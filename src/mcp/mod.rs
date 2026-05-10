@@ -202,7 +202,11 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "hint": { "type": "string", "description": "Task description or open file paths." },
-                        "token_budget": { "type": "integer", "description": "Max tokens to use (default: 2000)." }
+                        "token_budget": { "type": "integer", "description": "Max tokens to use (default: 2000)." },
+                        "delta_include": { "type": "string", "description": "Optional substring include filter for changed paths." },
+                        "delta_exclude": { "type": "string", "description": "Optional substring exclude filter for changed paths." },
+                        "delta_max_files": { "type": "integer", "description": "Max changed files in context delta section (default: 8)." },
+                        "delta_max_patch_lines": { "type": "integer", "description": "Max patch lines captured per changed file (default: 40)." }
                     },
                     "required": ["hint"]
                 }
@@ -213,7 +217,11 @@ fn tools_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "since": { "type": "string", "description": "Optional start ref. Uses HEAD working tree diff when omitted." }
+                        "since": { "type": "string", "description": "Optional start ref. Uses HEAD working tree diff when omitted." },
+                        "include": { "type": "string", "description": "Optional substring include filter for changed paths." },
+                        "exclude": { "type": "string", "description": "Optional substring exclude filter for changed paths." },
+                        "max_files": { "type": "integer", "description": "Max changed files to return (default: 128)." },
+                        "max_patch_lines": { "type": "integer", "description": "Max patch lines inspected per changed file (default: 40)." }
                     }
                 }
             },

@@ -15,7 +15,9 @@ mod watcher;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use serde::Serialize;
+use serde_json::json;
 
 use memory::Store;
 
@@ -27,6 +29,10 @@ struct Cli {
     /// Path to the cortex database. Defaults to .cortex/memory.db in the project root.
     #[arg(long, global = true)]
     db: Option<PathBuf>,
+
+    /// Output format for script-safe automation.
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 
     #[command(subcommand)]
     command: Command,
@@ -87,6 +93,16 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+
+    /// Run production-style workflow health checks.
+    #[command(subcommand)]
+    Doctor(DoctorCmd),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
 }
 
 // ── Subcommand args ───────────────────────────────────────────────────────────
@@ -165,6 +181,52 @@ struct ContextArgs {
 
     #[arg(long)]
     pub prefs: Option<PathBuf>,
+
+    /// Optional include filter for delta paths in the context packet.
+    #[arg(long)]
+    pub delta_include: Option<String>,
+
+    /// Optional exclude filter for delta paths in the context packet.
+    #[arg(long)]
+    pub delta_exclude: Option<String>,
+
+    /// Max changed files to include in context deltas.
+    #[arg(long, default_value = "8")]
+    pub delta_max_files: usize,
+}
+
+#[derive(Subcommand, Debug)]
+enum DoctorCmd {
+    /// Full workflow smoke test for automation and CI checks.
+    Workflow(DoctorWorkflowArgs),
+}
+
+#[derive(Parser, Debug)]
+struct DoctorWorkflowArgs {
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+
+    #[arg(long, default_value = "src")]
+    source: PathBuf,
+
+    #[arg(long, default_value = "Quartz")]
+    name: String,
+
+    /// Mutate and rollback a sentinel pattern as part of validation.
+    #[arg(long, default_value_t = false)]
+    mutate_pattern: bool,
+
+    /// Optional include filter for delta checks.
+    #[arg(long)]
+    delta_include: Option<String>,
+
+    /// Optional exclude filter for delta checks.
+    #[arg(long)]
+    delta_exclude: Option<String>,
+
+    /// Max changed files to inspect in delta checks.
+    #[arg(long, default_value = "25")]
+    delta_max_files: usize,
 }
 
 #[derive(Subcommand, Debug)]
@@ -246,6 +308,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let db_path = cli.db.unwrap_or_else(|| PathBuf::from(".cortex/memory.db"));
+    let format = cli.format;
 
     match cli.command {
         Command::Index(args)       => run_index(args, &db_path),
@@ -257,11 +320,12 @@ fn main() -> Result<()> {
         Command::Context(args)     => run_context(args, &db_path),
         Command::Graph(cmd)        => run_graph(cmd, &db_path),
         Command::Prefs(cmd)        => run_prefs(cmd),
-        Command::Pattern(cmd)      => run_pattern(cmd, &db_path),
-        Command::AntiPattern(cmd)  => run_anti_pattern(cmd, &db_path),
-        Command::Annotate(cmd)     => run_annotate(cmd, &db_path),
+        Command::Pattern(cmd)      => run_pattern(cmd, &db_path, format),
+        Command::AntiPattern(cmd)  => run_anti_pattern(cmd, &db_path, format),
+        Command::Annotate(cmd)     => run_annotate(cmd, &db_path, format),
         Command::Prune { keep_calls } => run_prune(keep_calls, &db_path),
-        Command::Status { full }   => run_status(&db_path, full),
+        Command::Status { full }   => run_status(&db_path, full, format),
+        Command::Doctor(cmd)       => run_doctor(cmd, &db_path, format),
     }
 }
 
@@ -355,7 +419,19 @@ fn run_dismiss(args: DismissArgs, db_path: &Path) -> Result<()> {
 
 fn run_context(args: ContextArgs, db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
-    let packet = planner::build_context_packet(&store, &args.hint, args.token_budget, Some(&args.repo))?;
+    let delta_opts = git::DeltaOptions {
+        include: args.delta_include,
+        exclude: args.delta_exclude,
+        max_files: args.delta_max_files,
+        max_patch_lines: 40,
+    };
+    let packet = planner::build_context_packet(
+        &store,
+        &args.hint,
+        args.token_budget,
+        Some(&args.repo),
+        Some(&delta_opts),
+    )?;
 
     let mut output = String::new();
     let prefs_path = args.prefs.unwrap_or_else(default_prefs_path);
@@ -432,43 +508,301 @@ fn default_prefs_path() -> PathBuf {
     PathBuf::from(".cortex/prefs.toml")
 }
 
-fn run_pattern(cmd: PatternCmd, db_path: &Path) -> Result<()> {
+fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
     let store = Store::open(db_path)?;
+    if format == OutputFormat::Text {
+        return match cmd {
+            PatternCmd::List => crystallizer::list_patterns(&store),
+            PatternCmd::Add { name, intent, body, uses, tags } =>
+                crystallizer::add_pattern(&store, &name, &intent, &body, uses, tags),
+            PatternCmd::Remove { id } => crystallizer::remove_pattern(&store, id),
+            PatternCmd::Revert { id } => crystallizer::report_revert(&store, id),
+            PatternCmd::Health => crystallizer::list_pattern_health(&store),
+        };
+    }
+
     match cmd {
-        PatternCmd::List => crystallizer::list_patterns(&store),
-        PatternCmd::Add { name, intent, body, uses, tags } =>
-            crystallizer::add_pattern(&store, &name, &intent, &body, uses, tags),
-        PatternCmd::Remove { id } => crystallizer::remove_pattern(&store, id),
-        PatternCmd::Revert { id } => crystallizer::report_revert(&store, id),
-        PatternCmd::Health => crystallizer::list_pattern_health(&store),
+        PatternCmd::List => {
+            let patterns = store.all_patterns()?;
+            print_json(&patterns)
+        }
+        PatternCmd::Add { name, intent, body, uses, tags } => {
+            let id = store.insert_pattern(&model::Pattern {
+                id: None,
+                name: name.clone(),
+                intent: intent.clone(),
+                body,
+                uses,
+                tags,
+                approved_at: chrono::Utc::now(),
+                use_count: 0,
+                reverted_count: 0,
+                survival_rate: 1.0,
+            })?;
+            print_json(&json!({"ok": true, "action": "add", "id": id, "name": name, "intent": intent}))
+        }
+        PatternCmd::Remove { id } => {
+            store.delete_pattern(id)?;
+            print_json(&json!({"ok": true, "action": "remove", "id": id}))
+        }
+        PatternCmd::Revert { id } => {
+            store.pattern_reverted(id)?;
+            print_json(&json!({"ok": true, "action": "revert", "id": id}))
+        }
+        PatternCmd::Health => {
+            let rows = store.pattern_health_rows()?;
+            let health: Vec<_> = rows
+                .into_iter()
+                .map(|(id, name, use_count, reverted_count, survival_rate)| {
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "use_count": use_count,
+                        "reverted_count": reverted_count,
+                        "survival_rate": survival_rate
+                    })
+                })
+                .collect();
+            print_json(&json!({"ok": true, "action": "health", "patterns": health}))
+        }
     }
 }
 
-fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path) -> Result<()> {
+fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
     let store = Store::open(db_path)?;
+    if format == OutputFormat::Text {
+        return match cmd {
+            AntiPatternCmd::List => crystallizer::list_anti_patterns(&store),
+            AntiPatternCmd::Add { description, wrong, correct, tags } =>
+                crystallizer::add_anti_pattern(&store, &description, &wrong, &correct, tags),
+            AntiPatternCmd::Remove { id } => crystallizer::remove_anti_pattern(&store, id),
+        };
+    }
+
     match cmd {
-        AntiPatternCmd::List => crystallizer::list_anti_patterns(&store),
-        AntiPatternCmd::Add { description, wrong, correct, tags } =>
-            crystallizer::add_anti_pattern(&store, &description, &wrong, &correct, tags),
-        AntiPatternCmd::Remove { id } => crystallizer::remove_anti_pattern(&store, id),
+        AntiPatternCmd::List => {
+            let anti_patterns = store.all_anti_patterns()?;
+            print_json(&anti_patterns)
+        }
+        AntiPatternCmd::Add { description, wrong, correct, tags } => {
+            let id = store.insert_anti_pattern(&model::AntiPattern {
+                id: None,
+                description: description.clone(),
+                wrong,
+                correct,
+                tags,
+                added_at: chrono::Utc::now(),
+            })?;
+            print_json(&json!({"ok": true, "action": "add", "id": id, "description": description}))
+        }
+        AntiPatternCmd::Remove { id } => {
+            store.delete_anti_pattern(id)?;
+            print_json(&json!({"ok": true, "action": "remove", "id": id}))
+        }
     }
 }
 
-fn run_annotate(cmd: AnnotateCmd, db_path: &Path) -> Result<()> {
+fn run_annotate(cmd: AnnotateCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
     let store = Store::open(db_path)?;
+    if format == OutputFormat::Text {
+        return match cmd {
+            AnnotateCmd::List => crystallizer::list_annotations(&store),
+            AnnotateCmd::Add { topic, body, tags } =>
+                crystallizer::add_annotation(&store, &topic, &body, tags),
+            AnnotateCmd::Remove { id } => crystallizer::remove_annotation(&store, id),
+        };
+    }
+
     match cmd {
-        AnnotateCmd::List => crystallizer::list_annotations(&store),
-        AnnotateCmd::Add { topic, body, tags } =>
-            crystallizer::add_annotation(&store, &topic, &body, tags),
-        AnnotateCmd::Remove { id } => crystallizer::remove_annotation(&store, id),
+        AnnotateCmd::List => {
+            let annotations = store.all_annotations()?;
+            print_json(&annotations)
+        }
+        AnnotateCmd::Add { topic, body, tags } => {
+            let id = store.insert_annotation(&model::Annotation {
+                id: None,
+                topic: topic.clone(),
+                body,
+                tags,
+                added_at: chrono::Utc::now(),
+            })?;
+            print_json(&json!({"ok": true, "action": "add", "id": id, "topic": topic}))
+        }
+        AnnotateCmd::Remove { id } => {
+            store.delete_annotation(id)?;
+            print_json(&json!({"ok": true, "action": "remove", "id": id}))
+        }
     }
 }
 
-fn run_status(db_path: &Path, full: bool) -> Result<()> {
+fn run_status(db_path: &Path, full: bool, format: OutputFormat) -> Result<()> {
     let store = Store::open(db_path)?;
+
+    if format == OutputFormat::Json {
+        let report = build_status_json(&store, db_path, full)?;
+        print_json(&report)?;
+        return Ok(());
+    }
 
     let report = build_status_report(&store, db_path, full)?;
     print!("{}", report);
+    Ok(())
+}
+
+fn build_status_json(store: &Store, db_path: &Path, full: bool) -> Result<serde_json::Value> {
+    let unit_count = store.unit_count()?;
+    let patterns = store.all_patterns()?;
+    let anti_patterns = store.all_anti_patterns()?;
+    let annotations = store.all_annotations()?;
+    let observations = store.all_observations()?;
+    let hot = store.hot_tools(5)?;
+    let cache = cache::cache_stats(store.conn()).ok();
+    let db_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+
+    let mut root = json!({
+        "db": db_path.display().to_string(),
+        "db_bytes": db_size,
+        "indexed_units": unit_count,
+        "patterns": patterns.len(),
+        "anti_patterns": anti_patterns.len(),
+        "annotations": annotations.len(),
+        "pending_review": observations.len(),
+        "hot_tools": hot,
+    });
+
+    if let Some(c) = cache {
+        root["cache"] = json!({
+            "entries": c.entries,
+            "total_hits": c.total_hits,
+            "content_blobs": c.content_blobs,
+            "approx_bytes": c.approx_bytes,
+        });
+    }
+
+    if full {
+        let (nodes, edges, inferred, manual) = store.graph_counts()?;
+        let scratchpads = store.scratchpad_count()?;
+        let recent_hot = store.hot_tools_recent(500, 5)?;
+        let health = store.pattern_health_rows()?;
+        root["full"] = json!({
+            "graph": {
+                "nodes": nodes,
+                "edges": edges,
+                "inferred": inferred,
+                "manual": manual,
+            },
+            "scratchpads": scratchpads,
+            "recent_hot_tools": recent_hot,
+            "pattern_health": health
+        });
+    }
+
+    Ok(root)
+}
+
+fn run_doctor(cmd: DoctorCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
+    match cmd {
+        DoctorCmd::Workflow(args) => run_doctor_workflow(args, db_path, format),
+    }
+}
+
+#[derive(Serialize)]
+struct DoctorCheck {
+    step: String,
+    pass: bool,
+    detail: String,
+}
+
+fn run_doctor_workflow(args: DoctorWorkflowArgs, db_path: &Path, format: OutputFormat) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let mut checks: Vec<DoctorCheck> = Vec::new();
+
+    let unit_count = store.unit_count()?;
+    checks.push(DoctorCheck {
+        step: "index_present".to_string(),
+        pass: unit_count > 0,
+        detail: format!("indexed_units={}", unit_count),
+    });
+
+    let delta_opts = git::DeltaOptions {
+        include: args.delta_include,
+        exclude: args.delta_exclude,
+        max_files: args.delta_max_files,
+        max_patch_lines: 12,
+    };
+    let deltas = git::head_deltas_with_options(&args.repo, &delta_opts)?;
+    checks.push(DoctorCheck {
+        step: "delta_query".to_string(),
+        pass: true,
+        detail: format!("delta_files_returned={}", deltas.len()),
+    });
+
+    let packet = planner::build_context_packet(
+        &store,
+        "workflow doctor check",
+        800,
+        Some(&args.repo),
+        Some(&delta_opts),
+    )?;
+    checks.push(DoctorCheck {
+        step: "context_packet".to_string(),
+        pass: true,
+        detail: format!("estimated_tokens={} relevant_units={} deltas={}", packet.estimated_tokens, packet.relevant_units.len(), packet.deltas.len()),
+    });
+
+    let full_status = build_status_report(&store, db_path, true)?;
+    checks.push(DoctorCheck {
+        step: "status_full_render".to_string(),
+        pass: full_status.contains("full details"),
+        detail: "status --full report generated".to_string(),
+    });
+
+    if args.mutate_pattern {
+        let pattern = model::Pattern {
+            id: None,
+            name: format!("doctor sentinel {}", chrono::Utc::now().timestamp()),
+            intent: "Doctor mutation check".to_string(),
+            body: "if grounded_transition { Action::PlaySound(..) }".to_string(),
+            uses: vec!["Action".to_string(), "Condition".to_string()],
+            tags: vec!["doctor".to_string(), "workflow".to_string()],
+            approved_at: chrono::Utc::now(),
+            use_count: 0,
+            reverted_count: 0,
+            survival_rate: 1.0,
+        };
+
+        let id = store.insert_pattern(&pattern)?;
+        store.pattern_reverted(id)?;
+        store.delete_pattern(id)?;
+        checks.push(DoctorCheck {
+            step: "pattern_roundtrip".to_string(),
+            pass: true,
+            detail: format!("added_reverted_removed_pattern_id={}", id),
+        });
+    }
+
+    let pass = checks.iter().all(|c| c.pass);
+    if format == OutputFormat::Json {
+        print_json(&json!({
+            "ok": pass,
+            "checks": checks
+        }))?;
+    } else {
+        println!("workflow doctor:\n");
+        for c in &checks {
+            let marker = if c.pass { "✓" } else { "✗" };
+            println!("  {} {:22} {}", marker, c.step, c.detail);
+        }
+    }
+
+    if !pass {
+        anyhow::bail!("workflow doctor failed one or more checks");
+    }
+    Ok(())
+}
+
+fn print_json<T: Serialize>(v: &T) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }
 

@@ -6,6 +6,25 @@ use anyhow::Result;
 use crate::model::DeltaEntry;
 
 #[derive(Debug, Clone)]
+pub struct DeltaOptions {
+    pub include: Option<String>,
+    pub exclude: Option<String>,
+    pub max_files: usize,
+    pub max_patch_lines: usize,
+}
+
+impl Default for DeltaOptions {
+    fn default() -> Self {
+        Self {
+            include: None,
+            exclude: None,
+            max_files: 256,
+            max_patch_lines: 40,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct FileDelta {
     pub path: String,
     pub status: DeltaStatus,
@@ -22,12 +41,25 @@ pub enum DeltaStatus {
 }
 
 pub fn head_deltas(repo_root: &Path) -> Result<Vec<FileDelta>> {
-    diff_name_status(repo_root, &["diff", "HEAD", "--name-status"])
+    head_deltas_with_options(repo_root, &DeltaOptions::default())
 }
 
 pub fn commit_deltas(repo_root: &Path, from: &str, to: &str) -> Result<Vec<FileDelta>> {
+    commit_deltas_with_options(repo_root, from, to, &DeltaOptions::default())
+}
+
+pub fn head_deltas_with_options(repo_root: &Path, opts: &DeltaOptions) -> Result<Vec<FileDelta>> {
+    diff_name_status(repo_root, &["diff", "HEAD", "--name-status"], opts)
+}
+
+pub fn commit_deltas_with_options(
+    repo_root: &Path,
+    from: &str,
+    to: &str,
+    opts: &DeltaOptions,
+) -> Result<Vec<FileDelta>> {
     let range = format!("{}..{}", from, to);
-    diff_name_status(repo_root, &["diff", &range, "--name-status"])
+    diff_name_status(repo_root, &["diff", &range, "--name-status"], opts)
 }
 
 pub fn compress_delta(d: &FileDelta) -> DeltaEntry {
@@ -49,7 +81,7 @@ impl DeltaStatus {
     }
 }
 
-fn diff_name_status(repo_root: &Path, args: &[&str]) -> Result<Vec<FileDelta>> {
+fn diff_name_status(repo_root: &Path, args: &[&str], opts: &DeltaOptions) -> Result<Vec<FileDelta>> {
     let out = run_git(repo_root, args)?;
     if out.is_empty() {
         return Ok(vec![]);
@@ -78,11 +110,11 @@ fn diff_name_status(repo_root: &Path, args: &[&str]) -> Result<Vec<FileDelta>> {
             path.to_string()
         };
 
-        if final_path.is_empty() {
+        if final_path.is_empty() || !path_allowed(final_path.as_str(), opts) {
             continue;
         }
 
-        let patch_lines = collect_patch_lines(repo_root, &status, &final_path)?;
+        let patch_lines = collect_patch_lines(repo_root, &status, &final_path, opts.max_patch_lines)?;
         let summary = summarize(&status, &patch_lines);
 
         deltas.push(FileDelta {
@@ -91,6 +123,10 @@ fn diff_name_status(repo_root: &Path, args: &[&str]) -> Result<Vec<FileDelta>> {
             summary,
             patch_lines,
         });
+    }
+
+    if deltas.len() > opts.max_files {
+        deltas.truncate(opts.max_files);
     }
 
     Ok(deltas)
@@ -106,7 +142,12 @@ fn parse_status(status: &str) -> DeltaStatus {
     }
 }
 
-fn collect_patch_lines(repo_root: &Path, status: &DeltaStatus, path: &str) -> Result<Vec<String>> {
+fn collect_patch_lines(
+    repo_root: &Path,
+    status: &DeltaStatus,
+    path: &str,
+    max_patch_lines: usize,
+) -> Result<Vec<String>> {
     match status {
         DeltaStatus::Deleted => {
             let out = run_git(repo_root, &["diff", "HEAD", "--", path])?;
@@ -121,12 +162,28 @@ fn collect_patch_lines(repo_root: &Path, status: &DeltaStatus, path: &str) -> Re
                     && !l.starts_with("+++")
                     && !l.starts_with("---")
                     && !l.starts_with("@@"))
-                .take(40)
+                .take(max_patch_lines)
                 .map(|s| s.to_string())
                 .collect::<Vec<_>>();
             Ok(lines)
         }
     }
+}
+
+fn path_allowed(path: &str, opts: &DeltaOptions) -> bool {
+    if let Some(include) = &opts.include {
+        if !include.trim().is_empty() && !path.contains(include) {
+            return false;
+        }
+    }
+
+    if let Some(exclude) = &opts.exclude {
+        if !exclude.trim().is_empty() && path.contains(exclude) {
+            return false;
+        }
+    }
+
+    true
 }
 
 fn summarize(status: &DeltaStatus, patch_lines: &[String]) -> String {

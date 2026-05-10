@@ -136,7 +136,14 @@ fn tool_get_context(
     // Augment hint with matching unit summaries for better semantic retrieval
     let augmented = augment_hint(hint, units);
 
-    let packet = build_context_packet(store, &augmented, budget, Some(repo_root))
+    let delta_opts = crate::git::DeltaOptions {
+        include: args.get("delta_include").and_then(|v| v.as_str()).map(str::to_string),
+        exclude: args.get("delta_exclude").and_then(|v| v.as_str()).map(str::to_string),
+        max_files: args.get("delta_max_files").and_then(|v| v.as_u64()).unwrap_or(8) as usize,
+        max_patch_lines: args.get("delta_max_patch_lines").and_then(|v| v.as_u64()).unwrap_or(40) as usize,
+    };
+
+    let packet = build_context_packet(store, &augmented, budget, Some(repo_root), Some(&delta_opts))
         .map_err(|e| e.to_string())?;
 
     if packet.relevant_units.is_empty()
@@ -159,10 +166,17 @@ fn tool_get_context(
 }
 
 fn tool_get_delta(args: &Value, repo_root: &Path) -> Result<String, String> {
+    let opts = crate::git::DeltaOptions {
+        include: args.get("include").and_then(|v| v.as_str()).map(str::to_string),
+        exclude: args.get("exclude").and_then(|v| v.as_str()).map(str::to_string),
+        max_files: args.get("max_files").and_then(|v| v.as_u64()).unwrap_or(128) as usize,
+        max_patch_lines: args.get("max_patch_lines").and_then(|v| v.as_u64()).unwrap_or(40) as usize,
+    };
+
     let deltas = if let Some(since) = args.get("since").and_then(|v| v.as_str()) {
-        git::commit_deltas(repo_root, since, "HEAD").map_err(|e| e.to_string())?
+        git::commit_deltas_with_options(repo_root, since, "HEAD", &opts).map_err(|e| e.to_string())?
     } else {
-        git::head_deltas(repo_root).map_err(|e| e.to_string())?
+        git::head_deltas_with_options(repo_root, &opts).map_err(|e| e.to_string())?
     };
 
     if deltas.is_empty() {

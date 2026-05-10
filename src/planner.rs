@@ -16,6 +16,7 @@ pub fn build_context_packet(
     hint: &str,
     token_budget: usize,
     repo_root: Option<&Path>,
+    delta_options: Option<&git::DeltaOptions>,
 ) -> Result<ContextPacket> {
     let all_units = store.all_units()?;
     let all_patterns = store.all_patterns()?;
@@ -71,9 +72,15 @@ pub fn build_context_packet(
     let used_tokens = token_budget.saturating_sub(budget_remaining);
 
     let deltas = if let Some(root) = repo_root {
-        git::head_deltas(root)?
+        let opts = delta_options.cloned().unwrap_or_else(|| git::DeltaOptions {
+            include: None,
+            exclude: None,
+            max_files: 8,
+            max_patch_lines: 40,
+        });
+
+        git::head_deltas_with_options(root, &opts)?
             .into_iter()
-            .take(8)
             .map(|d| git::compress_delta(&d))
             .collect()
     } else {

@@ -97,6 +97,12 @@ enum Command {
     /// Run production-style workflow health checks.
     #[command(subcommand)]
     Doctor(DoctorCmd),
+
+    /// Search patterns, anti-patterns, annotations, and indexed units for a topic.
+    Recall {
+        /// Topic keyword to search for across all memory.
+        topic: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -326,6 +332,7 @@ fn main() -> Result<()> {
         Command::Prune { keep_calls } => run_prune(keep_calls, &db_path),
         Command::Status { full }   => run_status(&db_path, full, format),
         Command::Doctor(cmd)       => run_doctor(cmd, &db_path, format),
+        Command::Recall { topic }  => run_recall(&topic, &db_path, format),
     }
 }
 
@@ -934,6 +941,132 @@ fn format_bytes(b: u64) -> String {
     if b < 1024 { format!("{}B", b) }
     else if b < 1024 * 1024 { format!("{:.1}KB", b as f64 / 1024.0) }
     else { format!("{:.2}MB", b as f64 / (1024.0 * 1024.0)) }
+}
+
+fn run_recall(topic: &str, db_path: &Path, format: OutputFormat) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let topic_lower = topic.to_lowercase();
+
+    let units = store.all_units()?;
+    let matched_units: Vec<_> = units
+        .iter()
+        .filter(|u| {
+            u.name.to_lowercase().contains(&topic_lower)
+                || u.compressed.to_lowercase().contains(&topic_lower)
+        })
+        .take(6)
+        .collect();
+
+    let patterns = store.all_patterns()?;
+    let matched_patterns: Vec<_> = patterns
+        .iter()
+        .filter(|p| {
+            p.name.to_lowercase().contains(&topic_lower)
+                || p.intent.to_lowercase().contains(&topic_lower)
+                || p.uses.iter().any(|u| u.to_lowercase().contains(&topic_lower))
+                || p.tags.iter().any(|t| t.to_lowercase().contains(&topic_lower))
+        })
+        .collect();
+
+    let aps = store.all_anti_patterns()?;
+    let matched_aps: Vec<_> = aps
+        .iter()
+        .filter(|ap| {
+            ap.description.to_lowercase().contains(&topic_lower)
+                || ap.wrong.to_lowercase().contains(&topic_lower)
+                || ap.tags.iter().any(|t| t.to_lowercase().contains(&topic_lower))
+        })
+        .collect();
+
+    let annotations = store.all_annotations()?;
+    let matched_annotations: Vec<_> = annotations
+        .iter()
+        .filter(|a| {
+            a.topic.to_lowercase().contains(&topic_lower)
+                || a.body.to_lowercase().contains(&topic_lower)
+                || a.tags.iter().any(|t| t.to_lowercase().contains(&topic_lower))
+        })
+        .collect();
+
+    if format == OutputFormat::Json {
+        print_json(&json!({
+            "topic": topic,
+            "units": matched_units.iter().map(|u| json!({
+                "id": u.id,
+                "name": u.name,
+                "kind": u.kind,
+                "summary": u.compressed.chars().take(200).collect::<String>(),
+            })).collect::<Vec<_>>(),
+            "patterns": matched_patterns.iter().map(|p| json!({
+                "id": p.id,
+                "name": p.name,
+                "intent": p.intent,
+                "body": p.body,
+                "survival_rate": p.survival_rate,
+            })).collect::<Vec<_>>(),
+            "anti_patterns": matched_aps.iter().map(|ap| json!({
+                "id": ap.id,
+                "description": ap.description,
+                "wrong": ap.wrong,
+                "correct": ap.correct,
+            })).collect::<Vec<_>>(),
+            "annotations": matched_annotations.iter().map(|a| json!({
+                "id": a.id,
+                "topic": a.topic,
+                "body": a.body,
+                "tags": a.tags,
+            })).collect::<Vec<_>>(),
+        }))?;
+        return Ok(());
+    }
+
+    println!("# Recall: `{topic}`\n");
+
+    if !matched_units.is_empty() {
+        println!("## Indexed Units");
+        for u in &matched_units {
+            println!("### {} ({})", u.name, u.kind);
+            let preview: String = u.compressed.chars().take(300).collect();
+            println!("{}", preview);
+            println!();
+        }
+    }
+
+    if !matched_patterns.is_empty() {
+        println!("## Patterns");
+        for p in &matched_patterns {
+            println!("### {} — {}", p.name, p.intent);
+            println!("{}", p.body);
+            println!("  survival: {:.0}%", p.survival_rate * 100.0);
+            println!();
+        }
+    }
+
+    if !matched_aps.is_empty() {
+        println!("## Anti-Patterns");
+        for ap in &matched_aps {
+            println!("### {}", ap.description);
+            println!("  WRONG:   {}", ap.wrong);
+            println!("  CORRECT: {}", ap.correct);
+            println!();
+        }
+    }
+
+    if !matched_annotations.is_empty() {
+        println!("## Annotations");
+        for a in &matched_annotations {
+            println!("### {}", a.topic);
+            println!("{}", a.body);
+            println!();
+        }
+    }
+
+    let total = matched_units.len() + matched_patterns.len() + matched_aps.len() + matched_annotations.len();
+    if total == 0 {
+        println!("No results found for `{topic}`.");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

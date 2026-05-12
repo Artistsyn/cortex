@@ -18,20 +18,25 @@ pub fn infer_edges(conn: &Connection, units: &[CodeUnit]) -> Result<usize> {
     conn.execute("DELETE FROM graph_edges WHERE source = 'inferred'", [])?;
 
     let by_name = node_name_to_id(conn)?;
+    let mut seen = HashSet::<(String, String, String)>::new();
     let mut inserted = 0usize;
 
     for unit in units {
-        inserted += infer_impl_edges(conn, unit, &by_name)?;
-        inserted += infer_uses_edges(conn, unit, &by_name)?;
-        inserted += infer_derived_edges(conn, unit)?;
+        inserted += infer_impl_edges(conn, unit, &by_name, &mut seen)?;
+        inserted += infer_uses_edges(conn, unit, &by_name, &mut seen)?;
+        inserted += infer_derived_edges(conn, unit, &mut seen)?;
     }
 
     Ok(inserted)
 }
 
 pub fn add_edge(conn: &Connection, from: &str, to: &str, relation: RelationType) -> Result<()> {
-    if !matches!(relation, RelationType::Pairs | RelationType::Conflicts) {
-        anyhow::bail!("manual edges only allow pairs or conflicts")
+    // Allow all meaningful manual relations: pairs, conflicts, owns, uses, calls, implements
+    if !matches!(relation,
+        RelationType::Pairs | RelationType::Conflicts | RelationType::Owns |
+        RelationType::Uses | RelationType::Calls | RelationType::Implements)
+    {
+        anyhow::bail!("manual edges allow: pairs, conflicts, owns, uses, calls, implements")
     }
 
     conn.execute(
@@ -129,14 +134,14 @@ pub fn subgraph(conn: &Connection, root_id: &str, depth: u8) -> Result<(Vec<Grap
     Ok((edges, nodes.into_values().collect()))
 }
 
-fn infer_impl_edges(conn: &Connection, unit: &CodeUnit, by_name: &HashMap<String, String>) -> Result<usize> {
+fn infer_impl_edges(conn: &Connection, unit: &CodeUnit, by_name: &HashMap<String, String>, seen: &mut HashSet<(String, String, String)>) -> Result<usize> {
     let mut count = 0usize;
 
     for line in unit.compressed.lines() {
         if let Some(raw) = line.strip_prefix("impl:") {
             for trait_name in raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
                 if let Some(to_id) = by_name.get(trait_name) {
-                    count += insert_inferred_edge(conn, &unit.id, to_id, RelationType::Implements)?;
+                    count += insert_inferred_edge(conn, &unit.id, to_id, RelationType::Implements, seen)?;
                 }
             }
         }
@@ -145,7 +150,7 @@ fn infer_impl_edges(conn: &Connection, unit: &CodeUnit, by_name: &HashMap<String
     Ok(count)
 }
 
-fn infer_uses_edges(conn: &Connection, unit: &CodeUnit, by_name: &HashMap<String, String>) -> Result<usize> {
+fn infer_uses_edges(conn: &Connection, unit: &CodeUnit, by_name: &HashMap<String, String>, seen: &mut HashSet<(String, String, String)>) -> Result<usize> {
     let mut count = 0usize;
 
     for line in unit.compressed.lines() {
@@ -155,7 +160,7 @@ fn infer_uses_edges(conn: &Connection, unit: &CodeUnit, by_name: &HashMap<String
                     continue;
                 }
                 if let Some(to_id) = by_name.get(&token) {
-                    count += insert_inferred_edge(conn, &unit.id, to_id, RelationType::Uses)?;
+                    count += insert_inferred_edge(conn, &unit.id, to_id, RelationType::Uses, seen)?;
                 }
             }
         }
@@ -164,7 +169,7 @@ fn infer_uses_edges(conn: &Connection, unit: &CodeUnit, by_name: &HashMap<String
     Ok(count)
 }
 
-fn infer_derived_edges(conn: &Connection, unit: &CodeUnit) -> Result<usize> {
+fn infer_derived_edges(conn: &Connection, unit: &CodeUnit, seen: &mut HashSet<(String, String, String)>) -> Result<usize> {
     let mut count = 0usize;
 
     let mut stmt = conn.prepare(
@@ -184,13 +189,17 @@ fn infer_derived_edges(conn: &Connection, unit: &CodeUnit) -> Result<usize> {
             params![child_id, kind, name, unit.module_path],
         )?;
 
-        count += insert_inferred_edge(conn, &child_id, &unit.id, RelationType::DerivedFrom)?;
+        count += insert_inferred_edge(conn, &child_id, &unit.id, RelationType::DerivedFrom, seen)?;
     }
 
     Ok(count)
 }
 
-fn insert_inferred_edge(conn: &Connection, from_id: &str, to_id: &str, relation: RelationType) -> Result<usize> {
+fn insert_inferred_edge(conn: &Connection, from_id: &str, to_id: &str, relation: RelationType, seen: &mut HashSet<(String, String, String)>) -> Result<usize> {
+    let key = (from_id.to_string(), to_id.to_string(), relation.as_str().to_string());
+    if !seen.insert(key) {
+        return Ok(0);
+    }
     let n = conn.execute(
         "INSERT OR IGNORE INTO graph_edges (from_id, to_id, relation, weight, source)
          VALUES (?1, ?2, ?3, 1.0, 'inferred')",

@@ -147,6 +147,8 @@ pub enum RelationType {
     Pairs,
     Conflicts,
     DerivedFrom,
+    /// Semantic ownership: the source type owns/contains the target (e.g. Scene → GameEvent list).
+    Owns,
 }
 
 impl RelationType {
@@ -158,6 +160,7 @@ impl RelationType {
             RelationType::Pairs => "pairs",
             RelationType::Conflicts => "conflicts",
             RelationType::DerivedFrom => "derived_from",
+            RelationType::Owns => "owns",
         }
     }
 
@@ -169,6 +172,7 @@ impl RelationType {
             "pairs" => Some(RelationType::Pairs),
             "conflicts" => Some(RelationType::Conflicts),
             "derived_from" => Some(RelationType::DerivedFrom),
+            "owns" => Some(RelationType::Owns),
             _ => None,
         }
     }

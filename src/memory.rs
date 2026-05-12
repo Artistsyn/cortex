@@ -125,7 +125,8 @@ impl Store {
                 to_id       TEXT NOT NULL REFERENCES graph_nodes(id) ON DELETE CASCADE,
                 relation    TEXT NOT NULL,
                 weight      REAL NOT NULL DEFAULT 1.0,
-                source      TEXT NOT NULL
+                source      TEXT NOT NULL,
+                UNIQUE (from_id, to_id, relation)
             );
 
             CREATE INDEX IF NOT EXISTS idx_edges_from ON graph_edges(from_id);

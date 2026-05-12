@@ -14,9 +14,11 @@ use crate::model::{ApiGraphItem, CodeMember, CodeUnit};
 
 // ── Public entry points ───────────────────────────────────────────────────────
 
-/// Compress all .rs files under `dir` into CodeUnits.
-pub fn compress_dir(dir: &Path) -> Result<Vec<CodeUnit>> {
+/// Compress all .rs files under `dir` into CodeUnits and their CodeMembers.
+/// Members include struct fields, enum variants, and methods for field-level graph inference.
+pub fn compress_dir(dir: &Path, scope: Option<&str>) -> Result<(Vec<CodeUnit>, Vec<CodeMember>)> {
     let mut units = Vec::new();
+    let mut members = Vec::new();
 
     for entry in WalkDir::new(dir)
         .into_iter()
@@ -33,7 +35,12 @@ pub fn compress_dir(dir: &Path) -> Result<Vec<CodeUnit>> {
             Err(_) => continue,
         };
 
-        let module_path = derive_module_path(dir, path);
+        let raw_module_path = derive_module_path(dir, path);
+        let module_path = match scope {
+            Some(s) if raw_module_path.is_empty() => s.to_string(),
+            Some(s) => format!("{}::{}", s, raw_module_path),
+            None => raw_module_path,
+        };
         let mut visitor = CompressVisitor {
             units: Vec::new(),
             members: Vec::new(),
@@ -43,9 +50,10 @@ pub fn compress_dir(dir: &Path) -> Result<Vec<CodeUnit>> {
         visitor.visit_file(&file);
         visitor.flush_impls();
         units.extend(visitor.units);
+        members.extend(visitor.members);
     }
 
-    Ok(units)
+    Ok((units, members))
 }
 
 /// Ingest an api-graph.json produced by quartz-ctx into CodeUnits.
@@ -190,6 +198,7 @@ fn build_summary_api(item: &ApiGraphItem) -> String {
 struct PendingImpl {
     self_ty: String,
     methods: Vec<String>,
+    trait_impl: Option<String>,
 }
 
 struct CompressVisitor {
@@ -203,15 +212,18 @@ impl CompressVisitor {
     fn flush_impls(&mut self) {
         for pending in self.pending_impls.drain(..) {
             if let Some(unit) = self.units.iter_mut().find(|u| u.name == pending.self_ty) {
+                if let Some(trait_name) = &pending.trait_impl {
+                    unit.compressed.push_str(&format!("impl: {}\n", trait_name));
+                }
                 if !pending.methods.is_empty() {
                     unit.compressed.push_str(&format!(
                         "methods: {}\n",
                         pending.methods.join(" | ")
                     ));
-                    // Rebuild term vector after augmenting compressed
-                    let compressed = unit.compressed.clone();
-                    unit.term_vector = build_term_vector_str(&compressed);
                 }
+                // Rebuild term vector after augmenting compressed
+                let compressed = unit.compressed.clone();
+                unit.term_vector = build_term_vector_str(&compressed);
             }
         }
     }
@@ -253,6 +265,26 @@ impl<'ast> Visit<'ast> for CompressVisitor {
         if let Some(d) = doc.lines().next() { if !d.trim().is_empty() { compressed.push_str(&format!("// {}\n", d.trim())); } }
         if !fields.is_empty() { compressed.push_str(&format!("fields: {}\n", fields.join(", "))); }
 
+        let parent_id = if self.module_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}::{}", self.module_path, name)
+        };
+
+        // Populate code_members for struct fields (enables field-level graph inference)
+        if let syn::Fields::Named(nf) = &node.fields {
+            for f in nf.named.iter().filter(|f| is_pub(&f.vis)) {
+                let field_name = f.ident.as_ref().unwrap().to_string();
+                self.members.push(CodeMember {
+                    parent_id: parent_id.clone(),
+                    kind: "field".to_string(),
+                    name: field_name,
+                    type_sig: ty_str(&f.ty),
+                    doc: extract_doc(&f.attrs),
+                });
+            }
+        }
+
         self.units.push(self.make_unit("struct", &name, compressed));
         syn::visit::visit_item_struct(self, node);
     }
@@ -264,6 +296,12 @@ impl<'ast> Visit<'ast> for CompressVisitor {
         let doc = extract_doc(&node.attrs);
         let mut compressed = format!("[enum: {}]\n", name);
         if let Some(d) = doc.lines().next() { if !d.trim().is_empty() { compressed.push_str(&format!("// {}\n", d.trim())); } }
+
+        let parent_id = if self.module_path.is_empty() {
+            name.clone()
+        } else {
+            format!("{}::{}", self.module_path, name)
+        };
 
         compressed.push_str("variants:\n");
         for v in &node.variants {
@@ -280,6 +318,16 @@ impl<'ast> Visit<'ast> for CompressVisitor {
             let fstr = if fields.is_empty() { String::new() } else { format!(" {{ {} }}", fields.join(", ")) };
             let dstr = if vdoc.is_empty() { String::new() } else { format!(" // {}", first_line(&vdoc)) };
             compressed.push_str(&format!("  {}::{}{}{}\n", name, v.ident, fstr, dstr));
+
+            // Populate code_members for enum variants (enables variant-level graph inference)
+            let type_sig = if fields.is_empty() { String::new() } else { format!("{{ {} }}", fields.join(", ")) };
+            self.members.push(CodeMember {
+                parent_id: parent_id.clone(),
+                kind: "variant".to_string(),
+                name: v.ident.to_string(),
+                type_sig,
+                doc: vdoc,
+            });
         }
 
         self.units.push(self.make_unit("enum", &name, compressed));
@@ -297,12 +345,35 @@ impl<'ast> Visit<'ast> for CompressVisitor {
         self.units.push(self.make_unit("fn", &name, compressed));
     }
 
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if !is_pub(&node.vis) { return; }
+        let name = node.ident.to_string();
+        let doc = extract_doc(&node.attrs);
+        let methods: Vec<String> = node.items.iter().filter_map(|item| {
+            if let syn::TraitItem::Fn(m) = item {
+                Some(m.sig.ident.to_string())
+            } else { None }
+        }).collect();
+        let mut compressed = format!("[trait: {}]\n", name);
+        if let Some(d) = doc.lines().next() {
+            if !d.trim().is_empty() { compressed.push_str(&format!("// {}\n", d.trim())); }
+        }
+        if !methods.is_empty() {
+            compressed.push_str(&format!("methods: {}\n", methods.join(" | ")));
+        }
+        self.units.push(self.make_unit("trait", &name, compressed));
+        syn::visit::visit_item_trait(self, node);
+    }
+
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
         let self_ty = match node.self_ty.as_ref() {
             syn::Type::Path(p) => p.path.segments.last()
                 .map(|s| s.ident.to_string()).unwrap_or_default(),
             _ => return,
         };
+        let trait_impl: Option<String> = node.trait_.as_ref().and_then(|(_, path, _)| {
+            path.segments.last().map(|s| s.ident.to_string())
+        });
         let methods: Vec<String> = node.items.iter().filter_map(|item| {
             if let syn::ImplItem::Fn(m) = item {
                 if !is_pub(&m.vis) { return None; }
@@ -310,7 +381,7 @@ impl<'ast> Visit<'ast> for CompressVisitor {
             } else { None }
         }).collect();
 
-        self.pending_impls.push(PendingImpl { self_ty, methods });
+        self.pending_impls.push(PendingImpl { self_ty, methods, trait_impl });
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {

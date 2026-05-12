@@ -103,6 +103,17 @@ enum Command {
         /// Topic keyword to search for across all memory.
         topic: String,
     },
+
+    /// Scan recent git diff for pattern relevance — shows which patterns apply to changed files.
+    GitReview {
+        /// Compare against this base ref (default: HEAD~1).
+        #[arg(long, default_value = "HEAD~1")]
+        base: String,
+
+        /// Path to the repo root (default: current dir).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -126,6 +137,11 @@ struct IndexArgs {
     /// Engine/project name label.
     #[arg(short, long, default_value = "Quartz")]
     name: String,
+
+    /// Optional scope prefix prepended to all unit IDs (e.g. "synful").
+    /// Use when indexing multiple source roots into the same DB to avoid ID collisions.
+    #[arg(long)]
+    scope: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -241,6 +257,9 @@ enum GraphCmd {
     AddPair {
         from: String,
         to: String,
+        /// Relation type: pairs (default), owns, uses, calls, implements, conflicts, derived_from
+        #[arg(long, default_value = "pairs")]
+        relation: String,
     },
     AddConflict {
         from: String,
@@ -333,6 +352,7 @@ fn main() -> Result<()> {
         Command::Status { full }   => run_status(&db_path, full, format),
         Command::Doctor(cmd)       => run_doctor(cmd, &db_path, format),
         Command::Recall { topic }  => run_recall(&topic, &db_path, format),
+        Command::GitReview { base, repo } => run_git_review(&base, repo.as_deref(), &db_path),
     }
 }
 
@@ -342,8 +362,8 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
 
     eprintln!("cortex index: compressing {}", args.source.display());
-    let mut units = compressor::compress_dir(&args.source)?;
-    eprintln!("  source: {} items compressed", units.len());
+    let (mut units, members) = compressor::compress_dir(&args.source, args.scope.as_deref())?;
+    eprintln!("  source: {} items compressed, {} members", units.len(), members.len());
 
     if let Some(graph_path) = &args.api_graph {
         let json = std::fs::read_to_string(graph_path)
@@ -360,9 +380,13 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
     for unit in &units {
         store.upsert_unit(unit)?;
     }
+    for member in &members {
+        store.upsert_member(member)?;
+    }
 
     let synced = graph::sync_nodes(store.conn())?;
-    let inferred = graph::infer_edges(store.conn(), &units)?;
+    let all_units = store.all_units()?;
+    let inferred = graph::infer_edges(store.conn(), &all_units)?;
 
     eprintln!("  total: {} units in index", units.len());
     eprintln!("  graph: {} nodes synced, {} edges inferred", synced, inferred);
@@ -380,7 +404,7 @@ fn run_serve(args: ServeArgs, db_path: &Path) -> Result<()> {
         store.all_units()?
     } else {
         eprintln!("cortex serve: index empty, compressing {} live", args.source.display());
-        let mut units = compressor::compress_dir(&args.source)?;
+        let (mut units, _members) = compressor::compress_dir(&args.source, None)?;
         if let Some(graph_path) = &args.api_graph {
             let json = std::fs::read_to_string(graph_path)?;
             let graph_items: Vec<model::ApiGraphItem> = serde_json::from_str(&json)?;
@@ -464,9 +488,11 @@ fn run_graph(cmd: GraphCmd, db_path: &Path) -> Result<()> {
             let inferred = graph::infer_edges(store.conn(), &units)?;
             println!("graph synced: {} nodes, {} inferred edges", synced, inferred);
         }
-        GraphCmd::AddPair { from, to } => {
-            graph::add_edge(store.conn(), &from, &to, model::RelationType::Pairs)?;
-            println!("added pair edge: {} -> {}", from, to);
+        GraphCmd::AddPair { from, to, relation } => {
+            let rel = model::RelationType::from_str(&relation)
+                .unwrap_or(model::RelationType::Pairs);
+            graph::add_edge(store.conn(), &from, &to, rel)?;
+            println!("added {} edge: {} -> {}", rel.as_str(), from, to);
         }
         GraphCmd::AddConflict { from, to } => {
             graph::add_edge(store.conn(), &from, &to, model::RelationType::Conflicts)?;
@@ -1066,6 +1092,92 @@ fn run_recall(topic: &str, db_path: &Path, format: OutputFormat) -> Result<()> {
         println!("No results found for `{topic}`.");
     }
 
+    Ok(())
+}
+
+fn run_git_review(base: &str, repo: Option<&Path>, db_path: &Path) -> Result<()> {
+    let repo_root = repo.unwrap_or_else(|| Path::new("."));
+    let store = Store::open(db_path)?;
+
+    // Get changed files from git diff
+    let output = std::process::Command::new("git")
+        .args(["diff", "--name-only", base, "HEAD"])
+        .current_dir(repo_root)
+        .output()
+        .context("git diff failed — is this a git repo?")?;
+
+    let changed_files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+
+    if changed_files.is_empty() {
+        println!("git-review: no changed files between {} and HEAD", base);
+        return Ok(());
+    }
+
+    // Read content of changed .rs files to extract API names mentioned
+    let mut mentioned_apis: Vec<String> = Vec::new();
+    for f in &changed_files {
+        if !f.ends_with(".rs") { continue; }
+        let path = repo_root.join(f);
+        if let Ok(src) = std::fs::read_to_string(&path) {
+            // Collect capitalised identifiers (likely API types/enums)
+            for word in src.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                if word.len() >= 4 && word.chars().next().map_or(false, |c| c.is_uppercase()) {
+                    mentioned_apis.push(word.to_string());
+                }
+            }
+        }
+    }
+    mentioned_apis.sort();
+    mentioned_apis.dedup();
+
+    // Match patterns whose `uses` overlap with mentioned APIs
+    let patterns = store.all_patterns()?;
+    let anti_patterns = store.all_anti_patterns()?;
+
+    let relevant_patterns: Vec<_> = patterns.iter().filter(|p| {
+        p.uses.iter().any(|u| mentioned_apis.iter().any(|m| m == u))
+    }).collect();
+
+    let relevant_aps: Vec<_> = anti_patterns.iter().filter(|ap| {
+        ap.tags.iter().any(|t| mentioned_apis.iter().any(|m| m.to_lowercase().contains(&t.to_lowercase())))
+        || mentioned_apis.iter().any(|m| ap.wrong.contains(m.as_str()) || ap.description.contains(m.as_str()))
+    }).collect();
+
+    println!("git-review: {} changed files ({}..HEAD)\n", changed_files.len(), base);
+    println!("Changed files:");
+    for f in &changed_files { println!("  {}", f); }
+    println!();
+
+    if relevant_patterns.is_empty() && relevant_aps.is_empty() {
+        println!("No patterns or anti-patterns matched the changed files.");
+        return Ok(());
+    }
+
+    if !relevant_patterns.is_empty() {
+        println!("## Relevant Patterns ({} matched)\n", relevant_patterns.len());
+        for p in &relevant_patterns {
+            println!("  [{}] {} (survival {:.0}%)", p.id.unwrap_or(0), p.name, p.survival_rate * 100.0);
+            println!("      {}", p.intent);
+            println!("      uses: {}", p.uses.join(", "));
+            println!();
+        }
+    }
+
+    if !relevant_aps.is_empty() {
+        println!("## Relevant Anti-Patterns ({} matched)\n", relevant_aps.len());
+        for ap in &relevant_aps {
+            println!("  [{}] {}", ap.id.unwrap_or(0), ap.description);
+            println!("      WRONG:   {}", ap.wrong);
+            println!("      CORRECT: {}", ap.correct);
+            println!();
+        }
+    }
+
+    println!("Run `cortex pattern revert <id>` to mark a pattern as not used in this diff.");
     Ok(())
 }
 

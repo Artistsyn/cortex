@@ -13,7 +13,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::model::*;
 
@@ -42,6 +42,7 @@ impl Store {
         self.conn.execute_batch("
             PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
+            PRAGMA busy_timeout = 5000;
 
             CREATE TABLE IF NOT EXISTS code_units (
                 id          TEXT PRIMARY KEY,
@@ -147,6 +148,179 @@ impl Store {
         // Backfill Phase 4 pattern-evolution columns for existing DBs.
         self.ensure_pattern_evolution_columns()?;
 
+        // FTS5 tables, new schema tables, and drift columns (idempotent).
+        self.ensure_fts_and_new_tables()?;
+
+        Ok(())
+    }
+
+    fn ensure_fts_and_new_tables(&self) -> Result<()> {
+        // FTS5 content-indexed virtual tables for BM25 keyword search.
+        self.conn.execute_batch("
+            CREATE VIRTUAL TABLE IF NOT EXISTS pattern_fts USING fts5(
+                name, intent, body, tags,
+                content = 'patterns',
+                content_rowid = 'id',
+                tokenize = 'porter unicode61'
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS anti_pattern_fts USING fts5(
+                description, wrong, correct, tags,
+                content = 'anti_patterns',
+                content_rowid = 'id',
+                tokenize = 'porter unicode61'
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS annotation_fts USING fts5(
+                topic, body, tags,
+                content = 'annotations',
+                content_rowid = 'id',
+                tokenize = 'porter unicode61'
+            );
+        ")?;
+
+        // FTS sync triggers — each trigger is its own execute_batch call.
+        let triggers = [
+            "CREATE TRIGGER IF NOT EXISTS trg_pat_fts_ins AFTER INSERT ON patterns BEGIN
+                INSERT INTO pattern_fts(rowid, name, intent, body, tags)
+                VALUES (NEW.id, NEW.name, NEW.intent, NEW.body, NEW.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_pat_fts_del AFTER DELETE ON patterns BEGIN
+                INSERT INTO pattern_fts(pattern_fts, rowid, name, intent, body, tags)
+                VALUES ('delete', OLD.id, OLD.name, OLD.intent, OLD.body, OLD.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_pat_fts_upd AFTER UPDATE ON patterns BEGIN
+                INSERT INTO pattern_fts(pattern_fts, rowid, name, intent, body, tags)
+                VALUES ('delete', OLD.id, OLD.name, OLD.intent, OLD.body, OLD.tags);
+                INSERT INTO pattern_fts(rowid, name, intent, body, tags)
+                VALUES (NEW.id, NEW.name, NEW.intent, NEW.body, NEW.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_ap_fts_ins AFTER INSERT ON anti_patterns BEGIN
+                INSERT INTO anti_pattern_fts(rowid, description, wrong, correct, tags)
+                VALUES (NEW.id, NEW.description, NEW.wrong, NEW.correct, NEW.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_ap_fts_del AFTER DELETE ON anti_patterns BEGIN
+                INSERT INTO anti_pattern_fts(anti_pattern_fts, rowid, description, wrong, correct, tags)
+                VALUES ('delete', OLD.id, OLD.description, OLD.wrong, OLD.correct, OLD.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_ap_fts_upd AFTER UPDATE ON anti_patterns BEGIN
+                INSERT INTO anti_pattern_fts(anti_pattern_fts, rowid, description, wrong, correct, tags)
+                VALUES ('delete', OLD.id, OLD.description, OLD.wrong, OLD.correct, OLD.tags);
+                INSERT INTO anti_pattern_fts(rowid, description, wrong, correct, tags)
+                VALUES (NEW.id, NEW.description, NEW.wrong, NEW.correct, NEW.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_ann_fts_ins AFTER INSERT ON annotations BEGIN
+                INSERT INTO annotation_fts(rowid, topic, body, tags)
+                VALUES (NEW.id, NEW.topic, NEW.body, NEW.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_ann_fts_del AFTER DELETE ON annotations BEGIN
+                INSERT INTO annotation_fts(annotation_fts, rowid, topic, body, tags)
+                VALUES ('delete', OLD.id, OLD.topic, OLD.body, OLD.tags);
+            END",
+            "CREATE TRIGGER IF NOT EXISTS trg_ann_fts_upd AFTER UPDATE ON annotations BEGIN
+                INSERT INTO annotation_fts(annotation_fts, rowid, topic, body, tags)
+                VALUES ('delete', OLD.id, OLD.topic, OLD.body, OLD.tags);
+                INSERT INTO annotation_fts(rowid, topic, body, tags)
+                VALUES (NEW.id, NEW.topic, NEW.body, NEW.tags);
+            END",
+        ];
+        for t in &triggers {
+            self.conn.execute_batch(t)?;
+        }
+
+        // New data tables.
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS pattern_merge_log (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                kept_id          INTEGER NOT NULL,
+                merged_id        INTEGER NOT NULL,
+                similarity_score REAL NOT NULL,
+                merge_reason     TEXT NOT NULL,
+                merged_at        TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS self_corrections (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                attempted        TEXT NOT NULL,
+                failure_reason   TEXT NOT NULL,
+                correction       TEXT NOT NULL,
+                tags             TEXT NOT NULL DEFAULT '[]',
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                first_seen_at    TEXT NOT NULL,
+                last_seen_at     TEXT NOT NULL,
+                UNIQUE(attempted, failure_reason)
+            );
+            CREATE INDEX IF NOT EXISTS idx_corrections_last ON self_corrections(last_seen_at);
+
+            CREATE TABLE IF NOT EXISTS adrs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                adr_number    INTEGER NOT NULL UNIQUE,
+                title         TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'accepted',
+                context       TEXT NOT NULL,
+                decision      TEXT NOT NULL,
+                reasoning     TEXT NOT NULL,
+                alternatives  TEXT NOT NULL DEFAULT '',
+                consequences  TEXT NOT NULL DEFAULT '',
+                concept_tags  TEXT NOT NULL DEFAULT '[]',
+                superseded_by INTEGER REFERENCES adrs(id),
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_adr_status ON adrs(status);
+            CREATE INDEX IF NOT EXISTS idx_adr_number ON adrs(adr_number);
+
+            CREATE TABLE IF NOT EXISTS adr_tag_index (
+                tag    TEXT NOT NULL,
+                adr_id INTEGER NOT NULL REFERENCES adrs(id) ON DELETE CASCADE,
+                PRIMARY KEY(tag, adr_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_adr_tag ON adr_tag_index(tag);
+
+            CREATE TABLE IF NOT EXISTS pattern_unit_refs (
+                pattern_id INTEGER NOT NULL REFERENCES patterns(id) ON DELETE CASCADE,
+                unit_id    TEXT NOT NULL,
+                PRIMARY KEY(pattern_id, unit_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_pur_unit ON pattern_unit_refs(unit_id);
+        ")?;
+
+        // Drift-detection columns on code_units (idempotent).
+        self.ensure_unit_drift_columns()?;
+
+        // Rebuild FTS index from existing data (safe to call repeatedly — replaces stale entries).
+        self.rebuild_fts()?;
+
+        Ok(())
+    }
+
+    fn ensure_unit_drift_columns(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(code_units)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut cols = std::collections::HashSet::new();
+        for c in rows { cols.insert(c?); }
+
+        if !cols.contains("previous_compressed") {
+            self.conn.execute(
+                "ALTER TABLE code_units ADD COLUMN previous_compressed TEXT",
+                [],
+            )?;
+        }
+        if !cols.contains("signature_changed_at") {
+            self.conn.execute(
+                "ALTER TABLE code_units ADD COLUMN signature_changed_at TEXT",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild FTS5 indexes from source tables. Safe to call repeatedly.
+    pub fn rebuild_fts(&self) -> Result<()> {
+        // 'rebuild' re-reads the content table and regenerates the inverted index.
+        self.conn.execute_batch("
+            INSERT INTO pattern_fts(pattern_fts) VALUES('rebuild');
+            INSERT INTO anti_pattern_fts(anti_pattern_fts) VALUES('rebuild');
+            INSERT INTO annotation_fts(annotation_fts) VALUES('rebuild');
+        ")?;
         Ok(())
     }
 
@@ -187,14 +361,36 @@ impl Store {
 
     pub fn upsert_unit(&self, unit: &CodeUnit) -> Result<()> {
         let tv_json = serde_json::to_string(&unit.term_vector)?;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Detect signature drift: read existing compressed before replacing.
+        let existing: Option<(String, Option<String>)> = self.conn.query_row(
+            "SELECT compressed, previous_compressed FROM code_units WHERE id = ?1",
+            params![&unit.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+
+        let (prev_compressed, signature_changed_at): (Option<String>, Option<String>) =
+            if let Some((old_comp, _prev)) = existing {
+                if old_comp != unit.compressed {
+                    (Some(old_comp), Some(now.clone()))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+
         self.conn.execute(
             "INSERT OR REPLACE INTO code_units
-             (id, kind, name, module_path, summary, compressed, term_vector, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id, kind, name, module_path, summary, compressed, term_vector, indexed_at,
+              previous_compressed, signature_changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 unit.id, unit.kind, unit.name, unit.module_path,
-                unit.summary, unit.compressed, tv_json,
-                unit.indexed_at.to_rfc3339(),
+                unit.summary, unit.compressed, tv_json, now,
+                prev_compressed,
+                signature_changed_at,
             ],
         )?;
         Ok(())
@@ -502,9 +698,330 @@ impl Store {
         )?;
         Ok(())
     }
+
+    // ── ADRs ──────────────────────────────────────────────────────────────────
+
+    pub fn next_adr_number(&self) -> Result<i64> {
+        let max: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(adr_number), 0) FROM adrs",
+            [], |r| r.get(0))?
+        ;
+        Ok(max + 1)
+    }
+
+    pub fn insert_adr(&self, adr: &Adr) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO adrs (adr_number, title, status, context, decision, reasoning,
+                              alternatives, consequences, concept_tags, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+            params![
+                adr.adr_number, adr.title, adr.status, adr.context, adr.decision,
+                adr.reasoning, adr.alternatives, adr.consequences,
+                serde_json::to_string(&adr.concept_tags)?,
+                now,
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        // Index concept tags.
+        for tag in &adr.concept_tags {
+            let _ = self.conn.execute(
+                "INSERT OR IGNORE INTO adr_tag_index (tag, adr_id) VALUES (?1, ?2)",
+                params![tag.to_lowercase(), id],
+            );
+        }
+        Ok(id)
+    }
+
+    pub fn all_adrs(&self) -> Result<Vec<Adr>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, adr_number, title, status, context, decision, reasoning,
+                    alternatives, consequences, concept_tags, superseded_by, created_at, updated_at
+             FROM adrs ORDER BY adr_number"
+        )?;
+        let rows = stmt.query_map([], row_to_adr)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_adr(&self, number: i64) -> Result<Option<Adr>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, adr_number, title, status, context, decision, reasoning,
+                    alternatives, consequences, concept_tags, superseded_by, created_at, updated_at
+             FROM adrs WHERE adr_number = ?1"
+        )?;
+        let mut rows = stmt.query_map(params![number], row_to_adr)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    pub fn get_adrs_by_tags(&self, tags: &[String]) -> Result<Vec<Adr>> {
+        if tags.is_empty() { return Ok(vec![]); }
+        let mut result: Vec<Adr> = Vec::new();
+        for tag in tags {
+            let mut stmt = self.conn.prepare(
+                "SELECT a.id, a.adr_number, a.title, a.status, a.context, a.decision,
+                        a.reasoning, a.alternatives, a.consequences, a.concept_tags,
+                        a.superseded_by, a.created_at, a.updated_at
+                 FROM adrs a
+                 JOIN adr_tag_index t ON t.adr_id = a.id
+                 WHERE t.tag = ?1 AND a.status = 'accepted'
+                 ORDER BY a.adr_number"
+            )?;
+            let rows = stmt.query_map(params![tag.to_lowercase()], row_to_adr)?;
+            for r in rows {
+                let adr = r?;
+                if !result.iter().any(|existing| existing.adr_number == adr.adr_number) {
+                    result.push(adr);
+                }
+            }
+        }
+        result.sort_by_key(|a| a.adr_number);
+        Ok(result)
+    }
+
+    pub fn update_adr_status(&self, id: i64, status: &str, superseded_by: Option<i64>) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "UPDATE adrs SET status = ?1, superseded_by = ?2, updated_at = ?3 WHERE id = ?4",
+            params![status, superseded_by, now, id],
+        )?;
+        Ok(())
+    }
+
+    // ── Pattern unit refs (drift detection) ───────────────────────────────────
+
+    pub fn insert_pattern_unit_ref(&self, pattern_id: i64, unit_id: &str) -> Result<()> {
+        let _ = self.conn.execute(
+            "INSERT OR IGNORE INTO pattern_unit_refs (pattern_id, unit_id) VALUES (?1, ?2)",
+            params![pattern_id, unit_id],
+        );
+        Ok(())
+    }
+
+    pub fn get_unit_ids_for_pattern(&self, pattern_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT unit_id FROM pattern_unit_refs WHERE pattern_id = ?1"
+        )?;
+        let rows = stmt.query_map(params![pattern_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Returns pattern ids whose linked units have had signature changes.
+    pub fn patterns_with_stale_units(&self) -> Result<Vec<(i64, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name, cu.name
+             FROM patterns p
+             JOIN pattern_unit_refs r ON r.pattern_id = p.id
+             JOIN code_units cu ON cu.id = r.unit_id
+             WHERE cu.signature_changed_at IS NOT NULL
+             ORDER BY p.id"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // ── Self-corrections ──────────────────────────────────────────────────────
+
+    pub fn insert_self_correction(
+        &self,
+        attempted: &str,
+        failure_reason: &str,
+        correction: &str,
+        tags: &[String],
+    ) -> Result<i64> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let tags_json = serde_json::to_string(tags)?;
+        self.conn.execute(
+            "INSERT INTO self_corrections
+             (attempted, failure_reason, correction, tags, occurrence_count, first_seen_at, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)
+             ON CONFLICT(attempted, failure_reason) DO UPDATE SET
+                occurrence_count = occurrence_count + 1,
+                last_seen_at = excluded.last_seen_at,
+                correction = excluded.correction",
+            params![attempted, failure_reason, correction, tags_json, now],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn all_self_corrections(&self) -> Result<Vec<SelfCorrection>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, attempted, failure_reason, correction, tags,
+                    occurrence_count, first_seen_at, last_seen_at
+             FROM self_corrections ORDER BY occurrence_count DESC, last_seen_at DESC"
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let tags_json: String = row.get(4)?;
+            let first: String = row.get(6)?;
+            let last: String = row.get(7)?;
+            Ok(SelfCorrection {
+                id: Some(row.get(0)?),
+                attempted: row.get(1)?,
+                failure_reason: row.get(2)?,
+                correction: row.get(3)?,
+                tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                occurrence_count: row.get(5)?,
+                first_seen_at: chrono::DateTime::parse_from_rfc3339(&first)
+                    .unwrap().with_timezone(&chrono::Utc),
+                last_seen_at: chrono::DateTime::parse_from_rfc3339(&last)
+                    .unwrap().with_timezone(&chrono::Utc),
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Promote a high-frequency self-correction (>= threshold occurrences) to an anti-pattern.
+    pub fn promote_correction_to_anti_pattern(&self, id: i64) -> Result<Option<i64>> {
+        let sc: Option<SelfCorrection> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, attempted, failure_reason, correction, tags,
+                        occurrence_count, first_seen_at, last_seen_at
+                 FROM self_corrections WHERE id = ?1"
+            )?;
+            let mut rows = stmt.query_map(params![id], |row| {
+                let tags_json: String = row.get(4)?;
+                let first: String = row.get(6)?;
+                let last: String = row.get(7)?;
+                Ok(SelfCorrection {
+                    id: Some(row.get(0)?),
+                    attempted: row.get(1)?,
+                    failure_reason: row.get(2)?,
+                    correction: row.get(3)?,
+                    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+                    occurrence_count: row.get(5)?,
+                    first_seen_at: chrono::DateTime::parse_from_rfc3339(&first)
+                        .unwrap().with_timezone(&chrono::Utc),
+                    last_seen_at: chrono::DateTime::parse_from_rfc3339(&last)
+                        .unwrap().with_timezone(&chrono::Utc),
+                })
+            })?;
+            rows.next().transpose()?
+        };
+        if let Some(sc) = sc {
+            let ap = AntiPattern {
+                id: None,
+                description: format!("[auto] {} — {}", sc.failure_reason, sc.attempted),
+                wrong: sc.attempted.clone(),
+                correct: sc.correction.clone(),
+                tags: sc.tags.clone(),
+                added_at: chrono::Utc::now(),
+            };
+            let ap_id = self.insert_anti_pattern(&ap)?;
+            self.conn.execute(
+                "DELETE FROM self_corrections WHERE id = ?1", params![id]
+            )?;
+            return Ok(Some(ap_id));
+        }
+        Ok(None)
+    }
+
+    // ── Pattern merge log (consolidation) ─────────────────────────────────────
+
+    pub fn insert_merge_log(
+        &self,
+        kept_id: i64,
+        merged_id: i64,
+        score: f32,
+        reason: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pattern_merge_log
+             (kept_id, merged_id, similarity_score, merge_reason, merged_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![kept_id, merged_id, score, reason, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    // ── FTS search ────────────────────────────────────────────────────────────
+
+    /// BM25 FTS5 search across patterns. Returns matched patterns ranked by relevance.
+    pub fn fts_search_patterns(&self, query: &str, limit: usize) -> Result<Vec<Pattern>> {
+        let safe_q = sanitize_fts_query(query);
+        if safe_q.is_empty() { return Ok(vec![]); }
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name, p.intent, p.body, p.uses, p.tags, p.approved_at,
+                    p.use_count, p.reverted_count, p.survival_rate
+             FROM pattern_fts f
+             JOIN patterns p ON p.id = f.rowid
+             WHERE pattern_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(params![safe_q, limit as i64], row_to_pattern)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// BM25 FTS5 search across anti-patterns.
+    pub fn fts_search_anti_patterns(&self, query: &str, limit: usize) -> Result<Vec<AntiPattern>> {
+        let safe_q = sanitize_fts_query(query);
+        if safe_q.is_empty() { return Ok(vec![]); }
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.description, a.wrong, a.correct, a.tags, a.added_at
+             FROM anti_pattern_fts f
+             JOIN anti_patterns a ON a.id = f.rowid
+             WHERE anti_pattern_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(params![safe_q, limit as i64], row_to_anti_pattern)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// BM25 FTS5 search across annotations.
+    pub fn fts_search_annotations(&self, query: &str, limit: usize) -> Result<Vec<Annotation>> {
+        let safe_q = sanitize_fts_query(query);
+        if safe_q.is_empty() { return Ok(vec![]); }
+        let mut stmt = self.conn.prepare(
+            "SELECT a.id, a.topic, a.body, a.tags, a.added_at
+             FROM annotation_fts f
+             JOIN annotations a ON a.id = f.rowid
+             WHERE annotation_fts MATCH ?1
+             ORDER BY rank
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(params![safe_q, limit as i64], row_to_annotation)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+}
+
+/// Sanitize user input for FTS5 MATCH queries. Strips special chars, joins with spaces (AND).
+fn sanitize_fts_query(q: &str) -> String {
+    q.split_whitespace()
+        .map(|t| t.chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_')
+            .collect::<String>())
+        .filter(|t| t.len() >= 2)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ── Row mappers ───────────────────────────────────────────────────────────────
+
+fn row_to_adr(row: &rusqlite::Row) -> rusqlite::Result<Adr> {
+    let tags_json: String = row.get(9)?;
+    let created: String = row.get(11)?;
+    let updated: String = row.get(12)?;
+    Ok(Adr {
+        id: Some(row.get(0)?),
+        adr_number: row.get(1)?,
+        title: row.get(2)?,
+        status: row.get(3)?,
+        context: row.get(4)?,
+        decision: row.get(5)?,
+        reasoning: row.get(6)?,
+        alternatives: row.get(7)?,
+        consequences: row.get(8)?,
+        concept_tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+        superseded_by: row.get(10)?,
+        created_at: chrono::DateTime::parse_from_rfc3339(&created)
+            .unwrap().with_timezone(&chrono::Utc),
+        updated_at: chrono::DateTime::parse_from_rfc3339(&updated)
+            .unwrap().with_timezone(&chrono::Utc),
+    })
+}
 
 fn row_to_unit(row: &rusqlite::Row) -> rusqlite::Result<CodeUnit> {
     let tv_json: String = row.get(6)?;

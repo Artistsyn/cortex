@@ -200,15 +200,21 @@ fn tool_query_graph(args: &Value, store: &Store) -> Result<String, String> {
         return Ok(format!("No graph node found for `{}`", name));
     };
 
-    let (edges, _) = graph::subgraph(store.conn(), &root.id, depth).map_err(|e| e.to_string())?;
+    let (edges, nodes) = graph::subgraph(store.conn(), &root.id, depth).map_err(|e| e.to_string())?;
     if edges.is_empty() {
-        return Ok(format!("{}\n  (no graph neighbors)", root.name));
+        return Ok(format!("{} ({}): no graph neighbors", root.name, root.id));
     }
 
+    // Build id → name map from returned nodes for human-readable output.
+    let node_name: std::collections::HashMap<&str, &str> = nodes.iter()
+        .map(|n| (n.id.as_str(), n.name.as_str()))
+        .collect();
+
     let mut out = String::new();
-    out.push_str(&format!("{}\n", root.name));
-    for e in edges {
-        out.push_str(&format!("  -[{}]-> {}\n", e.relation.as_str(), e.to_id));
+    out.push_str(&format!("{} ({}) -> {} relations:\n", root.name, root.kind, edges.len()));
+    for e in &edges {
+        let target_name = node_name.get(e.to_id.as_str()).copied().unwrap_or(&e.to_id);
+        out.push_str(&format!("  -[{}]-> {} ({})\n", e.relation.as_str(), target_name, e.to_id));
     }
     Ok(out)
 }

@@ -1,5 +1,7 @@
+mod adr;
 mod cache;
 mod compressor;
+mod consolidator;
 mod crystallizer;
 mod git;
 mod graph;
@@ -114,12 +116,74 @@ enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+
+    /// Architecture Decision Records (ADRs).
+    #[command(subcommand)]
+    Adr(AdrCmd),
+
+    /// Find and optionally merge duplicate/overlapping patterns using cosine similarity.
+    Consolidate {
+        /// Similarity threshold 0.0–1.0 (default 0.72). Pairs above this score are flagged.
+        #[arg(long, default_value_t = 0.72)]
+        threshold: f32,
+
+        /// Just report candidates; do not merge anything.
+        #[arg(long)]
+        report: bool,
+    },
+
+    /// Log a self-correction: what was attempted, why it failed, and what the fix was.
+    Correction {
+        /// The thing that was attempted (wrong approach or snippet).
+        #[arg(long)]
+        attempted: String,
+
+        /// Reason it failed.
+        #[arg(long)]
+        reason: String,
+
+        /// The correct approach or fix.
+        #[arg(long)]
+        fix: String,
+
+        /// Comma-separated tags.
+        #[arg(long, default_value = "")]
+        tags: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
     Text,
     Json,
+}
+
+// ── ADR subcommand ────────────────────────────────────────────────────────────
+
+#[derive(Subcommand, Debug)]
+enum AdrCmd {
+    /// Record a new Architecture Decision.
+    New {
+        #[arg(long)] title: String,
+        #[arg(long)] context: String,
+        #[arg(long)] decision: String,
+        #[arg(long, default_value = "")] reasoning: String,
+        #[arg(long, default_value = "")] alternatives: String,
+        #[arg(long, default_value = "")] consequences: String,
+        /// Comma-separated concept tags for context matching.
+        #[arg(long, default_value = "")] tags: String,
+    },
+    /// List all ADRs.
+    List,
+    /// Show a single ADR by number.
+    Show {
+        #[arg()] number: i64,
+    },
+    /// Deprecate or supersede an ADR.
+    Deprecate {
+        #[arg()] number: i64,
+        #[arg(long)] superseded_by: Option<i64>,
+    },
 }
 
 // ── Subcommand args ───────────────────────────────────────────────────────────
@@ -353,6 +417,13 @@ fn main() -> Result<()> {
         Command::Doctor(cmd)       => run_doctor(cmd, &db_path, format),
         Command::Recall { topic }  => run_recall(&topic, &db_path, format),
         Command::GitReview { base, repo } => run_git_review(&base, repo.as_deref(), &db_path),
+        Command::Adr(cmd)          => run_adr(cmd, &db_path),
+        Command::Consolidate { threshold, report } => run_consolidate(threshold, report, &db_path),
+        Command::Correction { attempted, reason, fix, tags } => {
+            let tag_vec: Vec<String> = tags.split(',').map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()).collect();
+            run_correction(&attempted, &reason, &fix, &tag_vec, &db_path)
+        }
     }
 }
 
@@ -1178,6 +1249,128 @@ fn run_git_review(base: &str, repo: Option<&Path>, db_path: &Path) -> Result<()>
     }
 
     println!("Run `cortex pattern revert <id>` to mark a pattern as not used in this diff.");
+    Ok(())
+}
+
+// ── ADR handler ────────────────────────────────────────────────────────────────
+
+fn run_adr(cmd: AdrCmd, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    match cmd {
+        AdrCmd::New { title, context, decision, reasoning, alternatives, consequences, tags } => {
+            let concept_tags: Vec<String> = tags.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let number = store.next_adr_number()?;
+            let a = model::Adr {
+                id: None,
+                adr_number: number,
+                title: title.clone(),
+                status: "accepted".into(),
+                context,
+                decision,
+                reasoning,
+                alternatives,
+                consequences,
+                concept_tags,
+                superseded_by: None,
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            let id = store.insert_adr(&a)?;
+            println!("ADR-{:03}: {} (id={})", number, title, id);
+        }
+        AdrCmd::List => {
+            let adrs = store.all_adrs()?;
+            if adrs.is_empty() {
+                println!("No ADRs recorded yet.");
+            }
+            for a in adrs {
+                println!("ADR-{:03} [{}] {}", a.adr_number, a.status, a.title);
+            }
+        }
+        AdrCmd::Show { number } => {
+            match store.get_adr(number)? {
+                None => println!("ADR-{:03} not found.", number),
+                Some(a) => {
+                    println!("{}", adr::format_for_context(&a));
+                    println!("Reasoning: {}", a.reasoning);
+                    if !a.alternatives.is_empty() {
+                        println!("Alternatives considered: {}", a.alternatives);
+                    }
+                    if !a.consequences.is_empty() {
+                        println!("Consequences: {}", a.consequences);
+                    }
+                    if !a.concept_tags.is_empty() {
+                        println!("Tags: {}", a.concept_tags.join(", "));
+                    }
+                }
+            }
+        }
+        AdrCmd::Deprecate { number, superseded_by } => {
+            match store.get_adr(number)? {
+                None => println!("ADR-{:03} not found.", number),
+                Some(a) => {
+                    let id = a.id.unwrap();
+                    let status = if superseded_by.is_some() { "superseded" } else { "deprecated" };
+                    store.update_adr_status(id, status, superseded_by)?;
+                    println!("ADR-{:03} marked as {}.", number, status);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ── Consolidate handler ────────────────────────────────────────────────────────
+
+fn run_consolidate(threshold: f32, report: bool, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let candidates = consolidator::find_candidates(&store, threshold)?;
+
+    if candidates.is_empty() {
+        println!("No duplicate pattern candidates found at threshold {:.0}%.", threshold * 100.0);
+        return Ok(());
+    }
+
+    println!(
+        "{} candidate pair(s) above {:.0}% similarity:\n",
+        candidates.len(),
+        threshold * 100.0
+    );
+    for (keep_id, discard_id, score, keep_name, discard_name) in &candidates {
+        println!(
+            "  [{keep_id}] {keep_name}  <=>  [{discard_id}] {discard_name}  ({:.1}%)",
+            score * 100.0
+        );
+    }
+
+    if !report {
+        println!("\nMerging: keeping higher-use pattern in each pair...");
+        for (keep_id, discard_id, score, keep_name, discard_name) in &candidates {
+            consolidator::merge_patterns(&store, *keep_id, *discard_id, *score)?;
+            println!("  Merged [{discard_id}] {discard_name} -> [{keep_id}] {keep_name}");
+        }
+        println!("Done. Run `cortex index` to rebuild FTS from updated patterns.");
+    } else {
+        println!("\nReport-only mode. No patterns were modified.");
+    }
+    Ok(())
+}
+
+// ── Correction handler ─────────────────────────────────────────────────────────
+
+fn run_correction(
+    attempted: &str,
+    reason: &str,
+    fix: &str,
+    tags: &[String],
+    db_path: &Path,
+) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let id = store.insert_self_correction(attempted, reason, fix, tags)?;
+    println!("Correction recorded (id={id}). Use `cortex anti-pattern add` to promote if this recurs.");
     Ok(())
 }
 

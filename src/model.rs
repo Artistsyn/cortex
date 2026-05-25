@@ -93,6 +93,38 @@ pub struct PendingObservation {
     pub observed_at: DateTime<Utc>,
 }
 
+/// An Architecture Decision Record — a formal record of a significant design choice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Adr {
+    pub id: Option<i64>,
+    pub adr_number: i64,
+    pub title: String,
+    /// "accepted", "proposed", "deprecated", "superseded"
+    pub status: String,
+    pub context: String,
+    pub decision: String,
+    pub reasoning: String,
+    pub alternatives: String,
+    pub consequences: String,
+    pub concept_tags: Vec<String>,
+    pub superseded_by: Option<i64>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A logged self-correction: Copilot attempted X, it failed, and Y was the right fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfCorrection {
+    pub id: Option<i64>,
+    pub attempted: String,
+    pub failure_reason: String,
+    pub correction: String,
+    pub tags: Vec<String>,
+    pub occurrence_count: i64,
+    pub first_seen_at: chrono::DateTime<chrono::Utc>,
+    pub last_seen_at: chrono::DateTime<chrono::Utc>,
+}
+
 // ── Session ───────────────────────────────────────────────────────────────────
 
 /// Pre-compiled context packet for a Copilot session.
@@ -107,6 +139,8 @@ pub struct ContextPacket {
     pub anti_patterns: Vec<AntiPattern>,
     /// Annotations relevant to current files
     pub annotations: Vec<Annotation>,
+    /// Architecture Decision Records relevant to this context
+    pub adrs: Vec<Adr>,
     /// What changed since last index (compressed deltas)
     pub deltas: Vec<DeltaEntry>,
     /// Token budget used (estimated)

@@ -69,6 +69,22 @@ pub fn build_context_packet(
         .take(3)
         .collect();
 
+    // ADRs relevant to this context (accepted, matched by title words or concept tags).
+    let hint_words: Vec<&str> = hint_lower.split_whitespace().collect();
+    let adrs: Vec<_> = store.all_adrs().unwrap_or_default()
+        .into_iter()
+        .filter(|a| {
+            a.status == "accepted" && (
+                a.title.to_lowercase().split_whitespace().any(|w| hint_lower.contains(w))
+                || a.concept_tags.iter().any(|t| {
+                    let tl = t.to_lowercase();
+                    hint_lower.contains(&tl) || hint_words.iter().any(|w| tl.contains(*w))
+                })
+            )
+        })
+        .take(3)
+        .collect();
+
     let used_tokens = token_budget.saturating_sub(budget_remaining);
 
     let deltas = if let Some(root) = repo_root {
@@ -92,6 +108,7 @@ pub fn build_context_packet(
         patterns,
         anti_patterns,
         annotations,
+        adrs,
         deltas,
         estimated_tokens: used_tokens,
     })
@@ -108,6 +125,28 @@ pub fn render_packet(packet: &ContextPacket) -> String {
         for unit in &packet.relevant_units {
             s.push_str(&unit.compressed);
             s.push('\n');
+        }
+    }
+
+    // ADRs — architectural constraints injected before patterns
+    if !packet.adrs.is_empty() {
+        s.push_str("=== ARCHITECTURE DECISIONS ===\n");
+        for adr in &packet.adrs {
+            s.push_str(&format!(
+                "## ADR-{:03}: {} [{}]\nContext: {}\nDecision: {}\n\n",
+                adr.adr_number, adr.title, adr.status, adr.context, adr.decision
+            ));
+        }
+    }
+
+    // ADRs — architectural constraints injected before patterns
+    if !packet.adrs.is_empty() {
+        s.push_str("=== ARCHITECTURE DECISIONS ===\n");
+        for adr in &packet.adrs {
+            s.push_str(&format!(
+                "## ADR-{:03}: {} [{}]\nContext: {}\nDecision: {}\n\n",
+                adr.adr_number, adr.title, adr.status, adr.context, adr.decision
+            ));
         }
     }
 

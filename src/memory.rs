@@ -13,9 +13,28 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::model::*;
+
+// ── First-run prefs.toml template ─────────────────────────────────────────────
+const PREFS_TEMPLATE: &str = r#"[style]
+line_length = 100
+indent = "4 spaces"
+naming = "snake_case functions and variables, PascalCase types and enums"
+error_handling = "use Result<T, E>; no unwrap() in engine code; ? operator preferred"
+comments = "/// doc comments on all public API; inline only for non-obvious logic"
+
+[project]
+name = "MyProject"
+language = "Rust"
+notes = [
+    "MANDATORY PRE-CODE CHECK (no PROTOCOL required): before writing any factory/tick/spawn/physics function call get_anti_patterns + get_preferences + list_patterns",
+    "MANDATORY MID-TASK CORTEX USAGE: after first approach fails call recall <error_keyword> before retrying. After two failed attempts STOP and call recall or semantic_search before a third.",
+    "session-end mandatory: after any coding session run post-session then annotate new bugs as anti-patterns and working implementations as patterns",
+]
+"#;
 
 pub struct Store {
     conn: Connection,
@@ -23,6 +42,7 @@ pub struct Store {
 
 impl Store {
     pub fn open(db_path: &Path) -> Result<Self> {
+        let is_new = !db_path.exists();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -30,7 +50,152 @@ impl Store {
             .with_context(|| format!("could not open db: {}", db_path.display()))?;
         let store = Self { conn };
         store.migrate()?;
+        if is_new {
+            store.first_run_init(db_path)?;
+        }
         Ok(store)
+    }
+
+    /// Called once when the DB file is created for the first time.
+    /// Seeds core workflow anti-patterns, MCP tool annotations, and writes a prefs.toml template.
+    fn first_run_init(&self, db_path: &Path) -> Result<()> {
+        eprintln!("[cortex] First run — seeding workflow memory and creating prefs.toml");
+
+        // ── Workflow anti-patterns ────────────────────────────────────────────
+        let aps: &[(&str, &str, &str, &[&str])] = &[
+            (
+                "Skipping cortex recall after the first approach fails — proceeding to a second attempt without checking memory costs a full debug cycle when the answer is already recorded",
+                "First approach failed; immediately try different approach without checking cortex",
+                "First approach failed -> recall <error_keyword> or semantic_search <description> -> if nothing found, THEN try next approach and note the gap for crystallization",
+                &["workflow", "meta", "cortex", "recall", "blocked", "debug-cycle"],
+            ),
+            (
+                "Passing a multiline PowerShell string variable to an external exe CLI flag — each newline becomes a separate positional argument causing unexpected argument errors",
+                "& cortex.exe --body $multiLineVar  // each line of var is a separate arg to the exe",
+                "& cortex.exe --body 'Single line. No newlines.'  // all cortex CLI flag values must be single-line",
+                &["powershell", "cli", "external-exe", "multiline", "cortex-cli", "string-args"],
+            ),
+            (
+                "Using && for command chaining in PowerShell 5.1 — not a valid operator, causes parse errors; use semicolon or explicit LASTEXITCODE check",
+                "cortex.exe status && cargo build  // && is bash syntax, not valid in PS 5.1",
+                "cortex.exe status; cargo build  // semicolon for sequential; if ($LASTEXITCODE -eq 0) for conditional",
+                &["powershell", "command-chaining", "syntax", "ps5", "bash-habit"],
+            ),
+            (
+                "Em-dash unicode char in external CLI arg values from PowerShell — arg parsers may treat em-dash as flag separator, splitting the following word as a separate positional arg",
+                "cortex.exe --body 'result is great - no issues'  // em-dash before a word: parser may read that word as a flag",
+                "cortex.exe --body 'result is great - no issues'  // use ASCII hyphen-minus in all CLI arg values",
+                &["powershell", "cli", "em-dash", "unicode", "string-args", "cortex-cli"],
+            ),
+        ];
+
+        for (desc, wrong, correct, tags) in aps {
+            let ap = AntiPattern {
+                id: None,
+                description: (*desc).to_string(),
+                wrong: (*wrong).to_string(),
+                correct: (*correct).to_string(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                added_at: Utc::now(),
+            };
+            self.insert_anti_pattern(&ap)?;
+        }
+        eprintln!("[cortex]   seeded {} workflow anti-patterns", aps.len());
+
+        // ── MCP tool annotations ──────────────────────────────────────────────
+        // These teach Copilot the exact params and usage for each cortex MCP tool.
+        let annotations: &[(&str, &str, &[&str])] = &[
+            (
+                "MCP: semantic_search",
+                "Params: query str required, limit int default=5. TF-IDF semantic plus keyword search across all indexed units. Returns top N units by relevance with compressed summaries. Use for finding which module handles a concept, discovering implementors of a trait, or locating code patterns. limit=3 for quick lookup, limit=8+ for exhaustive. Session cache deduplicates repeated content.",
+                &["cortex", "mcp", "tools", "semantic_search"],
+            ),
+            (
+                "MCP: get_item",
+                "Params: name str required, case-sensitive exact match. Returns full compressed source for one indexed unit. Best for reading a specific struct/enum/trait when you know its exact name. Returns kind, module_path, and full compressed text. Fails with 'no item named X' on mismatch — use semantic_search first to find the exact name.",
+                &["cortex", "mcp", "tools", "get_item"],
+            ),
+            (
+                "MCP: get_context",
+                "Params: hint str required, token_budget int default=2000, delta_include str, delta_exclude str, delta_max_files int default=8, delta_max_patch_lines int default=40. Builds context packet: relevant units + patterns + anti-patterns + annotations + git delta. Best single call to start a task. Use delta_exclude to filter noise like 'assets'. Raise token_budget to 4000 for complex tasks.",
+                &["cortex", "mcp", "tools", "get_context"],
+            ),
+            (
+                "MCP: get_delta",
+                "Params: include str, exclude str, max_files int default=128, max_patch_lines int default=40, since str git-ref. Returns git diff as compressed entries: change type + path + summary + patch lines. Omit 'since' for working-tree HEAD diff. Use since='HEAD~5' for commit range. Use exclude='assets' to filter binary noise. Returns 'No git deltas found' if clean.",
+                &["cortex", "mcp", "tools", "get_delta"],
+            ),
+            (
+                "MCP: query_graph",
+                "Params: name str required exact unit ID, depth int default=1. BFS traversal from node. Returns edges as 'source -[relation]-> target'. Relation types: Pairs, Conflicts, Owns, Uses, Calls, Implements, DerivedFrom. depth=1 direct neighbors, depth=2 two-hop impact, depth=3+ full blast radius. Returns 'No graph node found for X' if missing. Use before refactoring widely-used types.",
+                &["cortex", "mcp", "tools", "query_graph"],
+            ),
+            (
+                "MCP: get_preferences",
+                "Params: none. Returns active prefs.toml summary loaded at server startup. Contains project-level coding rules, style constraints, import conventions. Read once per session. File location: .cortex/prefs.toml relative to repo root passed to 'cortex serve'. Returns 'No preferences configured' if missing.",
+                &["cortex", "mcp", "tools", "get_preferences"],
+            ),
+            (
+                "MCP: recurrent_think",
+                "Params: task str required, hypothesis str, loop int, depth_mode str auto/shallow/deep default=auto, max_loops int default=6 max=16. Iterative hypothesis refinement. First call: provide task only to seed. Each loop: provide refined hypothesis, get critiques plus next_prompt plus confidence. Halt at confidence>=92% or max_loops. 'shallow' forces 2 loops, 'deep' allows up to 16. Scratchpad persisted in SQLite between calls.",
+                &["cortex", "mcp", "tools", "recurrent_think"],
+            ),
+            (
+                "MCP: simulate_change",
+                "Params: item str required exact name, change str default='unspecified change', depth int default=1. Predicts impact of changing 'item'. Returns risk Low/Medium/High, affected modules, recommended actions. depth=1 direct deps, depth=2+ cascade. Use before modifying widely-used types. High risk = stop and confirm with user.",
+                &["cortex", "mcp", "tools", "simulate_change"],
+            ),
+            (
+                "MCP: recall",
+                "Params: topic str required. Consolidated lookup across ALL memory layers: indexed units, patterns, anti-patterns, annotations. Best single call for 'what do we know about X'. Increments pattern use_count on match which affects survival_rate. Returns 'Nothing found' if no match — add an annotation in that case.",
+                &["cortex", "mcp", "tools", "recall"],
+            ),
+            (
+                "MCP: list_patterns",
+                "Params: none. Returns all approved patterns with: name, intent, body, uses, survival_rate. Patterns with survival_rate<0.4 show a warning marker. Patterns with use_count=0 may be stale. Call at task start for a domain to see all relevant approved patterns at once rather than multiple recall calls. survival_rate = use_count / (use_count + reverted_count).",
+                &["cortex", "mcp", "tools", "list_patterns"],
+            ),
+            (
+                "MCP: get_anti_patterns",
+                "Params: none. Returns ALL anti-patterns as wrong/correct pairs. ALWAYS call before generating code in a new domain. Call this at session start alongside get_preferences and list_patterns for the mandatory pre-code check.",
+                &["cortex", "mcp", "tools", "get_anti_patterns"],
+            ),
+            (
+                "MCP: suggest_pattern",
+                "Params: name str, intent str, body str, uses array of str. Queues pattern as pending observation — does NOT auto-approve. Human must run 'cortex review' then 'cortex crystallize ID'. Use after verifying a pattern works in real code. Governance: suggest freely, approve deliberately.",
+                &["cortex", "mcp", "tools", "suggest_pattern"],
+            ),
+            (
+                "MCP: list_all",
+                "Params: kind str optional enum/struct/trait/fn/type/const. Lists all indexed units filtered by kind, grouped by kind. Good for discovery when you don't know a type name. kind='enum' shows all enums. kind='struct' shows all structs. Includes scoped units (e.g. synful::) when indexed.",
+                &["cortex", "mcp", "tools", "list_all"],
+            ),
+        ];
+
+        for (topic, body, tags) in annotations {
+            let ann = Annotation {
+                id: None,
+                topic: (*topic).to_string(),
+                body: (*body).to_string(),
+                tags: tags.iter().map(|t| t.to_string()).collect(),
+                added_at: Utc::now(),
+            };
+            self.insert_annotation(&ann)?;
+        }
+        eprintln!("[cortex]   seeded {} MCP tool annotations", annotations.len());
+
+        // ── prefs.toml template ───────────────────────────────────────────────
+        if let Some(dir) = db_path.parent() {
+            let prefs_path = dir.join("prefs.toml");
+            if !prefs_path.exists() {
+                std::fs::write(&prefs_path, PREFS_TEMPLATE)
+                    .with_context(|| format!("could not write prefs.toml: {}", prefs_path.display()))?;
+                eprintln!("[cortex]   created prefs.toml — edit [project].name and add your API notes");
+            }
+        }
+
+        eprintln!("[cortex] First-run setup complete. See README.md for the recommended copilot-instructions.md snippet.");
+        Ok(())
     }
 
     /// Expose the connection for cache operations.

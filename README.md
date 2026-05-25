@@ -197,20 +197,95 @@ The api-graph items take precedence over raw source units when both exist for th
 
 ## copilot-instructions.md snippet
 
-Add this to your existing `.github/copilot-instructions.md`:
+Add this block to your `.github/copilot-instructions.md`. It teaches the assistant
+when and how to use cortex throughout a session — not just at boot.
 
 ```markdown
-## Cortex (Semantic Memory)
+## Cortex (Semantic Memory Layer)
 
-Before writing any Quartz code:
-1. Call `get_anti_patterns` - never violate these.
-2. Call `semantic_search` with your intent to find relevant API items.
-3. Call `recall` on any type you're about to use.
-4. Call `get_context` with the current file paths if starting a new task.
+cortex holds project-specific knowledge that is NOT in training data:
+bug traps, approved patterns, API facts, architecture decisions, and corrections.
+Always consult it before writing code and when blocked during a task.
 
-If you generate a useful pattern, call `suggest_pattern` to queue it for review.
-Do not assume any pattern is approved until you've seen it in `list_patterns`.
+### PROTOCOL - CORTEX Trigger
+
+If user message contains PROTOCOL - CORTEX -:
+- Run baseline retrieval: get_delta → get_preferences → get_anti_patterns → get_context
+- Use JSON mode for automation-critical commands: cortex --format json status --full
+
+### Mandatory Pre-Code Check (no trigger required)
+
+Before writing any factory, tick/update, spawn, pool, or physics-integration function:
+1. `get_anti_patterns` — check all known traps for this project
+2. `get_preferences` — load current style rules and API notes
+3. `list_patterns` — find approved patterns for the task category
+
+Skip only for trivial changes: renaming a constant, fixing a typo, adding a comment.
+
+### Mid-Task Cortex Checkpoints
+
+Cortex is a co-author, not a boot-time shelf. Consult it at every "I'm not sure" moment:
+
+| Situation | Tool to call |
+|---|---|
+| First approach failed | `recall <error_keyword>` before trying a second approach |
+| Unfamiliar compiler error | `semantic_search <error description>` before reading source |
+| A type/module behaves unexpectedly | `get_item <typename>` before reading docs |
+| About to add a new integration point | `simulate_change <unit>` to preview impact first |
+| Code compiles but behavior is wrong | `recall <behavior_keyword>` — may be a known runtime trap |
+| Choosing between two approaches | `list_patterns` + `get_anti_patterns` to see if one is vetted |
+
+**Blocked rule:** After two failed attempts at the same problem, STOP and run
+`recall <topic>` before a third. If cortex has nothing, note the gap for crystallization.
+
+### Tagging Quality (for semantic findability)
+
+New cortex entries must be findable by concept, not just exact API name:
+- Tags: API name + behavior + domain + colloquial term
+  e.g., GrappleConstraint → tags: grapple,hook,rope,constraint,swing,GrappleConstraint
+- Include error code if applicable: E0583,file-not-found (not just module-resolution)
+- First sentence of description = what goes wrong, not what the feature is
+- Body text: include both the official name AND plain-words description
+- Use `semantic_search` to look up entries — it uses embedding similarity,
+  so conceptual descriptions find relevant entries even with wrong API names
+
+### Session-End (Mandatory)
+
+After every session where code was written or a bug was fixed:
+1. Run post-session: `cortex post-session` (or your launcher equivalent)
+2. Add new bugs as anti-patterns; working implementations as patterns
+3. Update prefs notes if a new API fact was discovered
 ```
+
+### Recommended initial prefs.toml
+
+Create `.cortex/prefs.toml` in your project root (or run `cortex init` via the launcher):
+
+```toml
+[style]
+line_length = 100
+indent = "4 spaces"
+naming = "snake_case functions and variables, PascalCase types and enums"
+
+[project]
+name = "YourProject"
+language = "Rust"
+notes = [
+    "MANDATORY PRE-CODE CHECK (no PROTOCOL required): before writing any factory/tick/spawn/physics function call get_anti_patterns + get_preferences + list_patterns",
+    "MANDATORY MID-TASK CORTEX USAGE: after first approach fails call recall <error_keyword> before retrying. After two failed attempts STOP and call recall or semantic_search before a third.",
+    "session-end mandatory: after any coding session run post-session then annotate new bugs as anti-patterns and working implementations as patterns",
+]
+```
+
+### Windows / PowerShell CLI notes
+
+When passing strings to `cortex.exe` from PowerShell:
+- All `--description`, `--body`, `--reason`, `--wrong`, `--correct` values must be **single-line**
+  — multiline string variables pass each newline as a separate argument to the exe
+- Use `;` not `&&` for command chaining (PowerShell 5.1 does not support `&&`)
+- Use ASCII hyphen `-` not em-dash `—` in argument values
+- Use single-quoted `'strings'` for static values; double-quoted strings expand `$vars`
+- After any cortex command, check `$LASTEXITCODE` — silent failure is possible
 
 ---
 

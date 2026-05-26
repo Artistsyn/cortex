@@ -36,6 +36,32 @@ cortex serve --source src --api-graph docs/quartz-ctx/api-graph.json --name Quar
 Copy `.vscode/mcp.json` from this repo into your project. VS Code starts cortex
 automatically when you open the workspace.
 
+### Copilot Chat MCP readiness (required)
+
+Before relying on Cortex in chat, verify the required MCP baseline is callable:
+- `get_delta`
+- `get_preferences`
+- `get_anti_patterns`
+- `list_patterns`
+- `get_context`
+
+If any required tool is missing/failing, remediate before coding:
+
+```powershell
+.\.cortex\cortex.ps1 doctor --format json
+.\.cortex\cortex.ps1 -- status --format json --full
+```
+
+Then verify `.vscode/mcp.json` has a Cortex server entry, restart the server path,
+and reload VS Code window if needed:
+
+```powershell
+.\.cortex\cortex.ps1 serve
+```
+
+Do not proceed with non-trivial tasks until the MCP baseline passes (unless user
+explicitly approves degraded mode after a blocker report).
+
 ---
 
 ## Commands
@@ -210,8 +236,18 @@ Always consult it before writing code and when blocked during a task.
 ### PROTOCOL - CORTEX Trigger
 
 If user message contains PROTOCOL - CORTEX -:
+- Run MCP readiness gate first: required tools are get_delta, get_preferences,
+  get_anti_patterns, list_patterns, get_context
+- If any required tool fails, run remediation loop before coding:
+  1) `.\.cortex\cortex.ps1 doctor --format json`
+  2) `.\.cortex\cortex.ps1 -- status --format json --full`
+  3) verify `.vscode/mcp.json` cortex server entry
+  4) restart MCP server path (`.\.cortex\cortex.ps1 serve`) and re-probe tools
+  5) reload VS Code window and re-probe
 - Run baseline retrieval: get_delta → get_preferences → get_anti_patterns → get_context
 - Use JSON mode for automation-critical commands: cortex --format json status --full
+- Hard rule: do not silently bypass missing required MCP tools for non-trivial tasks.
+  Stop and report blocker unless user explicitly approves degraded mode.
 
 ### Mandatory Pre-Code Check (no trigger required)
 
@@ -252,7 +288,7 @@ New cortex entries must be findable by concept, not just exact API name:
 ### Session-End (Mandatory)
 
 After every session where code was written or a bug was fixed:
-1. Run post-session: `cortex post-session` (or your launcher equivalent)
+1. Run post-session: `.\.cortex\cortex.ps1 post-session` (or your launcher equivalent)
 2. Add new bugs as anti-patterns; working implementations as patterns
 3. Update prefs notes if a new API fact was discovered
 ```

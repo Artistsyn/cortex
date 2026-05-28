@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use memory::Store;
 
@@ -42,6 +42,9 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    /// First-time project bootstrap: create launcher and MCP config files.
+    Bootstrap(BootstrapArgs),
+
     /// Index a source directory (and optional quartz-ctx api-graph.json).
     Index(IndexArgs),
 
@@ -206,6 +209,25 @@ struct IndexArgs {
     /// Use when indexing multiple source roots into the same DB to avoid ID collisions.
     #[arg(long)]
     scope: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct BootstrapArgs {
+    /// Workspace root where .cortex/ and .vscode/ should be created.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+
+    /// Primary source path used by the MCP serve entry.
+    #[arg(long, default_value = "src")]
+    source: String,
+
+    /// Project display name used by MCP serve.
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Overwrite existing files when present.
+    #[arg(long, default_value_t = false)]
+    force: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -400,6 +422,7 @@ fn main() -> Result<()> {
     let format = cli.format;
 
     match cli.command {
+        Command::Bootstrap(args)   => run_bootstrap(args, &db_path),
         Command::Index(args)       => run_index(args, &db_path),
         Command::Serve(args)       => run_serve(args, &db_path),
         Command::Watch(args)       => run_watch(args, &db_path),
@@ -425,6 +448,196 @@ fn main() -> Result<()> {
             run_correction(&attempted, &reason, &fix, &tag_vec, &db_path)
         }
     }
+}
+
+fn run_bootstrap(args: BootstrapArgs, db_path: &Path) -> Result<()> {
+    let repo = args.repo;
+    let cortex_dir = repo.join(".cortex");
+    let vscode_dir = repo.join(".vscode");
+    std::fs::create_dir_all(&cortex_dir)
+        .with_context(|| format!("failed to create {}", cortex_dir.display()))?;
+    std::fs::create_dir_all(&vscode_dir)
+        .with_context(|| format!("failed to create {}", vscode_dir.display()))?;
+
+    let project_name = args.name.unwrap_or_else(|| {
+        repo.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Project".to_string())
+    });
+
+    let script_path = cortex_dir.join("cortex.ps1");
+    let index_path = cortex_dir.join("index-sources.json");
+    let mcp_path = vscode_dir.join("mcp.json");
+
+    if args.force || !script_path.exists() {
+        std::fs::write(&script_path, bootstrap_cortex_ps1_template())
+            .with_context(|| format!("failed to write {}", script_path.display()))?;
+        println!("wrote {}", script_path.display());
+    } else {
+        println!("kept existing {}", script_path.display());
+    }
+
+    if args.force || !index_path.exists() {
+        let index_json = json!({
+            "targets": [
+                {
+                    "source": args.source,
+                    "name": project_name,
+                    "scope": Value::Null,
+                }
+            ]
+        });
+        std::fs::write(&index_path, serde_json::to_string_pretty(&index_json)?)
+            .with_context(|| format!("failed to write {}", index_path.display()))?;
+        println!("wrote {}", index_path.display());
+    } else {
+        println!("kept existing {}", index_path.display());
+    }
+
+    let mut mcp: Value = if mcp_path.exists() {
+        let raw = std::fs::read_to_string(&mcp_path)
+            .with_context(|| format!("failed to read {}", mcp_path.display()))?;
+        serde_json::from_str(&raw).unwrap_or_else(|_| json!({ "servers": {}, "inputs": [] }))
+    } else {
+        json!({ "servers": {}, "inputs": [] })
+    };
+
+    if !mcp.is_object() {
+        mcp = json!({ "servers": {}, "inputs": [] });
+    }
+    if !mcp.get("servers").map(|v| v.is_object()).unwrap_or(false) {
+        mcp["servers"] = json!({});
+    }
+    if !mcp.get("inputs").map(|v| v.is_array()).unwrap_or(false) {
+        mcp["inputs"] = json!([]);
+    }
+
+    mcp["servers"]["cortex"] = json!({
+        "type": "stdio",
+        "command": "cortex/target/debug/cortex.exe",
+        "args": [
+            "--db",
+            db_path.to_string_lossy().replace('\\', "/"),
+            "serve",
+            "--source",
+            "src",
+            "--repo",
+            ".",
+            "--name",
+            project_name
+        ],
+        "description": "Cortex MCP direct binary server. Reindex via .cortex/cortex.ps1 reindex (uses .cortex/index-sources.json)."
+    });
+
+    std::fs::write(&mcp_path, serde_json::to_string_pretty(&mcp)?)
+        .with_context(|| format!("failed to write {}", mcp_path.display()))?;
+    println!("updated {}", mcp_path.display());
+
+    println!("\nbootstrap complete:");
+    println!("  1. Build cortex binary: cargo build --manifest-path cortex/Cargo.toml");
+    println!("  2. Index sources: .\\.cortex\\cortex.ps1 reindex");
+    println!("  3. Start MCP server: .\\.cortex\\cortex.ps1 serve");
+    Ok(())
+}
+
+fn bootstrap_cortex_ps1_template() -> &'static str {
+    r#"# cortex.ps1 (bootstrap template)
+param(
+    [Parameter(Position=0)]
+    [string]$Command = "serve",
+
+    [Parameter(Position=1, ValueFromRemainingArguments=$true)]
+    [string[]]$Rest
+)
+
+$DB = ".cortex\memory.db"
+$INDEX_CONFIG = ".cortex\index-sources.json"
+$BIN = "cortex\target\debug\cortex.exe"
+
+function Ensure-Binary {
+    if (-not (Test-Path $BIN)) {
+        Write-Error "Cortex binary not found at $BIN. Run: cargo build --manifest-path cortex/Cargo.toml"
+        exit 1
+    }
+}
+
+function Get-PrimarySource {
+    if (Test-Path $INDEX_CONFIG) {
+        try {
+            $cfg = Get-Content -Raw -Path $INDEX_CONFIG | ConvertFrom-Json
+            if ($cfg.targets -and $cfg.targets.Count -gt 0 -and $cfg.targets[0].source) {
+                return [string]$cfg.targets[0].source
+            }
+        } catch {}
+    }
+    return "src"
+}
+
+function Setup-Mcp {
+    $path = ".vscode\mcp.json"
+    $cfg = $null
+    if (Test-Path $path) {
+        try { $cfg = Get-Content -Raw -Path $path | ConvertFrom-Json } catch { $cfg = $null }
+    }
+    if (-not $cfg) { $cfg = [pscustomobject]@{} }
+    if (-not $cfg.servers) { $cfg | Add-Member -NotePropertyName servers -NotePropertyValue ([pscustomobject]@{}) -Force }
+    if (-not $cfg.inputs)  { $cfg | Add-Member -NotePropertyName inputs  -NotePropertyValue @() -Force }
+
+    $cfg.servers | Add-Member -NotePropertyName cortex -NotePropertyValue ([pscustomobject]@{
+        type = "stdio"
+        command = "cortex/target/debug/cortex.exe"
+        args = @("--db", ".cortex/memory.db", "serve", "--source", (Get-PrimarySource), "--repo", ".", "--name", "Project")
+        description = "Cortex MCP direct binary server. Reindex via .cortex/cortex.ps1 reindex."
+    }) -Force
+
+    Set-Content -Path $path -Value ($cfg | ConvertTo-Json -Depth 20) -Encoding UTF8
+    Write-Host "[cortex] updated $path"
+}
+
+Ensure-Binary
+
+switch ($Command) {
+    "serve" {
+        $source = Get-PrimarySource
+        & $BIN --db $DB serve --source $source --repo . --name Project
+        exit $LASTEXITCODE
+    }
+    "reindex" {
+        if (Test-Path $INDEX_CONFIG) {
+            $cfg = Get-Content -Raw -Path $INDEX_CONFIG | ConvertFrom-Json
+            foreach ($t in $cfg.targets) {
+                if (-not $t.source) { continue }
+                $name = if ($t.name) { [string]$t.name } else { "Project" }
+                $args = @("--db", $DB, "index", "--source", [string]$t.source, "--name", $name)
+                if ($t.scope) { $args += @("--scope", [string]$t.scope) }
+                & $BIN @args
+                if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+        } else {
+            & $BIN --db $DB index --source src --name Project
+            exit $LASTEXITCODE
+        }
+        Write-Host "[cortex] reindex complete"
+    }
+    "setup-mcp" {
+        Setup-Mcp
+    }
+    "status" {
+        & $BIN --db $DB --format json status --full
+        exit $LASTEXITCODE
+    }
+    "doctor" {
+        $source = Get-PrimarySource
+        & $BIN --db $DB --format json doctor workflow --repo . --source $source --name Project
+        exit $LASTEXITCODE
+    }
+    default {
+        & $BIN --db $DB $Command @Rest
+        exit $LASTEXITCODE
+    }
+}
+"#
 }
 
 // ── Command handlers ──────────────────────────────────────────────────────────

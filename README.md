@@ -26,6 +26,9 @@ Nothing gets written to memory without your explicit approval.
 ```sh
 cargo install --path /path/to/cortex
 
+# 0. First-time workspace bootstrap (creates .cortex/cortex.ps1, .cortex/index-sources.json, .vscode/mcp.json)
+cortex bootstrap --repo . --source src --name MyProject
+
 # 1. Index your source (and optionally a quartz-ctx api-graph)
 cortex index --source src --api-graph docs/quartz-ctx/api-graph.json --name Quartz
 
@@ -33,8 +36,9 @@ cortex index --source src --api-graph docs/quartz-ctx/api-graph.json --name Quar
 cortex serve --source src --api-graph docs/quartz-ctx/api-graph.json --name Quartz
 ```
 
-Copy `.vscode/mcp.json` from this repo into your project. VS Code starts cortex
-automatically when you open the workspace.
+The bootstrap command writes a valid direct-binary Cortex MCP entry. It avoids
+mixed command/argument family bugs (for example, `cortex.exe` command with
+PowerShell `-File` arguments).
 
 ### Copilot Chat MCP readiness (required)
 

@@ -14,11 +14,14 @@ mod reasoner;
 mod search;
 mod watcher;
 
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use rusqlite::params;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use memory::Store;
@@ -153,6 +156,15 @@ enum Command {
         #[arg(long, default_value = "")]
         tags: String,
     },
+
+    /// Log an execution outcome for evidence tracking.
+    Outcome(OutcomeArgs),
+
+    /// Apply weighted pattern confidence updates from retrieval + outcome evidence.
+    OutcomeApply(OutcomeApplyArgs),
+
+    /// Run lightweight benchmark harnesses for syntax lookup and dependency precision.
+    Benchmark(BenchmarkArgs),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -275,6 +287,65 @@ struct CrystallizeArgs {
 #[derive(Parser, Debug)]
 struct DismissArgs {
     pub id: i64,
+}
+
+#[derive(Parser, Debug)]
+struct OutcomeArgs {
+    /// Logical session identifier (for example: protocol_run_2026_06_07).
+    #[arg(long, default_value = "cli_manual")]
+    session_id: String,
+
+    /// Outcome classification (for example: build_pass, build_fail, test_fail, review_findings).
+    #[arg(long)]
+    outcome_type: String,
+
+    /// Optional error payload or failure message.
+    #[arg(long)]
+    error_text: Option<String>,
+
+    /// Optional comma-separated or free-form impacted symbols summary.
+    #[arg(long)]
+    diff_symbols: Option<String>,
+
+    /// Automatically apply weighted evidence after logging the outcome.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    auto_apply: bool,
+}
+
+#[derive(Parser, Debug)]
+struct OutcomeApplyArgs {
+    /// Session identifier to evaluate from retrieval and outcome logs.
+    #[arg(long)]
+    session_id: String,
+
+    /// Preview computed weights without mutating pattern counters.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum BenchmarkTarget {
+    Syntax,
+    Dependency,
+}
+
+#[derive(Parser, Debug)]
+struct BenchmarkArgs {
+    /// Benchmark category.
+    #[arg(long, value_enum)]
+    target: BenchmarkTarget,
+
+    /// Number of samples to evaluate.
+    #[arg(long, default_value_t = 64)]
+    samples: usize,
+
+    /// Graph traversal depth for dependency benchmark.
+    #[arg(long, default_value_t = 2)]
+    depth: u8,
+
+    /// Optional JSON corpus path for dependency precision checks.
+    #[arg(long)]
+    corpus: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -447,6 +518,9 @@ fn main() -> Result<()> {
                 .filter(|s| !s.is_empty()).collect();
             run_correction(&attempted, &reason, &fix, &tag_vec, &db_path)
         }
+        Command::Outcome(args) => run_outcome(args, &db_path, format),
+        Command::OutcomeApply(args) => run_outcome_apply(args, &db_path, format),
+        Command::Benchmark(args) => run_benchmark(args, &db_path, format),
     }
 }
 
@@ -454,6 +528,7 @@ fn run_bootstrap(args: BootstrapArgs, db_path: &Path) -> Result<()> {
     let repo = args.repo;
     let cortex_dir = repo.join(".cortex");
     let vscode_dir = repo.join(".vscode");
+    let primary_source = args.source.clone();
     std::fs::create_dir_all(&cortex_dir)
         .with_context(|| format!("failed to create {}", cortex_dir.display()))?;
     std::fs::create_dir_all(&vscode_dir)
@@ -465,8 +540,21 @@ fn run_bootstrap(args: BootstrapArgs, db_path: &Path) -> Result<()> {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "Project".to_string())
     });
+    let has_nested_cortex = repo.join("cortex").join("Cargo.toml").exists();
+    let mcp_command = if has_nested_cortex {
+        "cortex/target/debug/cortex.exe"
+    } else {
+        "target/debug/cortex.exe"
+    };
+    let build_manifest = if has_nested_cortex {
+        "cortex/Cargo.toml"
+    } else {
+        "Cargo.toml"
+    };
 
     let script_path = cortex_dir.join("cortex.ps1");
+    let reset_path = cortex_dir.join("cortex-reset.ps1");
+    let notes_path = cortex_dir.join("FIRST_RUN_SETUP_NOTES.md");
     let index_path = cortex_dir.join("index-sources.json");
     let mcp_path = vscode_dir.join("mcp.json");
 
@@ -478,12 +566,28 @@ fn run_bootstrap(args: BootstrapArgs, db_path: &Path) -> Result<()> {
         println!("kept existing {}", script_path.display());
     }
 
+    if args.force || !reset_path.exists() {
+        std::fs::write(&reset_path, bootstrap_cortex_reset_ps1_template())
+            .with_context(|| format!("failed to write {}", reset_path.display()))?;
+        println!("wrote {}", reset_path.display());
+    } else {
+        println!("kept existing {}", reset_path.display());
+    }
+
+    if args.force || !notes_path.exists() {
+        std::fs::write(&notes_path, bootstrap_first_run_notes_template())
+            .with_context(|| format!("failed to write {}", notes_path.display()))?;
+        println!("wrote {}", notes_path.display());
+    } else {
+        println!("kept existing {}", notes_path.display());
+    }
+
     if args.force || !index_path.exists() {
         let index_json = json!({
             "targets": [
                 {
-                    "source": args.source,
-                    "name": project_name,
+                    "source": primary_source.clone(),
+                    "name": project_name.clone(),
                     "scope": Value::Null,
                 }
             ]
@@ -515,13 +619,13 @@ fn run_bootstrap(args: BootstrapArgs, db_path: &Path) -> Result<()> {
 
     mcp["servers"]["cortex"] = json!({
         "type": "stdio",
-        "command": "cortex/target/debug/cortex.exe",
+        "command": mcp_command,
         "args": [
             "--db",
             db_path.to_string_lossy().replace('\\', "/"),
             "serve",
             "--source",
-            "src",
+            primary_source,
             "--repo",
             ".",
             "--name",
@@ -535,90 +639,668 @@ fn run_bootstrap(args: BootstrapArgs, db_path: &Path) -> Result<()> {
     println!("updated {}", mcp_path.display());
 
     println!("\nbootstrap complete:");
-    println!("  1. Build cortex binary: cargo build --manifest-path cortex/Cargo.toml");
-    println!("  2. Index sources: .\\.cortex\\cortex.ps1 reindex");
-    println!("  3. Start MCP server: .\\.cortex\\cortex.ps1 serve");
+    println!("  1. Build cortex binary: cargo build --manifest-path {build_manifest}");
+    println!("  2. Repair MCP config: .\\.cortex\\cortex.ps1 setup-mcp");
+    println!("  3. Index sources: .\\.cortex\\cortex.ps1 reindex");
+    println!("  4. Validate MCP readiness: .\\.cortex\\cortex.ps1 mcp-ready -SelfCheckFormat json");
+    println!("  5. Run tooling smoke check: .\\.cortex\\cortex.ps1 smoke -SelfCheckFormat json");
+    println!("  6. Start MCP server: .\\.cortex\\cortex.ps1 serve");
     Ok(())
 }
 
 fn bootstrap_cortex_ps1_template() -> &'static str {
     r#"# cortex.ps1 (bootstrap template)
+# Generated by: cortex bootstrap
+
 param(
     [Parameter(Position=0)]
     [string]$Command = "serve",
 
     [Parameter(Position=1, ValueFromRemainingArguments=$true)]
-    [string[]]$Rest
+    [string[]]$Rest,
+
+    [ValidateSet("text", "line", "json")]
+    [string]$SelfCheckFormat = "text"
 )
 
 $DB = ".cortex\memory.db"
 $INDEX_CONFIG = ".cortex\index-sources.json"
-$BIN = "cortex\target\debug\cortex.exe"
+$BIN_CANDIDATES = @("cortex\target\debug\cortex.exe", "target\debug\cortex.exe")
+$MANIFEST_CANDIDATES = @("cortex\Cargo.toml", "Cargo.toml")
+$REPO = "."
+
+function Get-FirstExistingPath {
+    param(
+        [string[]]$Candidates,
+        [string]$Fallback
+    )
+
+    foreach ($candidate in $Candidates) {
+        if (Test-Path $candidate) {
+            return $candidate
+        }
+    }
+
+    return $Fallback
+}
+
+$BIN = Get-FirstExistingPath -Candidates $BIN_CANDIDATES -Fallback "target\debug\cortex.exe"
+$MANIFEST = Get-FirstExistingPath -Candidates $MANIFEST_CANDIDATES -Fallback "Cargo.toml"
+
+function Get-McpCommandPath {
+    if (Test-Path "cortex\Cargo.toml") {
+        return "cortex/target/debug/cortex.exe"
+    }
+    return "target/debug/cortex.exe"
+}
+
+function Write-Prefix {
+    param([string]$Message)
+    Write-Host "[cortex] $Message"
+}
 
 function Ensure-Binary {
     if (-not (Test-Path $BIN)) {
-        Write-Error "Cortex binary not found at $BIN. Run: cargo build --manifest-path cortex/Cargo.toml"
+        Write-Error "Cortex binary not found at $BIN. Run: cargo build --manifest-path $MANIFEST"
         exit 1
     }
 }
 
-function Get-PrimarySource {
+function Get-PrimaryTarget {
+    $target = [pscustomobject]@{
+        source = "src"
+        name = "Project"
+        scope = $null
+    }
+
     if (Test-Path $INDEX_CONFIG) {
         try {
             $cfg = Get-Content -Raw -Path $INDEX_CONFIG | ConvertFrom-Json
             if ($cfg.targets -and $cfg.targets.Count -gt 0 -and $cfg.targets[0].source) {
-                return [string]$cfg.targets[0].source
+                $target.source = [string]$cfg.targets[0].source
+                if ($cfg.targets[0].name) {
+                    $target.name = [string]$cfg.targets[0].name
+                }
+                if ($cfg.targets[0].scope) {
+                    $target.scope = [string]$cfg.targets[0].scope
+                }
             }
-        } catch {}
+        }
+        catch {
+            Write-Prefix "WARN: failed to parse $INDEX_CONFIG; using defaults"
+        }
     }
-    return "src"
+
+    return $target
+}
+
+function Get-PrimarySource {
+    $target = Get-PrimaryTarget
+    return [string]$target.source
+}
+
+function Get-PrimaryName {
+    $target = Get-PrimaryTarget
+    return [string]$target.name
 }
 
 function Setup-Mcp {
     $path = ".vscode\mcp.json"
     $cfg = $null
+
     if (Test-Path $path) {
-        try { $cfg = Get-Content -Raw -Path $path | ConvertFrom-Json } catch { $cfg = $null }
+        try {
+            $cfg = Get-Content -Raw -Path $path | ConvertFrom-Json
+        }
+        catch {
+            Write-Prefix "WARN: existing $path is invalid JSON; recreating a minimal config"
+            $cfg = $null
+        }
     }
-    if (-not $cfg) { $cfg = [pscustomobject]@{} }
-    if (-not $cfg.servers) { $cfg | Add-Member -NotePropertyName servers -NotePropertyValue ([pscustomobject]@{}) -Force }
-    if (-not $cfg.inputs)  { $cfg | Add-Member -NotePropertyName inputs  -NotePropertyValue @() -Force }
+
+    if (-not $cfg) {
+        $cfg = [pscustomobject]@{}
+    }
+    if (-not $cfg.servers) {
+        $cfg | Add-Member -NotePropertyName servers -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    if (-not $cfg.inputs) {
+        $cfg | Add-Member -NotePropertyName inputs -NotePropertyValue @() -Force
+    }
+
+    $source = Get-PrimarySource
+    $name = Get-PrimaryName
+    $command = Get-McpCommandPath
 
     $cfg.servers | Add-Member -NotePropertyName cortex -NotePropertyValue ([pscustomobject]@{
         type = "stdio"
-        command = "cortex/target/debug/cortex.exe"
-        args = @("--db", ".cortex/memory.db", "serve", "--source", (Get-PrimarySource), "--repo", ".", "--name", "Project")
-        description = "Cortex MCP direct binary server. Reindex via .cortex/cortex.ps1 reindex."
+        command = $command
+        args = @("--db", ".cortex/memory.db", "serve", "--source", $source, "--repo", ".", "--name", $name)
+        description = "Cortex MCP direct binary server. Reindex via .cortex/cortex.ps1 reindex (uses .cortex/index-sources.json)."
     }) -Force
 
     Set-Content -Path $path -Value ($cfg | ConvertTo-Json -Depth 20) -Encoding UTF8
-    Write-Host "[cortex] updated $path"
+    Write-Prefix "updated $path"
+}
+
+function Convert-CortexOutputToJson {
+    param([string]$Text)
+
+    if (-not $Text) {
+        return $null
+    }
+
+    try {
+        return ($Text | ConvertFrom-Json)
+    }
+    catch {}
+
+    $lines = $Text -split "`r?`n"
+    foreach ($line in $lines) {
+        $trimmed = $line.Trim()
+        if (-not $trimmed) { continue }
+        if (-not (($trimmed.StartsWith("{")) -or ($trimmed.StartsWith("[")))) { continue }
+        try {
+            return ($trimmed | ConvertFrom-Json)
+        }
+        catch {}
+    }
+
+    return $null
+}
+
+function Invoke-LegacyMigrationPathway {
+    param(
+        [string]$TriggerCommand = ""
+    )
+
+    if (-not (Test-Path $DB)) {
+        return $true
+    }
+
+    $output = (& $BIN --db $DB --format json status --full 2>&1 | Out-String)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        Write-Prefix "WARN: legacy migration preflight failed for command '$TriggerCommand'."
+        Write-Prefix "Run: .\\.cortex\\cortex.ps1 migrate-legacy"
+        Write-Prefix "AI workflow prompt: PROTOCOL - CORTEX - migrate .cortex legacy DB and run smoke"
+        return $false
+    }
+
+    $migrationLine = @($output -split "`r?`n" | Where-Object { $_ -match "legacy outcome application markers detected" } | Select-Object -First 1)
+    if ($migrationLine -and $migrationLine.Count -gt 0) {
+        Write-Prefix $migrationLine[0].Trim()
+        Write-Prefix "Legacy migration pathway applied automatically during startup."
+        Write-Prefix "Recommended verification: .\\.cortex\\cortex.ps1 smoke -SelfCheckFormat json"
+    }
+
+    return $true
+}
+
+function Get-StatusCheck {
+    $output = (& $BIN --db $DB --format json status --full 2>&1 | Out-String)
+    $exitCode = $LASTEXITCODE
+    $json = Convert-CortexOutputToJson -Text $output
+
+    $indexedUnits = 0
+    if ($json -and $null -ne $json.indexed_units) {
+        $indexedUnits = [int]$json.indexed_units
+    }
+    elseif ($json -and $json.index -and $json.index.metrics -and $null -ne $json.index.metrics.indexed_units) {
+        $indexedUnits = [int]$json.index.metrics.indexed_units
+    }
+
+    return [pscustomobject]@{
+        ok = ($exitCode -eq 0)
+        indexed_units = $indexedUnits
+        parsed = [bool]($null -ne $json)
+    }
+}
+
+function Get-DoctorCheck {
+    $source = Get-PrimarySource
+    $name = Get-PrimaryName
+
+    $output = (& $BIN --db $DB --format json doctor workflow --repo $REPO --source $source --name $name 2>&1 | Out-String)
+    $exitCode = $LASTEXITCODE
+    $json = Convert-CortexOutputToJson -Text $output
+
+    $checksTotal = 0
+    $checksPass = 0
+    if ($json -and $json.checks) {
+        $checksTotal = @($json.checks).Count
+        $checksPass = @($json.checks | Where-Object { $_.pass -eq $true }).Count
+    }
+
+    return [pscustomobject]@{
+        ok = ($exitCode -eq 0)
+        workflow_ok = [bool]($json -and $json.ok -eq $true)
+        checks_pass = $checksPass
+        checks_total = $checksTotal
+        parsed = [bool]($null -ne $json)
+    }
+}
+
+function Write-SelfCheckResult {
+    param(
+        [bool]$Pass,
+        [object]$Status,
+        [object]$Doctor
+    )
+
+    if ($SelfCheckFormat -eq "json") {
+        [pscustomobject]@{
+            pass = $Pass
+            status_ok = $Status.ok
+            doctor_ok = $Doctor.ok
+            workflow_ok = $Doctor.workflow_ok
+            indexed_units = $Status.indexed_units
+            checks_pass = $Doctor.checks_pass
+            checks_total = $Doctor.checks_total
+            timestamp = (Get-Date).ToString("s")
+        } | ConvertTo-Json -Compress | Write-Host
+        return
+    }
+
+    if ($SelfCheckFormat -eq "line") {
+        $resultText = if ($Pass) { "PASS" } else { "FAIL" }
+        Write-Host ("CORTEX_SELFCHECK {0} status_ok={1} doctor_ok={2} workflow_ok={3} indexed_units={4} checks={5}/{6}" -f $resultText, $Status.ok, $Doctor.ok, $Doctor.workflow_ok, $Status.indexed_units, $Doctor.checks_pass, $Doctor.checks_total)
+        return
+    }
+
+    if ($Pass) {
+        Write-Prefix "selfcheck: PASS"
+    }
+    else {
+        Write-Prefix "selfcheck: FAIL"
+    }
+}
+
+function Invoke-SelfCheck {
+    $status = Get-StatusCheck
+    $doctor = Get-DoctorCheck
+    $pass = $status.ok -and $doctor.ok -and $doctor.workflow_ok -and ($status.indexed_units -gt 0)
+    Write-SelfCheckResult -Pass $pass -Status $status -Doctor $doctor
+    return $pass
+}
+
+function Read-JsonRpcResponse {
+    param(
+        [Parameter(Mandatory=$true)]
+        [System.Diagnostics.Process]$Process,
+
+        [Parameter(Mandatory=$true)]
+        [int]$ExpectedId,
+
+        [int]$TimeoutMs = 10000
+    )
+
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $task = $Process.StandardOutput.ReadLineAsync()
+        if (-not $task.Wait(500)) {
+            continue
+        }
+
+        $line = $task.Result
+        if ($null -eq $line) {
+            break
+        }
+
+        $trim = $line.Trim()
+        if (-not $trim) {
+            continue
+        }
+
+        try {
+            $json = $trim | ConvertFrom-Json
+        }
+        catch {
+            continue
+        }
+
+        if ($null -ne $json.id -and [int]$json.id -eq $ExpectedId) {
+            return $json
+        }
+    }
+
+    return $null
+}
+
+function Test-McpToolSurface {
+    param(
+        [string[]]$RequiredTools = @("get_delta", "get_preferences", "get_anti_patterns", "list_patterns", "get_context"),
+        [int]$TimeoutMs = 12000
+    )
+
+    if (-not (Test-Path $BIN)) {
+        return [pscustomobject]@{
+            ok = $false
+            reason = "missing_binary"
+            tools = @()
+            tool_defs = @()
+            missing_tools = $RequiredTools
+        }
+    }
+
+    $source = Get-PrimarySource
+    $name = Get-PrimaryName
+
+    $proc = $null
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $BIN
+        $psi.Arguments = "--db `"$DB`" serve --source `"$source`" --repo `"$REPO`" --name `"$name`""
+        $psi.RedirectStandardInput = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+
+        $proc = New-Object System.Diagnostics.Process
+        $proc.StartInfo = $psi
+        $started = $proc.Start()
+        if (-not $started) {
+            return [pscustomobject]@{
+                ok = $false
+                reason = "process_start_failed"
+                tools = @()
+                tool_defs = @()
+                missing_tools = $RequiredTools
+            }
+        }
+
+        $initReq = @{
+            jsonrpc = "2.0"
+            id = 1
+            method = "initialize"
+            params = @{
+                protocolVersion = "2024-11-05"
+                capabilities = @{}
+                clientInfo = @{ name = "cortex.ps1"; version = "1.0" }
+            }
+        } | ConvertTo-Json -Depth 8 -Compress
+
+        $toolsReq = @{
+            jsonrpc = "2.0"
+            id = 2
+            method = "tools/list"
+            params = @{}
+        } | ConvertTo-Json -Depth 8 -Compress
+
+        $proc.StandardInput.WriteLine($initReq)
+        $proc.StandardInput.Flush()
+        $null = Read-JsonRpcResponse -Process $proc -ExpectedId 1 -TimeoutMs $TimeoutMs
+
+        $proc.StandardInput.WriteLine($toolsReq)
+        $proc.StandardInput.Flush()
+        $toolsResp = Read-JsonRpcResponse -Process $proc -ExpectedId 2 -TimeoutMs $TimeoutMs
+
+        if ($null -eq $toolsResp -or $null -eq $toolsResp.result -or $null -eq $toolsResp.result.tools) {
+            return [pscustomobject]@{
+                ok = $false
+                reason = "tools_list_unavailable"
+                tools = @()
+                tool_defs = @()
+                missing_tools = $RequiredTools
+            }
+        }
+
+        $toolNames = @()
+        foreach ($tool in $toolsResp.result.tools) {
+            if ($tool.name) {
+                $toolNames += [string]$tool.name
+            }
+        }
+
+        $missing = @($RequiredTools | Where-Object { $toolNames -notcontains $_ })
+        return [pscustomobject]@{
+            ok = ($missing.Count -eq 0)
+            reason = if ($missing.Count -eq 0) { "ok" } else { "missing_required_tools" }
+            tools = $toolNames
+            tool_defs = @($toolsResp.result.tools)
+            missing_tools = $missing
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            ok = $false
+            reason = "exception"
+            detail = [string]$_
+            tools = @()
+            tool_defs = @()
+            missing_tools = $RequiredTools
+        }
+    }
+    finally {
+        if ($proc) {
+            try {
+                if (-not $proc.HasExited) {
+                    $proc.Kill()
+                }
+            }
+            catch {}
+            $proc.Dispose()
+        }
+    }
+}
+
+function Write-McpReadyResult {
+    param(
+        [bool]$Pass,
+        [object]$Status,
+        [object]$Doctor,
+        [object]$Probe
+    )
+
+    if ($SelfCheckFormat -eq "json") {
+        [pscustomobject]@{
+            pass = $Pass
+            status_ok = $Status.ok
+            doctor_ok = $Doctor.ok
+            workflow_ok = $Doctor.workflow_ok
+            indexed_units = $Status.indexed_units
+            checks_pass = $Doctor.checks_pass
+            checks_total = $Doctor.checks_total
+            mcp_tools_ok = $Probe.ok
+            mcp_reason = $Probe.reason
+            missing_tools = $Probe.missing_tools
+            tool_count = @($Probe.tools).Count
+            timestamp = (Get-Date).ToString("s")
+        } | ConvertTo-Json -Compress | Write-Host
+        return
+    }
+
+    if ($SelfCheckFormat -eq "line") {
+        $resultText = if ($Pass) { "PASS" } else { "FAIL" }
+        $missing = if ($Probe.missing_tools -and $Probe.missing_tools.Count -gt 0) { $Probe.missing_tools -join "," } else { "none" }
+        Write-Host ("CORTEX_MCP_READY {0} status_ok={1} doctor_ok={2} workflow_ok={3} indexed_units={4} checks={5}/{6} mcp_tools_ok={7} missing_tools={8}" -f $resultText, $Status.ok, $Doctor.ok, $Doctor.workflow_ok, $Status.indexed_units, $Doctor.checks_pass, $Doctor.checks_total, $Probe.ok, $missing)
+        return
+    }
+
+    if ($Pass) {
+        Write-Prefix "mcp-ready: PASS"
+        Write-Prefix "Baseline MCP tools are available."
+    }
+    else {
+        Write-Prefix "mcp-ready: FAIL"
+        if ($Probe.missing_tools -and $Probe.missing_tools.Count -gt 0) {
+            Write-Prefix ("Missing required MCP tools: {0}" -f ($Probe.missing_tools -join ", "))
+        }
+        Write-Prefix "If mcp-ready passes but chat still lacks wrappers, the limitation is in chat tool exposure, not cortex server registration."
+    }
+}
+
+function Invoke-McpReady {
+    $status = Get-StatusCheck
+    $doctor = Get-DoctorCheck
+    $probe = Test-McpToolSurface
+    $healthOk = $status.ok -and $doctor.ok -and $doctor.workflow_ok -and ($status.indexed_units -gt 0)
+    $pass = $healthOk -and $probe.ok
+    Write-McpReadyResult -Pass $pass -Status $status -Doctor $doctor -Probe $probe
+    return $pass
+}
+
+function Test-ToolSchemaProperty {
+    param(
+        [object]$Probe,
+        [string]$ToolName,
+        [string]$PropertyName
+    )
+
+    if (-not $Probe -or -not $Probe.tool_defs) {
+        return $false
+    }
+
+    $tool = @($Probe.tool_defs | Where-Object { $_.name -eq $ToolName } | Select-Object -First 1)
+    if (-not $tool -or $tool.Count -eq 0) {
+        return $false
+    }
+
+    $schema = $tool[0].inputSchema
+    if (-not $schema -or -not $schema.properties) {
+        return $false
+    }
+
+    $propertyNames = @($schema.properties.PSObject.Properties.Name)
+    return ($propertyNames -contains $PropertyName)
+}
+
+function Write-SmokeResult {
+    param(
+        [bool]$Pass,
+        [object]$Status,
+        [object]$Doctor,
+        [object]$Probe,
+        [bool]$RelationFilterOk
+    )
+
+    if ($SelfCheckFormat -eq "json") {
+        [pscustomobject]@{
+            pass = $Pass
+            status_ok = $Status.ok
+            doctor_ok = $Doctor.ok
+            workflow_ok = $Doctor.workflow_ok
+            indexed_units = $Status.indexed_units
+            checks_pass = $Doctor.checks_pass
+            checks_total = $Doctor.checks_total
+            mcp_tools_ok = $Probe.ok
+            relation_filter_ok = $RelationFilterOk
+            missing_tools = $Probe.missing_tools
+            tool_count = @($Probe.tools).Count
+            timestamp = (Get-Date).ToString("s")
+        } | ConvertTo-Json -Compress | Write-Host
+        return
+    }
+
+    if ($SelfCheckFormat -eq "line") {
+        $resultText = if ($Pass) { "PASS" } else { "FAIL" }
+        $missing = if ($Probe.missing_tools -and $Probe.missing_tools.Count -gt 0) { $Probe.missing_tools -join "," } else { "none" }
+        Write-Host ("CORTEX_SMOKE {0} status_ok={1} doctor_ok={2} workflow_ok={3} indexed_units={4} checks={5}/{6} mcp_tools_ok={7} relation_filter_ok={8} missing_tools={9}" -f $resultText, $Status.ok, $Doctor.ok, $Doctor.workflow_ok, $Status.indexed_units, $Doctor.checks_pass, $Doctor.checks_total, $Probe.ok, $RelationFilterOk, $missing)
+        return
+    }
+
+    if ($Pass) {
+        Write-Prefix "smoke: PASS"
+        Write-Prefix "Baseline and extended MCP tooling checks passed."
+    }
+    else {
+        Write-Prefix "smoke: FAIL"
+        if (-not $Probe.ok -and $Probe.missing_tools -and $Probe.missing_tools.Count -gt 0) {
+            Write-Prefix ("Missing required tools: {0}" -f ($Probe.missing_tools -join ", "))
+        }
+        if (-not $RelationFilterOk) {
+            Write-Prefix "simulate_change schema missing relation_filter property"
+        }
+    }
+}
+
+function Invoke-Smoke {
+    $requiredTools = @(
+        "get_delta",
+        "get_preferences",
+        "get_anti_patterns",
+        "list_patterns",
+        "get_context",
+        "get_usage_examples",
+        "get_helper",
+        "explain_dependency_path",
+        "simulate_change"
+    )
+
+    $status = Get-StatusCheck
+    $doctor = Get-DoctorCheck
+    $probe = Test-McpToolSurface -RequiredTools $requiredTools
+    $relationFilterOk = Test-ToolSchemaProperty -Probe $probe -ToolName "simulate_change" -PropertyName "relation_filter"
+
+    $healthOk = $status.ok -and $doctor.ok -and $doctor.workflow_ok -and ($status.indexed_units -gt 0)
+    $pass = $healthOk -and $probe.ok -and $relationFilterOk
+
+    Write-SmokeResult -Pass $pass -Status $status -Doctor $doctor -Probe $probe -RelationFilterOk $relationFilterOk
+    return $pass
+}
+
+$skipLegacyMigrationPreflight = @("setup-mcp", "migrate-legacy")
+if ($skipLegacyMigrationPreflight -notcontains $Command) {
+    $null = Invoke-LegacyMigrationPathway -TriggerCommand $Command
 }
 
 Ensure-Binary
 
 switch ($Command) {
     "serve" {
-        $source = Get-PrimarySource
-        & $BIN --db $DB serve --source $source --repo . --name Project
+        $target = Get-PrimaryTarget
+        & $BIN --db $DB serve --source $target.source --repo $REPO --name $target.name
         exit $LASTEXITCODE
     }
     "reindex" {
+        $targets = @()
         if (Test-Path $INDEX_CONFIG) {
-            $cfg = Get-Content -Raw -Path $INDEX_CONFIG | ConvertFrom-Json
-            foreach ($t in $cfg.targets) {
-                if (-not $t.source) { continue }
-                $name = if ($t.name) { [string]$t.name } else { "Project" }
-                $args = @("--db", $DB, "index", "--source", [string]$t.source, "--name", $name)
-                if ($t.scope) { $args += @("--scope", [string]$t.scope) }
-                & $BIN @args
-                if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            try {
+                $cfg = Get-Content -Raw -Path $INDEX_CONFIG | ConvertFrom-Json
+                if ($cfg.targets) {
+                    $targets = @($cfg.targets)
+                }
             }
-        } else {
-            & $BIN --db $DB index --source src --name Project
-            exit $LASTEXITCODE
+            catch {
+                Write-Prefix "WARN: failed to parse $INDEX_CONFIG; using fallback target"
+            }
         }
-        Write-Host "[cortex] reindex complete"
+
+        if (-not $targets -or $targets.Count -eq 0) {
+            $primary = Get-PrimaryTarget
+            $targets = @($primary)
+        }
+
+        $indexed = 0
+        foreach ($t in $targets) {
+            if (-not $t.source) { continue }
+
+            $source = [string]$t.source
+            if (-not (Test-Path $source)) {
+                Write-Prefix "WARN: skipping missing source path $source"
+                continue
+            }
+
+            $name = if ($t.name) { [string]$t.name } else { "Project" }
+            $args = @("--db", $DB, "index", "--source", $source, "--name", $name)
+            if ($t.scope) {
+                $args += @("--scope", [string]$t.scope)
+            }
+
+            & $BIN @args
+            if ($LASTEXITCODE -ne 0) {
+                exit $LASTEXITCODE
+            }
+            $indexed++
+        }
+
+        if ($indexed -eq 0) {
+            Write-Error "No valid source paths were indexed. Update .cortex/index-sources.json or pass an existing path."
+            exit 1
+        }
+
+        Write-Prefix "reindex complete"
     }
     "setup-mcp" {
         Setup-Mcp
@@ -629,7 +1311,30 @@ switch ($Command) {
     }
     "doctor" {
         $source = Get-PrimarySource
-        & $BIN --db $DB --format json doctor workflow --repo . --source $source --name Project
+        $name = Get-PrimaryName
+        & $BIN --db $DB --format json doctor workflow --repo $REPO --source $source --name $name
+        exit $LASTEXITCODE
+    }
+    "selfcheck" {
+        $ok = Invoke-SelfCheck
+        if (-not $ok) { exit 1 }
+    }
+    "mcp-ready" {
+        $ok = Invoke-McpReady
+        if (-not $ok) { exit 1 }
+    }
+    "smoke" {
+        $ok = Invoke-Smoke
+        if (-not $ok) { exit 1 }
+    }
+    "migrate-legacy" {
+        $ok = Invoke-LegacyMigrationPathway -TriggerCommand $Command
+        if (-not $ok) { exit 1 }
+        Write-Prefix "legacy migration pathway complete"
+        Write-Prefix "next: .\\.cortex\\cortex.ps1 smoke -SelfCheckFormat json"
+    }
+    "--" {
+        & $BIN --db $DB @Rest
         exit $LASTEXITCODE
     }
     default {
@@ -637,6 +1342,139 @@ switch ($Command) {
         exit $LASTEXITCODE
     }
 }
+"#
+}
+
+fn bootstrap_cortex_reset_ps1_template() -> &'static str {
+    r#"# cortex-reset.ps1 (bootstrap template)
+# Soft-default helper for stale cortex.exe lock cleanup.
+
+param(
+    [switch]$rebuild,
+    [switch]$full,
+    [switch]$Aggressive,
+    [switch]$ForceKill,
+    [switch]$PurgeBinaries
+)
+
+if ($Aggressive) {
+    $ForceKill = $true
+    $PurgeBinaries = $true
+}
+
+$RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
+if (Test-Path (Join-Path $RepoRoot "cortex\Cargo.toml")) {
+    $CortexRoot = Join-Path $RepoRoot "cortex"
+}
+else {
+    $CortexRoot = $RepoRoot
+}
+$DebugBinary = Join-Path $CortexRoot "target\debug\cortex.exe"
+$ReleaseBinary = Join-Path $CortexRoot "target\release\cortex.exe"
+
+function Get-CortexProcesses {
+    Get-Process -Name "cortex" -ErrorAction SilentlyContinue
+}
+
+function Stop-CortexProcesses {
+    param([switch]$UseForce)
+    $procs = Get-CortexProcesses
+    if (-not $procs) { return }
+
+    foreach ($proc in $procs) {
+        try {
+            if ($UseForce) {
+                Stop-Process -Id $proc.Id -Force -ErrorAction Stop
+            }
+            else {
+                Stop-Process -Id $proc.Id -ErrorAction Stop
+            }
+        }
+        catch {}
+    }
+}
+
+function Remove-Binaries {
+    param([string[]]$Paths)
+    foreach ($path in $Paths) {
+        if (-not (Test-Path $path)) { continue }
+        try { Remove-Item $path -Force -ErrorAction Stop } catch {}
+    }
+}
+
+Write-Host "[cortex-reset] Step 1/3: stopping cortex processes"
+Stop-CortexProcesses
+
+$remaining = Get-CortexProcesses
+if ($remaining -and $remaining.Count -gt 0) {
+    if ($ForceKill) {
+        Write-Host "[cortex-reset] Step 1b/3: force-killing remaining cortex processes"
+        Stop-CortexProcesses -UseForce
+    }
+    else {
+        Write-Host "[cortex-reset] Some processes are still running. Re-run with -Aggressive if lock persists."
+    }
+}
+
+if ($PurgeBinaries) {
+    Write-Host "[cortex-reset] Step 2/3: removing cortex binaries"
+    Remove-Binaries -Paths @($DebugBinary, $ReleaseBinary)
+}
+else {
+    Write-Host "[cortex-reset] Step 2/3: skipping binary removal (soft mode)"
+}
+
+$buildExit = 0
+if ($full -or $rebuild) {
+    Push-Location $CortexRoot
+    try {
+        if ($full) {
+            Write-Host "[cortex-reset] Step 3/3: cargo clean"
+            & cargo clean
+            if ($LASTEXITCODE -ne 0) { $buildExit = $LASTEXITCODE }
+        }
+
+        if ($rebuild) {
+            Write-Host "[cortex-reset] Step 3/3: cargo build --quiet"
+            & cargo build --quiet
+            if ($LASTEXITCODE -ne 0) { $buildExit = $LASTEXITCODE }
+        }
+    }
+    finally {
+        Pop-Location
+    }
+}
+
+Write-Host "[cortex-reset] Reset complete"
+if ($buildExit -ne 0) {
+    exit $buildExit
+}
+"#
+}
+
+fn bootstrap_first_run_notes_template() -> &'static str {
+    r#"# First-run setup notes
+
+## Why this exists
+
+Cortex can bootstrap launcher scripts and MCP wiring directly from the cortex repo.
+
+## Launcher support
+
+- `.cortex/cortex.ps1 setup-mcp` writes or repairs the Cortex MCP entry.
+- `.cortex/cortex.ps1 selfcheck -SelfCheckFormat json` validates status and doctor health.
+- `.cortex/cortex.ps1 mcp-ready -SelfCheckFormat json` validates required MCP baseline tools from the server tool registry.
+- `.cortex/cortex.ps1 smoke -SelfCheckFormat json` validates baseline + extended MCP tool surface and schema shape.
+- `.cortex/cortex.ps1 reindex` indexes configured targets from `.cortex/index-sources.json`.
+
+## New-user sequence
+
+1. Build cortex binary.
+2. Run `./.cortex/cortex.ps1 setup-mcp`.
+3. Run `./.cortex/cortex.ps1 reindex`.
+4. Run `./.cortex/cortex.ps1 mcp-ready -SelfCheckFormat json`.
+5. Run `./.cortex/cortex.ps1 smoke -SelfCheckFormat json`.
+6. Start `./.cortex/cortex.ps1 serve` (or let VS Code start MCP).
 "#
 }
 
@@ -663,6 +1501,14 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
 
     for unit in &units {
         store.upsert_unit(unit)?;
+        store.upsert_symbol_catalog_from_unit(unit)?;
+        store.add_symbol_example_if_missing(
+            &unit.id,
+            &unit.module_path,
+            None,
+            &unit.compressed,
+            "index_unit",
+        )?;
     }
     for member in &members {
         store.upsert_member(member)?;
@@ -952,6 +1798,472 @@ fn run_annotate(cmd: AnnotateCmd, db_path: &Path, format: OutputFormat) -> Resul
     }
 }
 
+fn run_outcome(args: OutcomeArgs, db_path: &Path, format: OutputFormat) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let id = store.log_outcome(
+        &args.session_id,
+        &args.outcome_type,
+        args.error_text.as_deref(),
+        args.diff_symbols.as_deref(),
+    )?;
+
+    let evidence_report = if args.auto_apply {
+        Some(apply_weighted_pattern_evidence(
+            &store,
+            &args.session_id,
+            false,
+        )?)
+    } else {
+        None
+    };
+
+    if format == OutputFormat::Json {
+        let mut payload = json!({
+            "ok": true,
+            "action": "outcome_logged",
+            "id": id,
+            "session_id": args.session_id,
+            "outcome_type": args.outcome_type,
+            "auto_apply": args.auto_apply,
+        });
+        if let Some(report) = &evidence_report {
+            payload["evidence"] = serde_json::to_value(report)?;
+        }
+        print_json(&payload)?;
+    } else {
+        println!(
+            "outcome logged: id={} session={} type={}",
+            id, args.session_id, args.outcome_type
+        );
+        if let Some(report) = &evidence_report {
+            println!(
+                "auto evidence: pending={} applied={} updated_patterns={} use_delta={} reverted_delta={}",
+                report.pending_outcomes,
+                report.applied_outcomes,
+                report.updated_patterns,
+                report.use_delta_total,
+                report.reverted_delta_total
+            );
+        } else {
+            println!("auto evidence: disabled");
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct OutcomeEvidenceReport {
+    session_id: String,
+    dry_run: bool,
+    already_applied: bool,
+    pending_outcomes: usize,
+    applied_outcomes: usize,
+    retrieved_patterns: usize,
+    positive_outcomes: i64,
+    negative_outcomes: i64,
+    updated_patterns: usize,
+    use_delta_total: i64,
+    reverted_delta_total: i64,
+    applied: bool,
+}
+
+fn classify_outcome_signal(outcome_type: &str) -> (i64, i64) {
+    let lower = outcome_type.to_lowercase();
+    let positive = ["pass", "success", "clean", "ok"]
+        .iter()
+        .any(|k| lower.contains(k));
+    let negative = ["fail", "error", "panic", "regression", "timeout"]
+        .iter()
+        .any(|k| lower.contains(k));
+
+    (if positive { 1 } else { 0 }, if negative { 1 } else { 0 })
+}
+
+fn apply_weighted_pattern_evidence(
+    store: &Store,
+    session_id: &str,
+    dry_run: bool,
+) -> Result<OutcomeEvidenceReport> {
+    let mut report = OutcomeEvidenceReport {
+        session_id: session_id.to_string(),
+        dry_run,
+        already_applied: false,
+        pending_outcomes: 0,
+        applied_outcomes: 0,
+        retrieved_patterns: 0,
+        positive_outcomes: 0,
+        negative_outcomes: 0,
+        updated_patterns: 0,
+        use_delta_total: 0,
+        reverted_delta_total: 0,
+        applied: false,
+    };
+
+    let pending_outcomes = store.pending_outcomes_for_session(session_id)?;
+    report.pending_outcomes = pending_outcomes.len();
+
+    if pending_outcomes.is_empty() {
+        report.already_applied = true;
+        return Ok(report);
+    }
+
+    for (_, kind) in &pending_outcomes {
+        let (pos, neg) = classify_outcome_signal(kind);
+        report.positive_outcomes += pos;
+        report.negative_outcomes += neg;
+    }
+
+    let pattern_hits: Vec<(i64, i64)> = {
+        let mut stmt = store.conn().prepare(
+            "SELECT entry_id, COUNT(*)
+             FROM session_retrieval_log
+             WHERE session_id = ?1
+               AND entry_table = 'patterns'
+             GROUP BY entry_id",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
+        let mut parsed: Vec<(i64, i64)> = Vec::new();
+        for row in rows {
+            let (entry_id, hits) = row?;
+            if let Ok(pattern_id) = entry_id.parse::<i64>() {
+                parsed.push((pattern_id, hits));
+            }
+        }
+        parsed
+    };
+
+    report.retrieved_patterns = pattern_hits.len();
+    let has_signal = report.positive_outcomes > 0 || report.negative_outcomes > 0;
+
+    if has_signal && !pattern_hits.is_empty() {
+        for (pattern_id, hit_count) in pattern_hits {
+            let use_delta = if report.positive_outcomes > 0 {
+                ((hit_count as f64) * (0.5 + 0.25 * report.positive_outcomes as f64)).ceil() as i64
+            } else {
+                0
+            };
+            let reverted_delta = if report.negative_outcomes > 0 {
+                ((hit_count as f64) * (0.5 + 0.35 * report.negative_outcomes as f64)).ceil() as i64
+            } else {
+                0
+            };
+
+            if use_delta == 0 && reverted_delta == 0 {
+                continue;
+            }
+
+            report.use_delta_total += use_delta;
+            report.reverted_delta_total += reverted_delta;
+
+            if !dry_run {
+                let touched = store.conn().execute(
+                    "UPDATE patterns
+                     SET use_count = use_count + ?1,
+                         reverted_count = reverted_count + ?2
+                     WHERE id = ?3",
+                    params![use_delta, reverted_delta, pattern_id],
+                )?;
+                report.updated_patterns += touched as usize;
+            }
+        }
+    }
+
+    if !dry_run {
+        let pending_ids: Vec<i64> = pending_outcomes.iter().map(|(id, _)| *id).collect();
+        report.applied_outcomes = store.mark_outcomes_applied(session_id, &pending_ids)?;
+
+        if report.updated_patterns > 0 {
+            store.conn().execute(
+                "UPDATE patterns
+                 SET survival_rate = CASE
+                     WHEN (use_count + reverted_count) = 0 THEN 1.0
+                     ELSE CAST(use_count AS REAL) / CAST((use_count + reverted_count) AS REAL)
+                 END",
+                [],
+            )?;
+        }
+
+        report.applied = report.updated_patterns > 0 || report.applied_outcomes > 0;
+    }
+
+    Ok(report)
+}
+
+fn run_outcome_apply(args: OutcomeApplyArgs, db_path: &Path, format: OutputFormat) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let report = apply_weighted_pattern_evidence(&store, &args.session_id, args.dry_run)?;
+
+    if format == OutputFormat::Json {
+        print_json(&report)?;
+        return Ok(());
+    }
+
+    println!("outcome evidence");
+    println!("  session:           {}", report.session_id);
+    println!("  dry run:           {}", report.dry_run);
+    println!("  already applied:   {}", report.already_applied);
+    println!("  pending outcomes:  {}", report.pending_outcomes);
+    println!("  applied outcomes:  {}", report.applied_outcomes);
+    println!("  retrieved patterns:{}", report.retrieved_patterns);
+    println!("  positive outcomes: {}", report.positive_outcomes);
+    println!("  negative outcomes: {}", report.negative_outcomes);
+    println!("  updated patterns:  {}", report.updated_patterns);
+    println!("  use delta total:   {}", report.use_delta_total);
+    println!("  revert delta total:{}", report.reverted_delta_total);
+    println!("  applied:           {}", report.applied);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct BenchmarkReport {
+    target: String,
+    samples_requested: usize,
+    samples_used: usize,
+    p50_ms: f64,
+    p95_ms: f64,
+    coverage: f64,
+    detail: Value,
+}
+
+#[derive(Deserialize)]
+struct DependencyBenchmarkCase {
+    from: String,
+    to: String,
+}
+
+#[derive(Deserialize)]
+struct DependencyBenchmarkCaseWrapper {
+    cases: Vec<DependencyBenchmarkCase>,
+}
+
+fn percentile(values: &mut [f64], fraction: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let index = ((values.len() - 1) as f64 * fraction).round() as usize;
+    values[index.min(values.len() - 1)]
+}
+
+fn run_benchmark(args: BenchmarkArgs, db_path: &Path, format: OutputFormat) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let report = match args.target {
+        BenchmarkTarget::Syntax => run_syntax_benchmark(&store, args.samples)?,
+        BenchmarkTarget::Dependency => {
+            run_dependency_benchmark(&store, args.samples, args.depth, args.corpus.as_deref())?
+        }
+    };
+
+    if format == OutputFormat::Json {
+        print_json(&report)?;
+        return Ok(());
+    }
+
+    println!("benchmark {}", report.target);
+    println!("  samples:      {}/{}", report.samples_used, report.samples_requested);
+    println!("  p50 latency:  {:.3} ms", report.p50_ms);
+    println!("  p95 latency:  {:.3} ms", report.p95_ms);
+    println!("  coverage:     {:.1}%", report.coverage * 100.0);
+    if report.target == "dependency" {
+        if let Some(precision) = report.detail.get("precision").and_then(Value::as_f64) {
+            println!("  precision:    {:.1}%", precision * 100.0);
+        }
+        if let Some(cases) = report.detail.get("corpus_cases").and_then(Value::as_u64) {
+            println!("  corpus cases: {}", cases);
+        }
+    }
+    Ok(())
+}
+
+fn run_syntax_benchmark(store: &Store, requested_samples: usize) -> Result<BenchmarkReport> {
+    let mut names: Vec<String> = {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT DISTINCT symbol_name FROM symbol_catalog ORDER BY last_seen_at DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![requested_samples as i64], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    if names.is_empty() {
+        let mut seen = HashSet::new();
+        for unit in store.all_units()?.into_iter() {
+            if seen.insert(unit.name.clone()) {
+                names.push(unit.name);
+            }
+            if names.len() >= requested_samples {
+                break;
+            }
+        }
+    }
+
+    let mut latencies: Vec<f64> = Vec::new();
+    let mut rich_hits = 0usize;
+    let mut lookup_stmt = store.conn().prepare(
+           "SELECT signature, methods_json, return_type
+         FROM symbol_catalog
+            WHERE symbol_name = ?1
+         LIMIT 1",
+    )?;
+
+    for name in &names {
+        let start = Instant::now();
+        let mut rows = lookup_stmt.query(params![name])?;
+        let mut has_shape = false;
+        if let Some(row) = rows.next()? {
+            let signature: Option<String> = row.get(0)?;
+            let methods: Option<String> = row.get(1)?;
+            let return_type: Option<String> = row.get(2)?;
+            has_shape = signature.as_deref().unwrap_or("").trim().len() > 3
+                || methods.as_deref().unwrap_or("").trim().len() > 3
+                || return_type.as_deref().unwrap_or("").trim().len() > 1;
+        }
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        latencies.push(elapsed_ms);
+        if has_shape {
+            rich_hits += 1;
+        }
+    }
+
+    let samples_used = latencies.len();
+    let coverage = if samples_used == 0 {
+        0.0
+    } else {
+        rich_hits as f64 / samples_used as f64
+    };
+
+    let mut sorted = latencies.clone();
+    let p50 = percentile(&mut sorted, 0.50);
+    let mut sorted = latencies;
+    let p95 = percentile(&mut sorted, 0.95);
+
+    Ok(BenchmarkReport {
+        target: "syntax".to_string(),
+        samples_requested: requested_samples,
+        samples_used,
+        p50_ms: p50,
+        p95_ms: p95,
+        coverage,
+        detail: json!({
+            "rich_shape_hits": rich_hits,
+        }),
+    })
+}
+
+fn load_dependency_corpus(path: &Path) -> Result<Vec<DependencyBenchmarkCase>> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read dependency benchmark corpus at {}", path.display()))?;
+
+    if let Ok(cases) = serde_json::from_str::<Vec<DependencyBenchmarkCase>>(&content) {
+        return Ok(cases);
+    }
+
+    let wrapper: DependencyBenchmarkCaseWrapper = serde_json::from_str(&content)
+        .with_context(|| format!("invalid dependency benchmark corpus JSON at {}", path.display()))?;
+    Ok(wrapper.cases)
+}
+
+fn dependency_path_exists(store: &Store, from: &str, to: &str, depth: u8) -> Result<bool> {
+    if from == to {
+        return Ok(true);
+    }
+
+    let mut seen = HashSet::new();
+    let mut queue: VecDeque<(String, u8)> = VecDeque::new();
+    seen.insert(from.to_string());
+    queue.push_back((from.to_string(), 0));
+
+    while let Some((current, level)) = queue.pop_front() {
+        if level >= depth {
+            continue;
+        }
+
+        for (edge, _) in graph::neighbors(store.conn(), &current)? {
+            if edge.to_id == to {
+                return Ok(true);
+            }
+            if seen.insert(edge.to_id.clone()) {
+                queue.push_back((edge.to_id, level + 1));
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn run_dependency_benchmark(
+    store: &Store,
+    requested_samples: usize,
+    depth: u8,
+    corpus: Option<&Path>,
+) -> Result<BenchmarkReport> {
+    let node_ids: Vec<String> = {
+        let mut stmt = store
+            .conn()
+            .prepare("SELECT id FROM graph_nodes ORDER BY id LIMIT ?1")?;
+        let rows = stmt.query_map(params![requested_samples as i64], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut latencies: Vec<f64> = Vec::new();
+    let mut with_neighbors = 0usize;
+    for node_id in &node_ids {
+        let start = Instant::now();
+        let (edges, _) = graph::subgraph(store.conn(), node_id, depth)?;
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        latencies.push(elapsed_ms);
+        if !edges.is_empty() {
+            with_neighbors += 1;
+        }
+    }
+
+    let samples_used = latencies.len();
+    let coverage = if samples_used == 0 {
+        0.0
+    } else {
+        with_neighbors as f64 / samples_used as f64
+    };
+
+    let mut precision = None;
+    let mut corpus_cases = 0usize;
+    if let Some(path) = corpus {
+        let cases = load_dependency_corpus(path)?;
+        corpus_cases = cases.len();
+        if !cases.is_empty() {
+            let mut hits = 0usize;
+            for case in &cases {
+                if dependency_path_exists(store, &case.from, &case.to, depth)? {
+                    hits += 1;
+                }
+            }
+            precision = Some(hits as f64 / cases.len() as f64);
+        }
+    }
+
+    let mut sorted = latencies.clone();
+    let p50 = percentile(&mut sorted, 0.50);
+    let mut sorted = latencies;
+    let p95 = percentile(&mut sorted, 0.95);
+
+    Ok(BenchmarkReport {
+        target: "dependency".to_string(),
+        samples_requested: requested_samples,
+        samples_used,
+        p50_ms: p50,
+        p95_ms: p95,
+        coverage,
+        detail: json!({
+            "depth": depth,
+            "graph_neighbor_hits": with_neighbors,
+            "corpus_cases": corpus_cases,
+            "precision": precision,
+        }),
+    })
+}
+
 fn run_status(db_path: &Path, full: bool, format: OutputFormat) -> Result<()> {
     let store = Store::open(db_path)?;
 
@@ -973,6 +2285,7 @@ fn build_status_json(store: &Store, db_path: &Path, full: bool) -> Result<serde_
     let annotations = store.all_annotations()?;
     let observations = store.all_observations()?;
     let hot = store.hot_tools(5)?;
+    let (gap_unique, gap_seen, gap_recurrent) = store.query_gap_summary()?;
     let cache = cache::cache_stats(store.conn()).ok();
     let db_size = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
 
@@ -985,6 +2298,11 @@ fn build_status_json(store: &Store, db_path: &Path, full: bool) -> Result<serde_
         "annotations": annotations.len(),
         "pending_review": observations.len(),
         "hot_tools": hot,
+        "query_gaps": {
+            "unique": gap_unique,
+            "seen": gap_seen,
+            "recurrent": gap_recurrent,
+        }
     });
 
     if let Some(c) = cache {
@@ -1001,6 +2319,7 @@ fn build_status_json(store: &Store, db_path: &Path, full: bool) -> Result<serde_
         let scratchpads = store.scratchpad_count()?;
         let recent_hot = store.hot_tools_recent(500, 5)?;
         let health = store.pattern_health_rows()?;
+        let top_query_gaps = store.top_query_gaps(8)?;
         root["full"] = json!({
             "graph": {
                 "nodes": nodes,
@@ -1010,7 +2329,8 @@ fn build_status_json(store: &Store, db_path: &Path, full: bool) -> Result<serde_
             },
             "scratchpads": scratchpads,
             "recent_hot_tools": recent_hot,
-            "pattern_health": health
+            "pattern_health": health,
+            "query_gaps": top_query_gaps
         });
     }
 
@@ -1065,6 +2385,16 @@ fn run_doctor_workflow(args: DoctorWorkflowArgs, db_path: &Path, format: OutputF
         step: "context_packet".to_string(),
         pass: true,
         detail: format!("estimated_tokens={} relevant_units={} deltas={}", packet.estimated_tokens, packet.relevant_units.len(), packet.deltas.len()),
+    });
+
+    let (gap_unique, gap_seen, gap_recurrent) = store.query_gap_summary()?;
+    checks.push(DoctorCheck {
+        step: "query_gap_telemetry".to_string(),
+        pass: true,
+        detail: format!(
+            "query_gaps_unique={} seen={} recurrent={}",
+            gap_unique, gap_seen, gap_recurrent
+        ),
     });
 
     let full_status = build_status_report(&store, db_path, true)?;
@@ -1131,6 +2461,7 @@ fn build_status_report(store: &Store, db_path: &Path, full: bool) -> Result<Stri
     let annotations = store.all_annotations()?;
     let observations = store.all_observations()?;
     let hot = store.hot_tools(5)?;
+    let (gap_unique, gap_seen, gap_recurrent) = store.query_gap_summary()?;
     let cache = cache::cache_stats(store.conn()).ok();
 
     // Rough DB file size
@@ -1147,6 +2478,7 @@ fn build_status_report(store: &Store, db_path: &Path, full: bool) -> Result<Stri
     out.push_str(&format!("  anti-patterns:    {}\n", anti_patterns.len()));
     out.push_str(&format!("  annotations:      {}\n", annotations.len()));
     out.push_str(&format!("  pending review:   {}\n", observations.len()));
+    out.push_str(&format!("  query gaps:       {} unique / {} seen / {} recurrent\n", gap_unique, gap_seen, gap_recurrent));
 
     if let Some(c) = cache {
         out.push('\n');
@@ -1180,6 +2512,7 @@ fn build_status_report(store: &Store, db_path: &Path, full: bool) -> Result<Stri
         let scratchpads = store.scratchpad_count()?;
         let recent_hot = store.hot_tools_recent(500, 5)?;
         let health = store.pattern_health_rows()?;
+        let top_query_gaps = store.top_query_gaps(8)?;
 
         out.push_str("\nfull details\n\n");
         out.push_str("  graph:\n");
@@ -1223,6 +2556,18 @@ fn build_status_report(store: &Store, db_path: &Path, full: bool) -> Result<Stri
                     "\n  {} pattern(s) below 40% survival — run `cortex pattern health` and revise risky patterns.\n",
                     low_count
                 ));
+            }
+        }
+
+        if !top_query_gaps.is_empty() {
+            out.push_str("\n  query gap hotspots:\n");
+            for (tool, query, count, _last_seen, reason) in &top_query_gaps {
+                out.push_str(&format!("    {:18} {:4}x  {}\n", tool, count, query));
+                if let Some(r) = reason {
+                    if !r.trim().is_empty() {
+                        out.push_str(&format!("    {:18}      reason: {}\n", "", r));
+                    }
+                }
             }
         }
     }
@@ -1620,6 +2965,41 @@ mod tests {
         assert!(report.contains("pattern health:"));
         assert!(report.contains("Grounded sound"));
         assert!(report.contains("0%"));
+
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn legacy_session_outcome_markers_backfill_to_per_outcome_log() {
+        let db_path = temp_db_path("cortex_outcome_backfill_test");
+
+        {
+            let store = Store::open(&db_path).expect("open store");
+            store
+                .log_outcome("legacy_session", "build_pass", None, None)
+                .expect("log outcome");
+            store
+                .mark_outcome_session_applied("legacy_session")
+                .expect("mark legacy session applied");
+
+            // Before reopen/migrate, the per-outcome ledger is still empty.
+            let pending_before = store
+                .pending_outcomes_for_session("legacy_session")
+                .expect("pending before migrate");
+            assert_eq!(pending_before.len(), 1);
+        }
+
+        {
+            // Reopen triggers migrate(), which backfills legacy session markers.
+            let store = Store::open(&db_path).expect("reopen store");
+            let pending_after = store
+                .pending_outcomes_for_session("legacy_session")
+                .expect("pending after migrate");
+            assert!(
+                pending_after.is_empty(),
+                "legacy session marker should be backfilled to per-outcome ledger"
+            );
+        }
 
         let _ = std::fs::remove_file(&db_path);
     }

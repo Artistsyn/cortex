@@ -1,5 +1,7 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
 use crate::cache::{render_with_session, sha256_hex, SessionRegistry};
@@ -21,17 +23,21 @@ pub fn dispatch(
     prefs_summary: &str,
 ) -> Result<Value, String> {
     let text = match tool {
-        "semantic_search"   => tool_semantic_search(args, units, sessions, session_id),
-        "get_item"          => tool_get_item(args, units, sessions, session_id),
+        "semantic_search"   => tool_semantic_search(args, store, units, sessions, session_id),
+        "get_item"          => tool_get_item(args, store, units, sessions, session_id),
+        "get_syntax"        => tool_get_syntax(args, store, units, session_id),
+        "get_usage_examples" => tool_get_usage_examples(args, store, units, session_id),
+        "get_helper"        => tool_get_helper(args, store, units, session_id),
         "get_context"       => tool_get_context(args, store, units, repo_root, prefs_summary),
         "get_delta"         => tool_get_delta(args, repo_root),
-        "query_graph"       => tool_query_graph(args, store),
+        "query_graph"       => tool_query_graph(args, store, session_id),
+        "explain_dependency_path" => tool_explain_dependency_path(args, store),
         "get_preferences"   => tool_get_preferences(prefs_summary),
         "recurrent_think"   => tool_recurrent_think(args, store),
         "simulate_change"   => tool_simulate_change(args, store),
         "recall"            => tool_recall(args, store, units, sessions, session_id),
-        "list_patterns"     => tool_list_patterns(store),
-        "get_anti_patterns" => tool_get_anti_patterns(store),
+        "list_patterns"     => tool_list_patterns(args, store, session_id),
+        "get_anti_patterns" => tool_get_anti_patterns(store, session_id),
         "suggest_pattern"   => tool_suggest_pattern(args, store),
         "list_all"          => tool_list_all(args, units),
         other               => Err(format!("unknown tool: {other}")),
@@ -44,6 +50,7 @@ pub fn dispatch(
 
 fn tool_semantic_search(
     args: &Value,
+    store: &Store,
     units: &[CodeUnit],
     sessions: &SessionRegistry,
     session_id: &str,
@@ -55,6 +62,12 @@ fn tool_semantic_search(
     let keyword = keyword_search(query, units);
 
     if results.is_empty() && keyword.is_empty() {
+        let _ = store.log_query_gap(
+            "semantic_search",
+            query,
+            Some(session_id),
+            Some("no semantic or keyword matches"),
+        );
         return Ok(format!("No results for `{query}`."));
     }
 
@@ -99,6 +112,7 @@ fn tool_semantic_search(
 
 fn tool_get_item(
     args: &Value,
+    store: &Store,
     units: &[CodeUnit],
     sessions: &SessionRegistry,
     session_id: &str,
@@ -106,7 +120,15 @@ fn tool_get_item(
     let name = args["name"].as_str().ok_or("missing `name`")?;
 
     let unit = units.iter().find(|u| u.name == name)
-        .ok_or_else(|| format!("no item named `{name}`"))?;
+        .ok_or_else(|| {
+            let _ = store.log_query_gap(
+                "get_item",
+                name,
+                Some(session_id),
+                Some("no indexed item with exact name"),
+            );
+            format!("no item named `{name}`")
+        })?;
 
     let header = format!("# `{}` ({})\n\nmodule: `{}`\n\n",
         unit.name, unit.kind, unit.module_path);
@@ -119,6 +141,261 @@ fn tool_get_item(
     );
 
     Ok(format!("{header}{rendered}"))
+}
+
+fn tool_get_syntax(
+    args: &Value,
+    store: &Store,
+    units: &[CodeUnit],
+    session_id: &str,
+) -> Result<String, String> {
+    let symbol = args["symbol_name"].as_str().ok_or("missing `symbol_name`")?;
+    let candidate = find_symbol_unit(symbol, units);
+
+    let Some(unit) = candidate else {
+        let suggestions = similar_symbol_units(symbol, units, 5);
+
+        if suggestions.is_empty() {
+            let _ = store.log_query_gap(
+                "get_syntax",
+                symbol,
+                Some(session_id),
+                Some("no symbol match or similar suggestions"),
+            );
+            return Err(format!("no symbol found for `{symbol}`"));
+        }
+
+        let _ = store.log_query_gap(
+            "get_syntax",
+            symbol,
+            Some(session_id),
+            Some("no exact symbol match; only similar suggestions"),
+        );
+
+        let names = suggestions
+            .iter()
+            .map(|u| format!("{} ({})", u.name, u.module_path))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(format!("no exact symbol found for `{symbol}`. Similar: {names}"));
+    };
+
+    let mut sig = String::new();
+    let mut fields = String::new();
+    let mut methods = String::new();
+    let mut variants = Vec::new();
+
+    for line in unit.compressed.lines() {
+        let trimmed = line.trim();
+        if let Some(v) = trimmed.strip_prefix("sig:") {
+            sig = v.trim().to_string();
+        } else if let Some(v) = trimmed.strip_prefix("fields:") {
+            fields = v.trim().to_string();
+        } else if let Some(v) = trimmed.strip_prefix("methods:") {
+            methods = v.trim().to_string();
+        } else if trimmed.starts_with(&format!("{}::", unit.name)) {
+            variants.push(trimmed.to_string());
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!("Symbol: {}\nKind: {}\nModule: {}\n", unit.name, unit.kind, unit.module_path));
+
+    if !sig.is_empty() {
+        out.push_str(&format!("\nSignature\n{}\n", sig));
+    }
+    if !fields.is_empty() {
+        out.push_str(&format!("\nFields\n{}\n", fields));
+    }
+    if !methods.is_empty() {
+        out.push_str(&format!("\nMethods\n{}\n", methods));
+    }
+    if !variants.is_empty() {
+        out.push_str("\nVariants\n");
+        for v in variants.iter().take(20) {
+            out.push_str(&format!("- {}\n", v));
+        }
+    }
+
+    if sig.is_empty() && fields.is_empty() && methods.is_empty() && variants.is_empty() {
+        out.push_str("\nNo structured signature details found. Use get_item for full compressed entry.");
+    }
+
+    Ok(out)
+}
+
+fn tool_get_usage_examples(
+    args: &Value,
+    store: &Store,
+    units: &[CodeUnit],
+    session_id: &str,
+) -> Result<String, String> {
+    let symbol = args["symbol_name"].as_str().ok_or("missing `symbol_name`")?;
+    let tier = args.get("tier").and_then(|v| v.as_str());
+    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+    let db_examples = store
+        .get_symbol_examples(symbol, tier, limit)
+        .map_err(|e| e.to_string())?;
+
+    let mut out = String::new();
+    out.push_str(&format!("Usage examples for `{}`\n\n", symbol));
+
+    if !db_examples.is_empty() {
+        out.push_str("From symbol_examples\n");
+        for (idx, (file, line, snippet, source_tier)) in db_examples.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. {}{} [{}]\n",
+                idx + 1,
+                file,
+                line.map(|n| format!(":{}", n)).unwrap_or_default(),
+                source_tier,
+            ));
+            let compact = snippet.lines().take(16).collect::<Vec<_>>().join("\n");
+            out.push_str(&format!("{}\n\n", compact));
+        }
+        return Ok(out);
+    }
+
+    let fallback = units
+        .iter()
+        .filter(|u| {
+            u.id == symbol
+                || u.name == symbol
+                || u.id.ends_with(&format!("::{}", symbol))
+                || u.name.eq_ignore_ascii_case(symbol)
+                || u.compressed.contains(symbol)
+        })
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    if fallback.is_empty() {
+        let _ = store.log_query_gap(
+            "get_usage_examples",
+            symbol,
+            Some(session_id),
+            Some("no symbol_examples rows and no indexed fallback units"),
+        );
+        return Err(format!("no usage examples found for `{}`", symbol));
+    }
+
+    out.push_str("Fallback from indexed units\n");
+    for (idx, unit) in fallback.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. {} ({})\n",
+            idx + 1,
+            unit.id,
+            unit.module_path
+        ));
+        let compact = unit.compressed.lines().take(16).collect::<Vec<_>>().join("\n");
+        out.push_str(&format!("{}\n\n", compact));
+    }
+
+    Ok(out)
+}
+
+fn tool_get_helper(
+    args: &Value,
+    store: &Store,
+    units: &[CodeUnit],
+    session_id: &str,
+) -> Result<String, String> {
+    let symbol = args["symbol_name"].as_str().ok_or("missing `symbol_name`")?;
+    let intent = args.get("intent").and_then(|v| v.as_str()).unwrap_or("");
+    let intent_lower = intent.to_lowercase();
+
+    let catalog = store
+        .get_symbol_catalog_entry(symbol)
+        .map_err(|e| e.to_string())?;
+    let unit = find_symbol_unit(symbol, units);
+
+    let (resolved_name, kind, module_path, signature, helper_tags) = if let Some(c) = catalog {
+        (c.0, c.1, c.2, c.3.unwrap_or_default(), c.5)
+    } else if let Some(u) = unit {
+        (
+            u.id.clone(),
+            u.kind.clone(),
+            u.module_path.clone(),
+            u.summary.clone(),
+            u.name.clone(),
+        )
+    } else {
+        let similar = store
+            .find_symbol_catalog_similar(symbol, 5)
+            .map_err(|e| e.to_string())?;
+        if similar.is_empty() {
+            let _ = store.log_query_gap(
+                "get_helper",
+                symbol,
+                Some(session_id),
+                Some("no catalog entry and no similar symbols"),
+            );
+            return Err(format!("no helper guidance found for `{}`", symbol));
+        }
+        let _ = store.log_query_gap(
+            "get_helper",
+            symbol,
+            Some(session_id),
+            Some("no exact symbol in catalog; returned similar hints"),
+        );
+        let hints = similar
+            .iter()
+            .map(|(n, k, m)| format!("{} ({}, {})", n, k, m))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        return Err(format!("no exact symbol for `{}`. Similar: {}", symbol, hints));
+    };
+
+    let mut guidance: Vec<String> = Vec::new();
+
+    if kind == "enum" {
+        guidance.push("Use `get_syntax` first to confirm exact variant names before wiring logic.".to_string());
+    }
+    if resolved_name.contains("Action") {
+        guidance.push("Dispatch through `canvas.run(Action::...)` instead of direct mutation paths.".to_string());
+    }
+    if resolved_name.contains("Condition") {
+        guidance.push("Prefer declarative branching with `Action::Conditional` over ad-hoc if/match in update loops.".to_string());
+    }
+    if resolved_name.contains("Target") || resolved_name.contains("Location") {
+        guidance.push("Use constructor helpers rather than tuple-style enum assumptions for target/location values.".to_string());
+    }
+    if kind == "fn" || kind == "method" {
+        guidance.push("Pull usage snippets with `get_usage_examples` to verify common call shapes.".to_string());
+    }
+
+    if intent_lower.contains("refactor") || intent_lower.contains("change") {
+        guidance.push("Run `simulate_change` before edits to estimate blast radius and test scope.".to_string());
+    }
+    if intent_lower.contains("safe") || intent_lower.contains("pitfall") {
+        guidance.push("Check `get_anti_patterns` before coding to avoid known regressions.".to_string());
+    }
+    if intent_lower.contains("example") || intent_lower.contains("usage") {
+        guidance.push("Call `get_usage_examples` for concrete, local callsite references.".to_string());
+    }
+
+    if !helper_tags.trim().is_empty() {
+        guidance.push(format!("Related helper tags: {}", helper_tags));
+    }
+
+    if guidance.is_empty() {
+        guidance.push("No special helper heuristics matched; use get_syntax + get_usage_examples for the safest path.".to_string());
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Helper guidance for `{}`\nKind: {}\nModule: {}\n",
+        resolved_name, kind, module_path
+    ));
+    if !signature.trim().is_empty() {
+        out.push_str(&format!("Signature hint: {}\n", signature));
+    }
+    out.push_str("\nRecommendations\n");
+    for (idx, g) in guidance.iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", idx + 1, g));
+    }
+
+    Ok(out)
 }
 
 // ── get_context ───────────────────────────────────────────────────────────────
@@ -151,6 +428,12 @@ fn tool_get_context(
         && packet.anti_patterns.is_empty()
         && packet.annotations.is_empty()
     {
+        let _ = store.log_query_gap(
+            "get_context",
+            hint,
+            None,
+            Some("context packet resolved empty across units/patterns/anti-patterns/annotations"),
+        );
         return Ok(format!(
             "No context found for `{hint}`. Run `cortex index` if the index is empty."
         ));
@@ -191,17 +474,29 @@ fn tool_get_delta(args: &Value, repo_root: &Path) -> Result<String, String> {
     Ok(out)
 }
 
-fn tool_query_graph(args: &Value, store: &Store) -> Result<String, String> {
+fn tool_query_graph(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
     let name = args["name"].as_str().ok_or("missing `name`")?;
     let depth = args["depth"].as_u64().unwrap_or(1) as u8;
 
     let unit = store.get_unit(name).map_err(|e| e.to_string())?;
     let Some(root) = unit else {
+        let _ = store.log_query_gap(
+            "query_graph",
+            name,
+            Some(session_id),
+            Some("no graph root node found"),
+        );
         return Ok(format!("No graph node found for `{}`", name));
     };
 
     let (edges, nodes) = graph::subgraph(store.conn(), &root.id, depth).map_err(|e| e.to_string())?;
     if edges.is_empty() {
+        let _ = store.log_query_gap(
+            "query_graph",
+            name,
+            Some(session_id),
+            Some("graph root has no neighbors for requested depth"),
+        );
         return Ok(format!("{} ({}): no graph neighbors", root.name, root.id));
     }
 
@@ -273,7 +568,10 @@ fn tool_recall(
             out.push_str(&format!("### {} — {}\n", p.name, p.intent));
             out.push_str(&p.body);
             out.push('\n');
-            if let Some(id) = p.id { let _ = store.pattern_used(id); }
+            if let Some(id) = p.id {
+                let _ = store.pattern_used(id);
+                let _ = store.log_session_retrieval(session_id, "patterns", id, "recall");
+            }
         }
     }
 
@@ -291,6 +589,9 @@ fn tool_recall(
         for ap in &matched_aps {
             out.push_str(&format!("✗ {}\n  wrong:   {}\n  correct: {}\n\n",
                 ap.description, ap.wrong, ap.correct));
+            if let Some(id) = ap.id {
+                let _ = store.log_session_retrieval(session_id, "anti_patterns", id, "recall");
+            }
         }
     }
 
@@ -307,10 +608,19 @@ fn tool_recall(
         out.push_str("## Notes\n");
         for a in &matched_annotations {
             out.push_str(&format!("[{}] {}\n", a.topic, a.body));
+            if let Some(id) = a.id {
+                let _ = store.log_session_retrieval(session_id, "annotations", id, "recall");
+            }
         }
     }
 
     if !found {
+        let _ = store.log_query_gap(
+            "recall",
+            topic,
+            Some(session_id),
+            Some("no matching api units, patterns, anti-patterns, or annotations"),
+        );
         out.push_str("Nothing found. Consider adding an annotation.\n");
     }
 
@@ -319,11 +629,13 @@ fn tool_recall(
 
 // ── list_patterns ─────────────────────────────────────────────────────────────
 
-fn tool_list_patterns(store: &Store) -> Result<String, String> {
+fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
     let patterns = store.all_patterns().map_err(|e| e.to_string())?;
     if patterns.is_empty() {
         return Ok("No approved patterns yet.".into());
     }
+
+    let detail = list_detail_tier(args);
     let mut out = format!("{} approved pattern(s):\n\n", patterns.len());
     for p in &patterns {
         let marker = if p.survival_rate < 0.4 {
@@ -342,10 +654,27 @@ fn tool_list_patterns(store: &Store) -> Result<String, String> {
             p.survival_rate * 100.0,
             p.intent
         ));
-        if !p.uses.is_empty() {
-            out.push_str(&format!("Uses: {}\n", p.uses.join(", ")));
+        if let Some(id) = p.id {
+            let _ = store.log_session_retrieval(session_id, "patterns", id, "list_patterns");
         }
-        out.push_str(&p.body);
+
+        if detail != "summary" {
+            if !p.uses.is_empty() {
+                out.push_str(&format!("Uses: {}\n", p.uses.join(", ")));
+            }
+        }
+
+        if detail == "full" {
+            out.push_str(&p.body);
+            out.push('\n');
+        } else if detail == "standard" {
+            let preview = p.body.lines().take(4).collect::<Vec<_>>().join("\n");
+            if !preview.trim().is_empty() {
+                out.push_str(&preview);
+                out.push('\n');
+            }
+        }
+
         out.push('\n');
     }
     Ok(out)
@@ -353,7 +682,7 @@ fn tool_list_patterns(store: &Store) -> Result<String, String> {
 
 // ── get_anti_patterns ─────────────────────────────────────────────────────────
 
-fn tool_get_anti_patterns(store: &Store) -> Result<String, String> {
+fn tool_get_anti_patterns(store: &Store, session_id: &str) -> Result<String, String> {
     let aps = store.all_anti_patterns().map_err(|e| e.to_string())?;
     if aps.is_empty() {
         return Ok("No anti-patterns recorded yet.".into());
@@ -362,6 +691,9 @@ fn tool_get_anti_patterns(store: &Store) -> Result<String, String> {
     for ap in &aps {
         out.push_str(&format!("### {}\n✗ wrong:   {}\n✓ correct: {}\n\n",
             ap.description, ap.wrong, ap.correct));
+        if let Some(id) = ap.id {
+            let _ = store.log_session_retrieval(session_id, "anti_patterns", id, "get_anti_patterns");
+        }
     }
     Ok(out)
 }
@@ -399,6 +731,7 @@ fn tool_suggest_pattern(args: &Value, store: &Store) -> Result<String, String> {
 
 fn tool_list_all(args: &Value, units: &[CodeUnit]) -> Result<String, String> {
     let kind_filter = args["kind"].as_str();
+    let detail = list_detail_tier(args);
 
     let filtered: Vec<_> = units.iter()
         .filter(|u| kind_filter.map_or(true, |k| u.kind == k))
@@ -421,7 +754,21 @@ fn tool_list_all(args: &Value, units: &[CodeUnit]) -> Result<String, String> {
     for (kind, items) in &by_kind {
         out.push_str(&format!("## {} ({})\n", kind, items.len()));
         for u in items {
-            out.push_str(&format!("- `{}` — {}\n", u.name, u.summary));
+            match detail {
+                "summary" => {
+                    out.push_str(&format!("- `{}`\n", u.name));
+                }
+                "full" => {
+                    out.push_str(&format!("- `{}` — {}\n", u.name, u.summary));
+                    let preview = u.compressed.lines().take(8).collect::<Vec<_>>().join("\n");
+                    if !preview.trim().is_empty() {
+                        out.push_str(&format!("{}\n", preview));
+                    }
+                }
+                _ => {
+                    out.push_str(&format!("- `{}` — {}\n", u.name, u.summary));
+                }
+            }
         }
         out.push('\n');
     }
@@ -430,6 +777,34 @@ fn tool_list_all(args: &Value, units: &[CodeUnit]) -> Result<String, String> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn list_detail_tier(args: &Value) -> &str {
+    match args.get("detail").and_then(|v| v.as_str()) {
+        Some("summary") => "summary",
+        Some("full") => "full",
+        _ => "standard",
+    }
+}
+
+fn find_symbol_unit<'a>(symbol: &str, units: &'a [CodeUnit]) -> Option<&'a CodeUnit> {
+    let exact_id = units.iter().find(|u| u.id == symbol);
+    let exact_name = units.iter().find(|u| u.name == symbol);
+    exact_id
+        .or(exact_name)
+        .or_else(|| units.iter().find(|u| u.id.ends_with(&format!("::{symbol}"))))
+        .or_else(|| units.iter().find(|u| u.name.eq_ignore_ascii_case(symbol)))
+}
+
+fn similar_symbol_units<'a>(symbol: &str, units: &'a [CodeUnit], limit: usize) -> Vec<&'a CodeUnit> {
+    let symbol_lower = symbol.to_lowercase();
+    let mut suggestions: Vec<&CodeUnit> = units
+        .iter()
+        .filter(|u| u.name.to_lowercase().contains(&symbol_lower))
+        .take(limit)
+        .collect();
+    suggestions.sort_by(|a, b| a.name.cmp(&b.name));
+    suggestions
+}
 
 fn augment_hint(hint: &str, units: &[CodeUnit]) -> String {
     let hint_lower = hint.to_lowercase();
@@ -532,12 +907,85 @@ fn tool_recurrent_think(args: &Value, store: &Store) -> Result<String, String> {
 
 // ── simulate_change ────────────────────────────────────────────────────────────
 
+fn tool_explain_dependency_path(args: &Value, store: &Store) -> Result<String, String> {
+    let from = args["from"].as_str().ok_or("missing `from`")?;
+    let to = args["to"].as_str().ok_or("missing `to`")?;
+    let max_depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+
+    let from_candidates = resolve_graph_candidates(store.conn(), from, 6).map_err(|e| e.to_string())?;
+    let to_candidates = resolve_graph_candidates(store.conn(), to, 6).map_err(|e| e.to_string())?;
+
+    if from_candidates.is_empty() {
+        return Err(format!("no graph node found for `from`: {}", from));
+    }
+    if to_candidates.is_empty() {
+        return Err(format!("no graph node found for `to`: {}", to));
+    }
+
+    let target_ids: HashSet<String> = to_candidates.iter().map(|(id, _, _)| id.clone()).collect();
+
+    let mut found: Option<(String, Vec<(String, String, String)>)> = None;
+    let mut chosen_start: Option<(String, String, String)> = None;
+    for start in &from_candidates {
+        if let Some(path) = bfs_dependency_path(store.conn(), &start.0, &target_ids, max_depth)? {
+            chosen_start = Some(start.clone());
+            found = Some(path);
+            break;
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "Dependency path query: from `{}` to `{}` (depth <= {})\n\n",
+        from, to, max_depth
+    ));
+
+    if from_candidates.len() > 1 {
+        let labels = from_candidates
+            .iter()
+            .map(|(id, name, module)| format!("{} [{} | {}]", id, name, module))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        out.push_str(&format!("From candidates: {}\n", labels));
+    }
+    if to_candidates.len() > 1 {
+        let labels = to_candidates
+            .iter()
+            .map(|(id, name, module)| format!("{} [{} | {}]", id, name, module))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        out.push_str(&format!("To candidates: {}\n", labels));
+    }
+
+    let Some((target_id, path_steps)) = found else {
+        out.push_str("No dependency path found within depth limit.");
+        return Ok(out);
+    };
+
+    if let Some((start_id, start_name, _)) = chosen_start {
+        out.push_str(&format!("\nResolved start: {} ({})\n", start_id, start_name));
+    }
+    if let Some((_, target_name, _)) = to_candidates.iter().find(|(id, _, _)| *id == target_id) {
+        out.push_str(&format!("Resolved target: {} ({})\n", target_id, target_name));
+    } else {
+        out.push_str(&format!("Resolved target: {}\n", target_id));
+    }
+
+    out.push_str("\nPath\n");
+    for (idx, (from_id, relation, to_id)) in path_steps.iter().enumerate() {
+        out.push_str(&format!("{}. {} -[{}]-> {}\n", idx + 1, from_id, relation, to_id));
+    }
+
+    Ok(out)
+}
+
 fn tool_simulate_change(args: &Value, store: &Store) -> Result<String, String> {
     let item_name = args["item"].as_str().ok_or("missing `item`")?;
     let change_description = args["change"].as_str().unwrap_or("unspecified change");
     let depth = args["depth"].as_u64().unwrap_or(1) as u8;
+    let relation_filter = parse_relation_filter(args.get("relation_filter"));
 
-    let result = if depth > 1 {
+    let mut result = if depth > 1 {
         crate::reasoner::simulator::simulate_change_deep(
             store.conn(),
             item_name,
@@ -552,5 +1000,230 @@ fn tool_simulate_change(args: &Value, store: &Store) -> Result<String, String> {
         )
     }.map_err(|e| format!("Simulation failed: {}", e))?;
 
+    if let Some(filter) = relation_filter {
+        result
+            .affected
+            .retain(|a| filter.contains(&a.relation.to_lowercase()));
+        result
+            .depends_on
+            .retain(|a| filter.contains(&a.relation.to_lowercase()));
+        result.risk_level = classify_risk(result.affected.len(), result.depends_on.len());
+
+        if result.affected.is_empty() && result.depends_on.is_empty() {
+            result.warnings.push(
+                "relation_filter removed all matches; broaden filter or omit it for full impact".to_string(),
+            );
+        }
+    }
+
     Ok(result.render())
+}
+
+fn parse_relation_filter(v: Option<&Value>) -> Option<HashSet<String>> {
+    let mut set = HashSet::new();
+    match v {
+        Some(Value::String(s)) => {
+            let normalized = s.trim().to_lowercase();
+            if !normalized.is_empty() {
+                set.insert(normalized);
+            }
+        }
+        Some(Value::Array(items)) => {
+            for it in items {
+                if let Some(s) = it.as_str() {
+                    let normalized = s.trim().to_lowercase();
+                    if !normalized.is_empty() {
+                        set.insert(normalized);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if set.is_empty() { None } else { Some(set) }
+}
+
+fn classify_risk(affected_len: usize, depends_len: usize) -> crate::reasoner::simulator::RiskLevel {
+    let basis = affected_len + (depends_len / 2);
+    match basis {
+        0..=2 => crate::reasoner::simulator::RiskLevel::Low,
+        3..=7 => crate::reasoner::simulator::RiskLevel::Medium,
+        _ => crate::reasoner::simulator::RiskLevel::High,
+    }
+}
+
+fn resolve_graph_candidates(
+    conn: &Connection,
+    name_or_id: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<(String, String, String)>> {
+    let mut out: Vec<(String, String, String)> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    if let Some(row) = conn
+        .query_row(
+            "SELECT id, name, module_path FROM graph_nodes WHERE id = ?1 LIMIT 1",
+            [name_or_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+    {
+        seen.insert(row.0.clone());
+        out.push(row);
+    }
+
+    if out.len() >= limit {
+        return Ok(out);
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT id, name, module_path FROM graph_nodes
+         WHERE name = ?1 OR lower(name) = lower(?1)
+         ORDER BY module_path
+         LIMIT ?2"
+    )?;
+    let exact_rows = stmt.query_map(params![name_or_id, limit as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for r in exact_rows {
+        let tup = r?;
+        if seen.insert(tup.0.clone()) {
+            out.push(tup);
+            if out.len() >= limit {
+                return Ok(out);
+            }
+        }
+    }
+
+    let like = format!("%{}%", name_or_id);
+    let mut stmt = conn.prepare(
+        "SELECT id, name, module_path FROM graph_nodes
+         WHERE id LIKE ?1 OR name LIKE ?1
+         ORDER BY module_path
+         LIMIT ?2"
+    )?;
+    let fuzzy_rows = stmt.query_map(params![like, limit as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for r in fuzzy_rows {
+        let tup = r?;
+        if seen.insert(tup.0.clone()) {
+            out.push(tup);
+            if out.len() >= limit {
+                break;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+fn bfs_dependency_path(
+    conn: &Connection,
+    start_id: &str,
+    target_ids: &HashSet<String>,
+    max_depth: usize,
+) -> Result<Option<(String, Vec<(String, String, String)>)>, String> {
+    if target_ids.contains(start_id) {
+        return Ok(Some((start_id.to_string(), Vec::new())));
+    }
+
+    let mut queue: VecDeque<(String, usize)> = VecDeque::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut parent: HashMap<String, (String, String)> = HashMap::new();
+
+    queue.push_back((start_id.to_string(), 0));
+    visited.insert(start_id.to_string());
+
+    while let Some((current, depth)) = queue.pop_front() {
+        if depth >= max_depth {
+            continue;
+        }
+
+        let neighbors = crate::graph::neighbors(conn, &current).map_err(|e| e.to_string())?;
+
+        for (edge, node) in neighbors {
+            if !visited.insert(node.id.clone()) {
+                continue;
+            }
+
+            parent.insert(
+                node.id.clone(),
+                (current.clone(), edge.relation.as_str().to_string()),
+            );
+
+            if target_ids.contains(&node.id) {
+                let mut steps_rev: Vec<(String, String, String)> = Vec::new();
+                let mut cursor = node.id.clone();
+                while cursor != start_id {
+                    if let Some((p, rel)) = parent.get(&cursor).cloned() {
+                        steps_rev.push((p.clone(), rel, cursor.clone()));
+                        cursor = p;
+                    } else {
+                        break;
+                    }
+                }
+                steps_rev.reverse();
+                return Ok(Some((node.id, steps_rev)));
+            }
+
+            queue.push_back((node.id.clone(), depth + 1));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_risk, parse_relation_filter};
+    use crate::reasoner::simulator::RiskLevel;
+    use serde_json::json;
+
+    #[test]
+    fn parse_relation_filter_supports_single_string() {
+        let parsed = parse_relation_filter(Some(&json!("uses"))).expect("expected filter set");
+        assert!(parsed.contains("uses"));
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn parse_relation_filter_supports_string_arrays_and_normalizes() {
+        let parsed = parse_relation_filter(Some(&json!(["Calls", " uses ", "", null]))).expect("expected filter set");
+        assert!(parsed.contains("calls"));
+        assert!(parsed.contains("uses"));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn parse_relation_filter_rejects_empty_inputs() {
+        assert!(parse_relation_filter(Some(&json!("   "))).is_none());
+        assert!(parse_relation_filter(Some(&json!([]))).is_none());
+        assert!(parse_relation_filter(None).is_none());
+    }
+
+    #[test]
+    fn classify_risk_thresholds_are_stable() {
+        assert_eq!(classify_risk(0, 0), RiskLevel::Low);
+        assert_eq!(classify_risk(2, 0), RiskLevel::Low);
+        assert_eq!(classify_risk(3, 0), RiskLevel::Medium);
+        assert_eq!(classify_risk(6, 2), RiskLevel::Medium);
+        assert_eq!(classify_risk(8, 0), RiskLevel::High);
+        assert_eq!(classify_risk(7, 4), RiskLevel::High);
+    }
 }

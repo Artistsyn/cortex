@@ -1,7 +1,7 @@
 //! Simulator — dry-run impact predictor.
 //! Predicts what breaks before touching a core type.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use crate::graph;
@@ -34,6 +34,7 @@ pub struct AffectedItem {
 pub struct SimulationResult {
     pub changed_item: String,
     pub affected: Vec<AffectedItem>,
+    pub depends_on: Vec<AffectedItem>,
     pub risk_level: RiskLevel,
     pub warnings: Vec<String>,
 }
@@ -65,6 +66,16 @@ impl SimulationResult {
             }
         }
 
+        if !self.depends_on.is_empty() {
+            output.push_str("\nDepends On (outbound):\n");
+            for item in &self.depends_on {
+                output.push_str(&format!(
+                    "  • {} (via {}): {}\n",
+                    item.name, item.relation, item.impact
+                ));
+            }
+        }
+
         if !self.warnings.is_empty() {
             output.push_str("\nWarnings:\n");
             for warning in &self.warnings {
@@ -84,32 +95,74 @@ pub fn simulate_change(
     change_description: &str,
 ) -> crate::Result<SimulationResult> {
     let mut affected = vec![];
+    let mut depends_on = vec![];
     let mut warnings = vec![];
     let mut seen: HashSet<(String, String)> = HashSet::new();
 
-    // Find the node ID
-    let mut stmt = conn.prepare(
-        "SELECT id FROM graph_nodes WHERE name = ?1 LIMIT 1"
-    )?;
-
-    let node_id: Option<String> = stmt.query_row(
-        [item_name],
-        |row| row.get(0),
-    ).ok();
-
-    if node_id.is_none() {
+    let node_ids = resolve_node_ids(conn, item_name)?;
+    if node_ids.is_empty() {
         return Ok(SimulationResult {
             changed_item: item_name.to_string(),
             affected: vec![],
+            depends_on: vec![],
             risk_level: RiskLevel::Low,
             warnings: vec!["Item not found in graph — no impact detected.".to_string()],
         });
     }
 
-    let node_id = node_id.unwrap();
+    if node_ids.len() > 1 {
+        let names = node_ids
+            .iter()
+            .map(|(id, module_path)| format!("{} ({})", id, module_path))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        warnings.push(format!(
+            "Ambiguous symbol lookup for '{}'. Aggregating impact across {} matches: {}",
+            item_name,
+            node_ids.len(),
+            names
+        ));
+    }
 
+    for (node_id, _module_path) in node_ids {
+        collect_inbound_impact(conn, &node_id, change_description, &mut affected, &mut warnings, &mut seen)?;
+        collect_outbound_dependencies(conn, &node_id, &mut depends_on)?;
+    }
+
+    depends_on.sort_by(|a, b| a.name.cmp(&b.name));
+    depends_on.dedup_by(|a, b| a.name == b.name && a.relation == b.relation);
+
+    // Classify risk
+    let risk_basis = affected.len() + (depends_on.len() / 2);
+    let risk_level = match risk_basis {
+        0..=2 => RiskLevel::Low,
+        3..=7 => RiskLevel::Medium,
+        _ => RiskLevel::High,
+    };
+
+    if risk_level == RiskLevel::High {
+        warnings.insert(0, "HIGH RISK: Many items depend on this. Plan for wide-ranging re-testing.".to_string());
+    }
+
+    Ok(SimulationResult {
+        changed_item: item_name.to_string(),
+        affected,
+        depends_on,
+        risk_level,
+        warnings,
+    })
+}
+
+fn collect_inbound_impact(
+    conn: &Connection,
+    node_id: &str,
+    change_description: &str,
+    affected: &mut Vec<AffectedItem>,
+    warnings: &mut Vec<String>,
+    seen: &mut HashSet<(String, String)>,
+) -> crate::Result<()> {
     // Use graph reverse lookup for primary impact set (depth 1).
-    let users = graph::used_by(conn, &node_id)?;
+    let users = graph::used_by(conn, node_id)?;
     for user in users {
         if !seen.insert((user.name.clone(), "uses".to_string())) {
             continue;
@@ -138,7 +191,7 @@ pub fn simulate_change(
          LIMIT 20"
     )?;
 
-    let uses = stmt.query_map([&node_id], |row| {
+    let uses = stmt.query_map([node_id], |row| {
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
@@ -153,7 +206,7 @@ pub fn simulate_change(
         if !seen.insert((from_name.clone(), relation_norm.clone())) {
             continue;
         }
-        
+
         let impact = match relation_norm.as_str() {
             "implements" => {
                 warnings.push(format!("Trait implementation: '{}' implements this trait. Contract may need updating.", from_name));
@@ -183,30 +236,66 @@ pub fn simulate_change(
             _ => "unknown relation — requires manual review".to_string(),
         };
 
+        let relation_value = relation.clone();
         affected.push(AffectedItem {
             name: from_name,
-            relation: relation.clone(),
+            relation: relation_value,
             impact,
         });
     }
 
-    // Classify risk
-    let risk_level = match affected.len() {
-        0..=2 => RiskLevel::Low,
-        3..=6 => RiskLevel::Medium,
-        _ => RiskLevel::High,
-    };
+    Ok(())
+}
 
-    if risk_level == RiskLevel::High {
-        warnings.insert(0, "HIGH RISK: Many items depend on this. Plan for wide-ranging re-testing.".to_string());
+fn collect_outbound_dependencies(
+    conn: &Connection,
+    node_id: &str,
+    depends_on: &mut Vec<AffectedItem>,
+) -> crate::Result<()> {
+    let neighbors = graph::neighbors(conn, node_id)?;
+    for (edge, node) in neighbors {
+        depends_on.push(AffectedItem {
+            name: node.name,
+            relation: edge.relation.as_str().to_string(),
+            impact: "Direct dependency of changed item".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_node_ids(conn: &Connection, item_name: &str) -> crate::Result<Vec<(String, String)>> {
+    if let Some((id, module_path)) = conn
+        .query_row(
+            "SELECT id, module_path FROM graph_nodes WHERE id = ?1 LIMIT 1",
+            [item_name],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        return Ok(vec![(id, module_path)]);
     }
 
-    Ok(SimulationResult {
-        changed_item: item_name.to_string(),
-        affected,
-        risk_level,
-        warnings,
-    })
+    let mut stmt = conn.prepare(
+        "SELECT id, module_path FROM graph_nodes WHERE name = ?1 ORDER BY module_path"
+    )?;
+    let exact = stmt
+        .query_map([item_name], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !exact.is_empty() {
+        return Ok(exact);
+    }
+
+    let like = format!("%{}%", item_name);
+    let mut stmt = conn.prepare(
+        "SELECT id, module_path FROM graph_nodes
+         WHERE name LIKE ?1 OR id LIKE ?1
+         ORDER BY module_path
+         LIMIT 5"
+    )?;
+    let fuzzy = stmt
+        .query_map(params![like], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(fuzzy)
 }
 
 /// Extended simulation with depth-2 transitive lookup.
@@ -271,6 +360,7 @@ mod tests {
                     impact: "field type change".to_string(),
                 },
             ],
+            depends_on: vec![],
             risk_level: RiskLevel::Medium,
             warnings: vec!["Consider backwards compat.".to_string()],
         };

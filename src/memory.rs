@@ -446,15 +446,129 @@ impl Store {
                 PRIMARY KEY(pattern_id, unit_id)
             );
             CREATE INDEX IF NOT EXISTS idx_pur_unit ON pattern_unit_refs(unit_id);
+
+            CREATE TABLE IF NOT EXISTS symbol_catalog (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol_name     TEXT    NOT NULL UNIQUE,
+                kind            TEXT    NOT NULL,
+                module_path     TEXT    NOT NULL,
+                signature       TEXT,
+                return_type     TEXT,
+                fields_json     TEXT,
+                methods_json    TEXT,
+                variants_json   TEXT,
+                helper_tags     TEXT    NOT NULL DEFAULT '',
+                source_tier     TEXT    NOT NULL DEFAULT 'index',
+                last_seen_at    INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_sc_kind ON symbol_catalog(kind);
+            CREATE INDEX IF NOT EXISTS idx_sc_module ON symbol_catalog(module_path);
+
+            CREATE TABLE IF NOT EXISTS symbol_examples (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol_name     TEXT    NOT NULL,
+                file_path       TEXT    NOT NULL,
+                line_number     INTEGER,
+                example_snippet TEXT    NOT NULL,
+                source_tier     TEXT    NOT NULL DEFAULT 'production_fn',
+                created_at      INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_se_symbol ON symbol_examples(symbol_name);
+
+            CREATE TABLE IF NOT EXISTS session_retrieval_log (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id    TEXT    NOT NULL,
+                entry_table   TEXT    NOT NULL,
+                entry_id      INTEGER NOT NULL,
+                tool_name     TEXT    NOT NULL,
+                retrieved_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_srl_session ON session_retrieval_log(session_id);
+            CREATE INDEX IF NOT EXISTS idx_srl_tool ON session_retrieval_log(tool_name);
+
+            CREATE TABLE IF NOT EXISTS outcome_log (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id    TEXT    NOT NULL,
+                outcome_type  TEXT    NOT NULL,
+                error_text    TEXT,
+                diff_symbols  TEXT,
+                created_at    INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_ol_session ON outcome_log(session_id);
+            CREATE INDEX IF NOT EXISTS idx_ol_type ON outcome_log(outcome_type);
+
+            CREATE TABLE IF NOT EXISTS outcome_applied_session (
+                session_id    TEXT PRIMARY KEY,
+                applied_at    INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
+            CREATE TABLE IF NOT EXISTS outcome_applied_log (
+                outcome_id    INTEGER PRIMARY KEY REFERENCES outcome_log(id) ON DELETE CASCADE,
+                session_id    TEXT    NOT NULL,
+                applied_at    INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_oal_session ON outcome_applied_log(session_id);
+
+            CREATE TABLE IF NOT EXISTS query_gap_log (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                tool_name     TEXT    NOT NULL,
+                query_text    TEXT    NOT NULL,
+                session_id    TEXT,
+                seen_count    INTEGER NOT NULL DEFAULT 1,
+                last_reason   TEXT,
+                first_seen_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+                UNIQUE(tool_name, query_text)
+            );
+            CREATE INDEX IF NOT EXISTS idx_qgl_seen ON query_gap_log(seen_count DESC);
+            CREATE INDEX IF NOT EXISTS idx_qgl_last_seen ON query_gap_log(last_seen_at DESC);
+
+            CREATE TABLE IF NOT EXISTS call_graph (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                caller      TEXT    NOT NULL,
+                callee      TEXT    NOT NULL,
+                edge_type   TEXT    NOT NULL DEFAULT 'direct',
+                file_path   TEXT,
+                line_number INTEGER,
+                weight      REAL    NOT NULL DEFAULT 1.0,
+                source      TEXT    NOT NULL DEFAULT 'inferred',
+                UNIQUE(caller, callee, edge_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cg_caller ON call_graph(caller);
+            CREATE INDEX IF NOT EXISTS idx_cg_callee ON call_graph(callee);
         ")?;
 
         // Drift-detection columns on code_units (idempotent).
         self.ensure_unit_drift_columns()?;
 
+        // Backfill legacy session-level outcome markers into per-outcome ledger.
+        // This preserves prior evidence application semantics and prevents re-application.
+        let migrated_outcome_rows = self.backfill_legacy_outcome_application()?;
+        if migrated_outcome_rows > 0 {
+            eprintln!(
+                "[cortex] legacy outcome application markers detected; migrated {} row(s) to outcome_applied_log",
+                migrated_outcome_rows
+            );
+            eprintln!(
+                "[cortex] migration verification: run .\\.cortex\\cortex.ps1 smoke -SelfCheckFormat json"
+            );
+        }
+
         // Rebuild FTS index from existing data (safe to call repeatedly — replaces stale entries).
         self.rebuild_fts()?;
 
         Ok(())
+    }
+
+    fn backfill_legacy_outcome_application(&self) -> Result<usize> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO outcome_applied_log (outcome_id, session_id, applied_at)
+             SELECT o.id, o.session_id, COALESCE(s.applied_at, o.created_at, unixepoch())
+             FROM outcome_log o
+             JOIN outcome_applied_session s ON s.session_id = o.session_id",
+            [],
+        )?;
+        Ok(changed)
     }
 
     fn ensure_unit_drift_columns(&self) -> Result<()> {
@@ -805,14 +919,319 @@ impl Store {
         Ok(())
     }
 
+    pub fn upsert_symbol_catalog_from_unit(&self, unit: &CodeUnit) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO symbol_catalog
+                (symbol_name, kind, module_path, signature, return_type,
+                 fields_json, methods_json, variants_json, helper_tags,
+                 source_tier, last_seen_at)
+             VALUES
+                (?1, ?2, ?3, ?4, NULL, NULL, NULL, NULL, ?5, 'index', unixepoch())
+             ON CONFLICT(symbol_name) DO UPDATE SET
+                kind = excluded.kind,
+                module_path = excluded.module_path,
+                signature = excluded.signature,
+                helper_tags = excluded.helper_tags,
+                source_tier = excluded.source_tier,
+                last_seen_at = unixepoch()",
+            params![
+                unit.id,
+                unit.kind,
+                unit.module_path,
+                unit.summary,
+                unit.name,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_symbol_example_if_missing(
+        &self,
+        symbol_name: &str,
+        file_path: &str,
+        line_number: Option<i64>,
+        example_snippet: &str,
+        source_tier: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO symbol_examples
+                (symbol_name, file_path, line_number, example_snippet, source_tier, created_at)
+             SELECT ?1, ?2, ?3, ?4, ?5, unixepoch()
+             WHERE NOT EXISTS (
+                SELECT 1 FROM symbol_examples
+                WHERE symbol_name = ?1 AND file_path = ?2 AND source_tier = ?5
+             )",
+            params![symbol_name, file_path, line_number, example_snippet, source_tier],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_symbol_examples(
+        &self,
+        symbol_name: &str,
+        source_tier: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<i64>, String, String)>> {
+        let like_suffix = format!("%::{}", symbol_name);
+
+        let out = if let Some(tier) = source_tier {
+            let mut stmt = self.conn.prepare(
+                "SELECT file_path, line_number, example_snippet, source_tier
+                 FROM symbol_examples
+                 WHERE (symbol_name = ?1 OR lower(symbol_name) = lower(?1) OR symbol_name LIKE ?2)
+                   AND source_tier = ?3
+                 ORDER BY created_at DESC
+                 LIMIT ?4"
+            )?;
+            let rows = stmt.query_map(params![symbol_name, like_suffix, tier, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT file_path, line_number, example_snippet, source_tier
+                 FROM symbol_examples
+                 WHERE symbol_name = ?1 OR lower(symbol_name) = lower(?1) OR symbol_name LIKE ?2
+                 ORDER BY created_at DESC
+                 LIMIT ?3"
+            )?;
+            let rows = stmt.query_map(params![symbol_name, like_suffix, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        Ok(out)
+    }
+
+    pub fn get_symbol_catalog_entry(
+        &self,
+        symbol_name: &str,
+    ) -> Result<Option<(String, String, String, Option<String>, Option<String>, String)>> {
+        let like_suffix = format!("%::{}", symbol_name);
+        self.conn.query_row(
+            "SELECT symbol_name, kind, module_path, signature, return_type, helper_tags
+             FROM symbol_catalog
+             WHERE symbol_name = ?1 OR lower(symbol_name) = lower(?1) OR symbol_name LIKE ?2
+             ORDER BY
+                CASE
+                    WHEN symbol_name = ?1 THEN 0
+                    WHEN lower(symbol_name) = lower(?1) THEN 1
+                    WHEN symbol_name LIKE ?2 THEN 2
+                    ELSE 3
+                END,
+                last_seen_at DESC
+             LIMIT 1",
+            params![symbol_name, like_suffix],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn find_symbol_catalog_similar(
+        &self,
+        symbol_name: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String, String)>> {
+        let like = format!("%{}%", symbol_name);
+        let mut stmt = self.conn.prepare(
+            "SELECT symbol_name, kind, module_path
+             FROM symbol_catalog
+             WHERE symbol_name LIKE ?1 OR lower(symbol_name) LIKE lower(?1)
+             ORDER BY last_seen_at DESC
+             LIMIT ?2"
+        )?;
+        let rows = stmt.query_map(params![like, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     // ── MCP call log ──────────────────────────────────────────────────────────
 
-    pub fn log_mcp_call(&self, tool: &str, args: &str) -> Result<()> {
+    pub fn log_mcp_call(&self, tool: &str, args: &str) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO mcp_calls (tool, args, called_at) VALUES (?1, ?2, ?3)",
             params![tool, args, chrono::Utc::now().to_rfc3339()],
         )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn log_session_retrieval(
+        &self,
+        session_id: &str,
+        entry_table: &str,
+        entry_id: i64,
+        tool_name: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO session_retrieval_log
+                (session_id, entry_table, entry_id, tool_name, retrieved_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch())",
+            params![session_id, entry_table, entry_id, tool_name],
+        )?;
         Ok(())
+    }
+
+    pub fn log_outcome(
+        &self,
+        session_id: &str,
+        outcome_type: &str,
+        error_text: Option<&str>,
+        diff_symbols: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO outcome_log
+                (session_id, outcome_type, error_text, diff_symbols, created_at)
+             VALUES (?1, ?2, ?3, ?4, unixepoch())",
+            params![session_id, outcome_type, error_text, diff_symbols],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn outcome_session_applied(&self, session_id: &str) -> Result<bool> {
+        let exists: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM outcome_applied_session WHERE session_id = ?1 LIMIT 1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(exists.is_some())
+    }
+
+    pub fn mark_outcome_session_applied(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO outcome_applied_session (session_id, applied_at)
+             VALUES (?1, unixepoch())
+             ON CONFLICT(session_id) DO UPDATE SET applied_at = unixepoch()",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_outcomes_for_session(&self, session_id: &str) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT o.id, o.outcome_type
+             FROM outcome_log o
+             LEFT JOIN outcome_applied_log a ON a.outcome_id = o.id
+             WHERE o.session_id = ?1
+               AND a.outcome_id IS NULL
+             ORDER BY o.id ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn mark_outcomes_applied(&self, session_id: &str, outcome_ids: &[i64]) -> Result<usize> {
+        if outcome_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut applied = 0usize;
+        for outcome_id in outcome_ids {
+            let changed = self.conn.execute(
+                "INSERT OR IGNORE INTO outcome_applied_log (outcome_id, session_id, applied_at)
+                 VALUES (?1, ?2, unixepoch())",
+                params![outcome_id, session_id],
+            )?;
+            applied += changed as usize;
+        }
+        Ok(applied)
+    }
+
+    pub fn log_query_gap(
+        &self,
+        tool_name: &str,
+        query_text: &str,
+        session_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let normalized = query_text.trim();
+        if normalized.is_empty() {
+            return Ok(());
+        }
+
+        self.conn.execute(
+            "INSERT INTO query_gap_log
+                (tool_name, query_text, session_id, seen_count, last_reason, first_seen_at, last_seen_at)
+             VALUES (?1, ?2, ?3, 1, ?4, unixepoch(), unixepoch())
+             ON CONFLICT(tool_name, query_text) DO UPDATE SET
+                seen_count = query_gap_log.seen_count + 1,
+                session_id = excluded.session_id,
+                last_reason = excluded.last_reason,
+                last_seen_at = unixepoch()",
+            params![tool_name, normalized, session_id, reason],
+        )?;
+        Ok(())
+    }
+
+    pub fn query_gap_summary(&self) -> Result<(i64, i64, i64)> {
+        let unique_gap_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM query_gap_log",
+            [],
+            |row| row.get(0),
+        )?;
+        let total_seen_count: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(seen_count), 0) FROM query_gap_log",
+            [],
+            |row| row.get(0),
+        )?;
+        let recurrent_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM query_gap_log WHERE seen_count >= 2",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok((unique_gap_count, total_seen_count, recurrent_count))
+    }
+
+    pub fn top_query_gaps(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(String, String, i64, i64, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT tool_name, query_text, seen_count, last_seen_at, last_reason
+             FROM query_gap_log
+             ORDER BY seen_count DESC, last_seen_at DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Most frequently called tools — useful for tuning what to pre-inject.

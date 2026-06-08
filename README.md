@@ -26,8 +26,15 @@ Nothing gets written to memory without your explicit approval.
 ```sh
 cargo install --path /path/to/cortex
 
-# 0. First-time workspace bootstrap (creates .cortex/cortex.ps1, .cortex/index-sources.json, .vscode/mcp.json)
+# 0. First-time workspace bootstrap (creates .cortex/cortex.ps1, .cortex/cortex-reset.ps1, .cortex/FIRST_RUN_SETUP_NOTES.md, .cortex/index-sources.json, .vscode/mcp.json)
 cortex bootstrap --repo . --source src --name MyProject
+
+# Optional validation from generated launcher (recommended)
+./.cortex/cortex.ps1 setup-mcp
+./.cortex/cortex.ps1 migrate-legacy
+./.cortex/cortex.ps1 reindex
+./.cortex/cortex.ps1 mcp-ready -SelfCheckFormat json
+./.cortex/cortex.ps1 smoke -SelfCheckFormat json
 
 # 1. Index your source (and optionally a quartz-ctx api-graph)
 cortex index --source src --api-graph docs/quartz-ctx/api-graph.json --name Quartz
@@ -43,6 +50,7 @@ PowerShell `-File` arguments).
 ### Copilot Chat MCP readiness (required)
 
 Before relying on Cortex in chat, verify the required MCP baseline is callable:
+
 - `get_delta`
 - `get_preferences`
 - `get_anti_patterns`
@@ -52,15 +60,23 @@ Before relying on Cortex in chat, verify the required MCP baseline is callable:
 If any required tool is missing/failing, remediate before coding:
 
 ```powershell
-.\.cortex\cortex.ps1 doctor --format json
-.\.cortex\cortex.ps1 -- status --format json --full
+.\.cortex\cortex.ps1 mcp-ready -SelfCheckFormat json
 ```
 
-Then verify `.vscode/mcp.json` has a Cortex server entry, restart the server path,
-and reload VS Code window if needed:
+If `mcp-ready` fails, run detailed remediation checks:
 
 ```powershell
+.\.cortex\cortex.ps1 doctor --format json
+.\.cortex\cortex.ps1 -- status --format json --full
 .\.cortex\cortex.ps1 serve
+```
+
+Then verify `.vscode/mcp.json` has a Cortex server entry and reload VS Code window if needed.
+
+For expanded regression coverage (baseline + extended MCP tool surface and schema), run:
+
+```powershell
+.\.cortex\cortex.ps1 smoke -SelfCheckFormat json
 ```
 
 Do not proceed with non-trivial tasks until the MCP baseline passes (unless user
@@ -194,7 +210,69 @@ cortex status
 cortex --format json status --full
 ```
 
-Shows unit count, pattern count, pending observations, and most-called MCP tools.
+Shows unit count, pattern count, pending observations, most-called MCP tools,
+and query-gap telemetry (`unique`, `seen`, `recurrent`).
+
+### Outcome Evidence Weighting
+
+```sh
+# Log outcomes (auto evidence apply runs by default)
+cortex outcome --session-id protocol_run_2026_06_08 --outcome-type build_pass
+
+# Disable automatic evidence apply for a specific call
+cortex outcome --session-id protocol_run_2026_06_08 --outcome-type test_fail --auto-apply false
+
+# Manually apply any pending evidence for a session
+cortex outcome-apply --session-id protocol_run_2026_06_08
+
+# Preview without mutating pattern counters
+cortex outcome-apply --session-id protocol_run_2026_06_08 --dry-run
+```
+
+Automatic evidence processing is idempotent per outcome row using `outcome_applied_log`.
+Only pending outcomes for the session are processed on each run.
+
+Existing databases are migrated in-place at startup.
+Legacy session-level markers in `outcome_applied_session` are backfilled into
+`outcome_applied_log` automatically so previously applied sessions are preserved
+under the new per-outcome standard.
+
+Launcher pathway for legacy DBs:
+
+- On run, `.cortex/cortex.ps1` performs a migration preflight and auto-applies legacy backfills when needed.
+- Explicit command: `./.cortex/cortex.ps1 migrate-legacy`
+- If preflight cannot run, the launcher prints an AI workflow prompt to run migration and smoke checks.
+
+### Benchmark Harness
+
+```sh
+# Syntax lookup latency + shape coverage
+cortex benchmark --target syntax --samples 64
+
+# Dependency traversal latency + optional precision corpus
+cortex benchmark --target dependency --samples 64 --depth 2
+cortex benchmark --target dependency --corpus benches/dependency_cases.json --depth 3
+```
+
+The dependency corpus accepts either:
+
+- a JSON array: `[{"from":"A","to":"B"}]`
+- or wrapper object: `{"cases":[{"from":"A","to":"B"}]}`
+
+### Benchmark Precision Baselines (Recommended)
+
+To make benchmark metrics actionable, define a stable baseline process:
+
+1. Create and version a dependency corpus file (for example `benches/dependency_cases.json`) with representative `from -> to` paths.
+2. Run both benchmark targets 5-10 times on a warm local environment and record median values.
+3. Store baseline metrics in CI/docs: dependency precision, dependency p95 latency, syntax p95 latency, syntax coverage.
+4. Gate regressions by delta from baseline (recommended starting policy):
+
+Dependency precision: fail if drop > 5 percentage points.
+Dependency/syntax p95 latency: fail if increase > 25%.
+Syntax coverage: track trend first, then add a floor after catalog enrichment stabilizes.
+
+This baseline workflow requires corpus maintenance and periodic re-baselining when graph topology or symbol extraction changes significantly.
 
 ### Workflow Doctor (Phase 4.2)
 
@@ -212,7 +290,11 @@ cortex doctor workflow --repo . --source src --mutate-pattern
 ```
 
 Doctor checks include index presence, delta query health, context packet generation,
-and status rendering. It exits non-zero if any check fails.
+status rendering, and query-gap telemetry visibility. It exits non-zero if any
+check fails.
+
+Architecture note for v4.1 borrow/runtime guarantees:
+`docs/architecture-note-borrow-strategy-v41.md`
 
 ---
 

@@ -24,6 +24,7 @@ const UNCACHEABLE: &[&str] = &[
     "get_delta",
     "recurrent_think",
     "simulate_change",
+    "explain_dependency_path",
 ];
 
 pub fn serve(
@@ -92,7 +93,14 @@ pub fn serve(
                 let args_str = args.to_string();
 
                 // Log the call regardless of cache hit.
-                let _ = store.log_mcp_call(tool, &args_str);
+                if let Ok(call_id) = store.log_mcp_call(tool, &args_str) {
+                    let _ = store.log_session_retrieval(
+                        &session_id,
+                        "mcp_calls",
+                        call_id,
+                        tool,
+                    );
+                }
 
                 // Check response cache (skip for volatile tools).
                 let cached = if UNCACHEABLE.contains(&tool) {
@@ -193,6 +201,42 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "get_syntax",
+                "description": "Get a concise syntax sheet for a symbol: signature, fields, methods, and enum variants when available.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol_name": { "type": "string", "description": "Symbol or unit id to inspect." }
+                    },
+                    "required": ["symbol_name"]
+                }
+            },
+            {
+                "name": "get_usage_examples",
+                "description": "Return ranked usage examples for a symbol from indexed callsites and symbol example cache.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol_name": { "type": "string", "description": "Symbol or unit id to inspect." },
+                        "tier": { "type": "string", "description": "Optional source tier filter (for example: index_unit, production_fn)." },
+                        "limit": { "type": "integer", "description": "Max examples to return (default: 5)." }
+                    },
+                    "required": ["symbol_name"]
+                }
+            },
+            {
+                "name": "get_helper",
+                "description": "Get symbol-specific helper guidance and safe usage patterns for an implementation intent.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "symbol_name": { "type": "string", "description": "Symbol or unit id to inspect." },
+                        "intent": { "type": "string", "description": "Optional intent context (for example: refactor, safe usage, examples)." }
+                    },
+                    "required": ["symbol_name"]
+                }
+            },
+            {
                 "name": "get_context",
                 "description": "Get a pre-compiled, token-efficient context packet \
                                 for the current task. Pass open file paths or a task \
@@ -238,6 +282,19 @@ fn tools_list() -> Value {
                 }
             },
             {
+                "name": "explain_dependency_path",
+                "description": "Explain one dependency path between two symbols using graph edges.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "Start symbol name or graph node id." },
+                        "to": { "type": "string", "description": "Target symbol name or graph node id." },
+                        "depth": { "type": "integer", "description": "Maximum path depth (default: 4)." }
+                    },
+                    "required": ["from", "to"]
+                }
+            },
+            {
                 "name": "get_preferences",
                 "description": "Return the active Copilot coding preferences summary loaded by cortex.",
                 "inputSchema": { "type": "object", "properties": {} }
@@ -273,7 +330,14 @@ fn tools_list() -> Value {
                     "properties": {
                         "item": { "type": "string", "description": "Name of the item to change." },
                         "change": { "type": "string", "description": "Description of the change (e.g., 'add new variant')." },
-                        "depth": { "type": "integer", "description": "Transitive depth (default: 1)." }
+                        "depth": { "type": "integer", "description": "Transitive depth (default: 1)." },
+                        "relation_filter": {
+                            "description": "Optional relation filter (string or string array), for example uses/calls/implements.",
+                            "oneOf": [
+                                { "type": "string" },
+                                { "type": "array", "items": { "type": "string" } }
+                            ]
+                        }
                     },
                     "required": ["item"]
                 }
@@ -296,7 +360,16 @@ fn tools_list() -> Value {
                 "description": "List all approved code patterns with their intents. \
                                 Includes use/revert/survival metrics and flags patterns below 40% survival. \
                                 Check this before implementing any non-trivial logic.",
-                "inputSchema": { "type": "object", "properties": {} }
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "detail": {
+                            "type": "string",
+                            "description": "Output detail tier (default: standard).",
+                            "enum": ["summary", "standard", "full"]
+                        }
+                    }
+                }
             },
             {
                 "name": "get_anti_patterns",
@@ -329,10 +402,89 @@ fn tools_list() -> Value {
                             "type": "string",
                             "description": "Filter: struct, enum, trait, fn. Omit for all.",
                             "enum": ["struct", "enum", "trait", "fn"]
+                        },
+                        "detail": {
+                            "type": "string",
+                            "description": "Output detail tier (default: standard).",
+                            "enum": ["summary", "standard", "full"]
                         }
                     }
                 }
             }
         ]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tools_list, UNCACHEABLE};
+    use serde_json::Value;
+
+    fn find_tool<'a>(tools: &'a [Value], name: &str) -> Option<&'a Value> {
+        tools
+            .iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+    }
+
+    #[test]
+    fn tools_list_includes_extended_tooling_entries() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().expect("tools array");
+
+        for name in ["get_usage_examples", "get_helper", "explain_dependency_path"] {
+            assert!(find_tool(tools, name).is_some(), "missing tool in tools/list: {name}");
+        }
+    }
+
+    #[test]
+    fn simulate_change_schema_exposes_relation_filter() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().expect("tools array");
+        let simulate_change = find_tool(tools, "simulate_change").expect("simulate_change tool present");
+
+        let properties = simulate_change["inputSchema"]["properties"]
+            .as_object()
+            .expect("simulate_change inputSchema.properties object");
+        assert!(
+            properties.contains_key("relation_filter"),
+            "simulate_change schema missing relation_filter"
+        );
+    }
+
+    #[test]
+    fn explain_dependency_path_is_not_cached() {
+        assert!(
+            UNCACHEABLE.contains(&"explain_dependency_path"),
+            "explain_dependency_path should be uncacheable"
+        );
+    }
+
+    #[test]
+    fn list_tools_expose_detail_tiers() {
+        let list = tools_list();
+        let tools = list["tools"].as_array().expect("tools array");
+
+        for tool_name in ["list_patterns", "list_all"] {
+            let tool = find_tool(tools, tool_name).expect("list tool present");
+            let detail = tool["inputSchema"]["properties"]["detail"]
+                .as_object()
+                .expect("detail schema object");
+            let enum_values = detail
+                .get("enum")
+                .and_then(Value::as_array)
+                .expect("detail enum");
+            assert!(
+                enum_values.iter().any(|v| v.as_str() == Some("summary")),
+                "{tool_name} missing summary detail tier"
+            );
+            assert!(
+                enum_values.iter().any(|v| v.as_str() == Some("standard")),
+                "{tool_name} missing standard detail tier"
+            );
+            assert!(
+                enum_values.iter().any(|v| v.as_str() == Some("full")),
+                "{tool_name} missing full detail tier"
+            );
+        }
+    }
 }

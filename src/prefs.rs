@@ -13,9 +13,18 @@ pub struct Preferences {
     pub api: ApiPrefs,
     #[serde(default)]
     pub project: ProjectPrefs,
+    // Phase 0A: self-learning loop configuration sections.
+    #[serde(default)]
+    pub enforcement: EnforcementPrefs,
+    #[serde(default)]
+    pub consolidation: ConsolidationPrefs,
+    #[serde(default)]
+    pub skills: SkillsPrefs,
+    #[serde(default)]
+    pub memory: MemoryPrefs,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StylePrefs {
     #[serde(default)]
     pub line_length: u32,
@@ -27,6 +36,18 @@ pub struct StylePrefs {
     pub error_handling: String,
     #[serde(default)]
     pub comments: String,
+}
+
+impl Default for StylePrefs {
+    fn default() -> Self {
+        Self {
+            line_length: 0,
+            indent: String::new(),
+            naming: String::new(),
+            error_handling: String::new(),
+            comments: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -56,6 +77,119 @@ pub struct ProjectPrefs {
     #[serde(default)]
     pub notes: Vec<String>,
 }
+
+/// Protocol enforcement configuration (Phase 0A).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnforcementPrefs {
+    /// "protocol_session_only" (default) or "always".
+    /// "protocol_session_only": Phase 0 gating only when begin_protocol_session was called.
+    /// "always": gate all work tool calls in every session.
+    #[serde(default = "default_protocol_gate_mode")]
+    pub protocol_gate_mode: String,
+    /// Warn in get_context if previous session has no closeout record.
+    #[serde(default = "default_true")]
+    pub closeout_warning_enabled: bool,
+    /// Hours before a session is considered orphaned without closeout.
+    #[serde(default = "default_closeout_grace_hours")]
+    pub closeout_grace_period_hours: u32,
+}
+
+impl Default for EnforcementPrefs {
+    fn default() -> Self {
+        Self {
+            protocol_gate_mode: default_protocol_gate_mode(),
+            closeout_warning_enabled: true,
+            closeout_grace_period_hours: default_closeout_grace_hours(),
+        }
+    }
+}
+
+fn default_protocol_gate_mode() -> String { "protocol_session_only".to_string() }
+fn default_closeout_grace_hours() -> u32 { 2 }
+fn default_true() -> bool { true }
+
+/// Consolidation pipeline configuration (Phase 0A).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsolidationPrefs {
+    /// Hours of staleness before consolidation runs at VS Code open.
+    #[serde(default = "default_staleness_hours")]
+    pub staleness_hours: u32,
+    /// Maximum proposals committed per consolidation run.
+    #[serde(default = "default_max_commits")]
+    pub max_commits_per_run: u32,
+    /// Minimum sessions in a cluster before generating proposals.
+    #[serde(default = "default_min_cluster_sessions")]
+    pub min_cluster_sessions: u32,
+    /// Minimum occurrences before a skill candidate is drafted.
+    #[serde(default = "default_skill_candidate_min")]
+    pub skill_candidate_min_occurrences: u32,
+    /// Graph snapshot retention days.
+    #[serde(default = "default_snapshot_days")]
+    pub graph_snapshot_days: u32,
+}
+
+impl Default for ConsolidationPrefs {
+    fn default() -> Self {
+        Self {
+            staleness_hours: default_staleness_hours(),
+            max_commits_per_run: default_max_commits(),
+            min_cluster_sessions: default_min_cluster_sessions(),
+            skill_candidate_min_occurrences: default_skill_candidate_min(),
+            graph_snapshot_days: default_snapshot_days(),
+        }
+    }
+}
+
+fn default_staleness_hours() -> u32 { 8 }
+fn default_max_commits() -> u32 { 5 }
+fn default_min_cluster_sessions() -> u32 { 3 }
+fn default_skill_candidate_min() -> u32 { 3 }
+fn default_snapshot_days() -> u32 { 30 }
+
+/// Skill self-authoring configuration (Phase 0A).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsPrefs {
+    /// Directory for skill files relative to workspace root.
+    #[serde(default = "default_skills_dir")]
+    pub skills_dir: String,
+    /// Auto-update skill files when revision proposals are approved.
+    #[serde(default = "default_true")]
+    pub auto_update_skills: bool,
+}
+
+impl Default for SkillsPrefs {
+    fn default() -> Self {
+        Self {
+            skills_dir: default_skills_dir(),
+            auto_update_skills: true,
+        }
+    }
+}
+
+fn default_skills_dir() -> String { "agent_customization/skills".to_string() }
+
+/// Memory file lifecycle configuration (Phase 0A).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryPrefs {
+    /// Maximum agent memory mirror files before consolidation is recommended.
+    #[serde(default = "default_max_mirror_files")]
+    pub max_mirror_files: u32,
+    /// Similarity threshold for mirror consolidation proposals (0.0–1.0).
+    #[serde(default = "default_consolidation_threshold")]
+    pub mirror_consolidation_threshold: f32,
+}
+
+impl Default for MemoryPrefs {
+    fn default() -> Self {
+        Self {
+            max_mirror_files: default_max_mirror_files(),
+            mirror_consolidation_threshold: default_consolidation_threshold(),
+        }
+    }
+}
+
+fn default_max_mirror_files() -> u32 { 200 }
+fn default_consolidation_threshold() -> f32 { 0.75 }
 
 pub fn load(path: &Path) -> Result<Preferences> {
     if !path.exists() {

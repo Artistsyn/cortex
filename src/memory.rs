@@ -32,8 +32,29 @@ language = "Rust"
 notes = [
     "MANDATORY PRE-CODE CHECK (no PROTOCOL required): before writing any factory/tick/spawn/physics function call get_anti_patterns + get_preferences + list_patterns",
     "MANDATORY MID-TASK CORTEX USAGE: after first approach fails call recall <error_keyword> before retrying. After two failed attempts STOP and call recall or semantic_search before a third.",
-    "session-end mandatory: after any coding session run post-session then annotate new bugs as anti-patterns and working implementations as patterns",
+    "session-end mandatory: when task verified complete, present Task Complete Summary and ask user to type KNOWLEDGE COMMITTED to trigger closeout_session(inline_approve=true)",
 ]
+
+[enforcement]
+# "protocol_session_only" (default) or "always"
+protocol_gate_mode = "protocol_session_only"
+closeout_warning_enabled = true
+closeout_grace_period_hours = 2
+
+[consolidation]
+staleness_hours = 8
+max_commits_per_run = 5
+min_cluster_sessions = 3
+skill_candidate_min_occurrences = 3
+graph_snapshot_days = 30
+
+[skills]
+skills_dir = "agent_customization/skills"
+auto_update_skills = true
+
+[memory]
+max_mirror_files = 200
+mirror_consolidation_threshold = 0.75
 "#;
 
 pub struct Store {
@@ -538,8 +559,101 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_cg_callee ON call_graph(callee);
         ")?;
 
+        // Phase 0A: self-learning loop tables (idempotent).
+        self.conn.execute_batch("
+            -- Protocol session tracking (persists across MCP server restarts).
+            CREATE TABLE IF NOT EXISTS protocol_sessions (
+                session_key                TEXT PRIMARY KEY,
+                started_at                 INTEGER NOT NULL DEFAULT (unixepoch()),
+                protocol_mode              INTEGER NOT NULL DEFAULT 0,
+                delta_retrieved            INTEGER NOT NULL DEFAULT 0,
+                preferences_loaded         INTEGER NOT NULL DEFAULT 0,
+                anti_patterns_loaded       INTEGER NOT NULL DEFAULT 0,
+                context_loaded             INTEGER NOT NULL DEFAULT 0,
+                bootstrap_complete         INTEGER NOT NULL DEFAULT 0,
+                closeout_run               INTEGER NOT NULL DEFAULT 0,
+                outcome_type               TEXT,
+                closed_at                  INTEGER,
+                knowledge_markers_flushed  INTEGER NOT NULL DEFAULT 0,
+                inline_approved            INTEGER NOT NULL DEFAULT 0,
+                graph_snapshot_written     INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_ps_started ON protocol_sessions(started_at DESC);
+
+            -- Knowledge markers: extracted CORTEX-* tags from session turns.
+            CREATE TABLE IF NOT EXISTS knowledge_markers (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_key  TEXT NOT NULL,
+                marker_type  TEXT NOT NULL,
+                name         TEXT,
+                intent       TEXT,
+                body         TEXT NOT NULL,
+                tags         TEXT NOT NULL DEFAULT '[]',
+                trust_level  TEXT NOT NULL DEFAULT 'annotated',
+                raw_tag      TEXT NOT NULL DEFAULT '',
+                extracted_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                promoted     INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_km_session ON knowledge_markers(session_key);
+            CREATE INDEX IF NOT EXISTS idx_km_type ON knowledge_markers(marker_type);
+            CREATE INDEX IF NOT EXISTS idx_km_promoted ON knowledge_markers(promoted);
+
+            -- Skill candidates detected from repeated mcp_calls sequences.
+            CREATE TABLE IF NOT EXISTS skill_candidates (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                name             TEXT NOT NULL,
+                trigger_hint     TEXT NOT NULL DEFAULT '',
+                tool_sequence    TEXT NOT NULL DEFAULT '[]',
+                session_keys     TEXT NOT NULL DEFAULT '[]',
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                confidence       REAL NOT NULL DEFAULT 0.0,
+                draft_path       TEXT,
+                status           TEXT NOT NULL DEFAULT 'candidate',
+                first_seen_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+                last_seen_at     INTEGER NOT NULL DEFAULT (unixepoch()),
+                UNIQUE(name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_sc_status ON skill_candidates(status);
+
+            -- Consolidation proposals (Tier 2: cross-session, reviewed via review-proposals).
+            CREATE TABLE IF NOT EXISTS proposals (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                proposal_type TEXT NOT NULL,
+                content_hash  TEXT NOT NULL UNIQUE,
+                target_file   TEXT NOT NULL,
+                section       TEXT,
+                proposed_text TEXT NOT NULL,
+                evidence      TEXT NOT NULL DEFAULT '{}',
+                status        TEXT NOT NULL DEFAULT 'pending',
+                gate_signals  TEXT NOT NULL DEFAULT '{}',
+                created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+                reviewed_at   INTEGER,
+                committed_at  INTEGER,
+                rejected_at   INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_prop_status ON proposals(status);
+            CREATE INDEX IF NOT EXISTS idx_prop_type ON proposals(proposal_type);
+            CREATE INDEX IF NOT EXISTS idx_prop_hash ON proposals(content_hash);
+
+            -- Session snapshots index for consolidation pipeline.
+            CREATE TABLE IF NOT EXISTS session_snapshots (
+                session_key       TEXT PRIMARY KEY,
+                outcome_type      TEXT,
+                domain_tags       TEXT NOT NULL DEFAULT '[]',
+                tool_sequence     TEXT NOT NULL DEFAULT '[]',
+                marker_counts     TEXT NOT NULL DEFAULT '{}',
+                user_message_hash TEXT,
+                snapshot_path     TEXT NOT NULL DEFAULT '',
+                created_at        INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_ss_outcome ON session_snapshots(outcome_type);
+        ")?;
+
         // Drift-detection columns on code_units (idempotent).
         self.ensure_unit_drift_columns()?;
+
+        // Phase 0A: session tracking columns (idempotent ALTER TABLE).
+        self.ensure_session_tracking_columns()?;
 
         // Backfill legacy session-level outcome markers into per-outcome ledger.
         // This preserves prior evidence application semantics and prevents re-application.
@@ -589,6 +703,43 @@ impl Store {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// Phase 0A: add logical_session_key to mcp_calls and credibility to patterns.
+    fn ensure_session_tracking_columns(&self) -> Result<()> {
+        // mcp_calls: logical_session_key groups calls within a 2-hour inactivity window.
+        let mut stmt = self.conn.prepare("PRAGMA table_info(mcp_calls)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut cols = std::collections::HashSet::new();
+        for c in rows { cols.insert(c?); }
+
+        if !cols.contains("logical_session_key") {
+            self.conn.execute(
+                "ALTER TABLE mcp_calls ADD COLUMN logical_session_key TEXT",
+                [],
+            )?;
+        }
+
+        // patterns: credibility = min(use_count, 10) / 10.0
+        // Provides Bayesian-style trust signal: survival_rate=1.0 is uninformative at use_count=0.
+        let mut stmt = self.conn.prepare("PRAGMA table_info(patterns)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut cols2 = std::collections::HashSet::new();
+        for c in rows { cols2.insert(c?); }
+
+        if !cols2.contains("credibility") {
+            self.conn.execute(
+                "ALTER TABLE patterns ADD COLUMN credibility REAL NOT NULL DEFAULT 0.0",
+                [],
+            )?;
+            // Backfill credibility for existing patterns.
+            self.conn.execute(
+                "UPDATE patterns SET credibility = CAST(MIN(use_count, 10) AS REAL) / 10.0",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 

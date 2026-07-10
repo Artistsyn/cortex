@@ -42,7 +42,10 @@ pub fn dispatch(
         "list_all"             => tool_list_all(args, units),
         // Phase 0B: protocol session management tools.
         "begin_protocol_session" => tool_begin_protocol_session(args, store, session_id),
-        "get_session_health"   => tool_get_session_health(store, session_id),
+        "get_session_health"     => tool_get_session_health(store, session_id),
+        // Phase 0C/0D: knowledge capture tools.
+        "flush_knowledge_markers" => tool_flush_knowledge_markers(store, session_id, repo_root),
+        "closeout_session"        => tool_closeout_session(args, store, session_id, repo_root),
         other                  => Err(format!("unknown tool: {other}")),
     }?;
 
@@ -1263,6 +1266,146 @@ fn tool_get_session_health(
         &health,
         pending_proposals,
     ).map_err(|e| e.to_string())
+}
+
+// ── Phase 0C/0D: knowledge capture tools ─────────────────────────────────────
+
+/// flush_knowledge_markers — scan VS Code session store, extract CORTEX-* tags, stage them.
+fn tool_flush_knowledge_markers(
+    store: &Store,
+    session_id: &str,
+    repo_root: &Path,
+) -> Result<String, String> {
+    let store_path = crate::session_store::find_session_store();
+    let Some(path) = store_path else {
+        return Ok("VS Code session store not found. Ensure VS Code is installed and has been used. No markers extracted.".to_string());
+    };
+
+    let conn = crate::session_store::open_readonly(&path)
+        .map_err(|e| e.to_string())?;
+    let responses = crate::session_store::recent_assistant_responses(&conn, 60)
+        .unwrap_or_default();
+
+    if responses.is_empty() {
+        return Ok("No recent assistant responses found in session store. No markers extracted.".to_string());
+    }
+
+    let all_text = responses.join("\n\n---\n\n");
+    let parsed = crate::markers::parse_markers(&all_text);
+
+    if parsed.is_empty() {
+        return Ok("No CORTEX-* markers found in recent responses. Write markers like [CORTEX-PATTERN: ...] to capture knowledge.".to_string());
+    }
+
+    let mut staged = 0usize;
+    for marker in &parsed {
+        let body = match marker {
+            crate::markers::KnowledgeMarker::Pattern { body, .. } => body.clone(),
+            crate::markers::KnowledgeMarker::AntiPattern { description, wrong, correct, .. } =>
+                format!("{description}\nwrong: {wrong}\ncorrect: {correct}"),
+            crate::markers::KnowledgeMarker::Correction { attempted, reason, fix, .. } =>
+                format!("attempted: {attempted}\nreason: {reason}\nfix: {fix}"),
+            crate::markers::KnowledgeMarker::Adr { context, decision, .. } =>
+                format!("Context: {context}\nDecision: {decision}"),
+            crate::markers::KnowledgeMarker::PrefsNote { body, .. } => body.clone(),
+            crate::markers::KnowledgeMarker::SkillCandidate { summary, .. } => summary.clone(),
+        };
+        let name = marker.display_name();
+        let tags_json = "[]".to_string();
+        let trust = if let crate::markers::KnowledgeMarker::Pattern { trust, .. } = marker {
+            trust.clone()
+        } else { "annotated".to_string() };
+
+        let _ = store.conn().execute(
+            "INSERT INTO knowledge_markers
+                 (session_key, marker_type, name, body, tags, trust_level, raw_tag, promoted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 0)",
+            rusqlite::params![session_id, marker.marker_type(), name, body, tags_json, trust],
+        );
+        staged += 1;
+    }
+
+    let _ = store.conn().execute(
+        "UPDATE protocol_sessions SET knowledge_markers_flushed = 1 WHERE session_key = ?1",
+        rusqlite::params![session_id],
+    );
+
+    let mut out = format!("Extracted {} marker(s) from recent responses:\n", staged);
+    for m in &parsed {
+        out.push_str(&format!("  [{}] {}\n", m.marker_type(), m.display_name()));
+    }
+    out.push_str("\nMarkers staged (not yet committed). Call closeout_session(inline_approve=true) with KNOWLEDGE COMMITTED to commit them.");
+    Ok(out)
+}
+
+/// closeout_session — the single-call session closeout replacing the 7-step checklist.
+fn tool_closeout_session(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+    repo_root: &Path,
+) -> Result<String, String> {
+    let outcome_type = args["outcome_type"].as_str().ok_or("missing `outcome_type`")?;
+    let inline_approve = args.get("inline_approve")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let error_text   = args.get("error_text").and_then(|v| v.as_str());
+    let diff_symbols = args.get("diff_symbols").and_then(|v| v.as_str());
+
+    // Determine prefs path from repo_root.
+    let prefs_path = repo_root.join(".cortex").join("prefs.toml");
+    let prefs_path_opt = if prefs_path.exists() { Some(prefs_path.as_path()) } else { None };
+
+    let result = crate::closeout::run_closeout(
+        store,
+        session_id,
+        outcome_type,
+        error_text,
+        diff_symbols,
+        inline_approve,
+        repo_root,
+        prefs_path_opt,
+    ).map_err(|e| e.to_string())?;
+
+    // Build response.
+    let mut out = String::new();
+
+    if inline_approve {
+        out.push_str("✓ KNOWLEDGE COMMITTED — session closed.\n\n");
+        out.push_str("Committed to Cortex DB:\n");
+        out.push_str(&format!("  {} patterns\n", result.patterns_committed));
+        out.push_str(&format!("  {} anti-patterns\n", result.anti_patterns_committed));
+        out.push_str(&format!("  {} corrections\n", result.corrections_committed));
+        out.push_str(&format!("  {} ADRs\n", result.adrs_committed));
+        out.push_str(&format!("  {} prefs notes\n", result.prefs_notes_committed));
+        if result.skill_candidates_staged > 0 {
+            out.push_str(&format!("  {} skill candidates staged for Tier 2 consolidation\n",
+                result.skill_candidates_staged));
+        }
+    } else {
+        out.push_str("Session closed (staged mode).\n\n");
+        if result.markers_staged > 0 {
+            out.push_str(&format!("{} markers staged (not committed).\n", result.markers_staged));
+            out.push_str("To commit, call closeout_session again with inline_approve=true after user types KNOWLEDGE COMMITTED.\n");
+        } else {
+            out.push_str("No markers found in recent responses. Write CORTEX-* markers to capture knowledge next session.\n");
+        }
+    }
+
+    out.push_str(&format!("\nOutcome logged: {} ({})\n", outcome_type,
+        if result.outcome_logged { "✓" } else { "failed" }));
+
+    if result.graph_snapshot_written {
+        out.push_str("Graph snapshot: ✓ written\n");
+    }
+    if result.session_snapshot_written {
+        out.push_str("Session snapshot: ✓ written to .cortex/mined-tasks/\n");
+    }
+    if result.mirror_written {
+        out.push_str("Mirror: ✓ written to .agent-memory/mirrors/repo/\n");
+    }
+
+    Ok(out)
 }
 
 #[cfg(test)]

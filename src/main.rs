@@ -1,10 +1,12 @@
 mod adr;
 mod cache;
+mod closeout;
 mod compressor;
 mod consolidator;
 mod crystallizer;
 mod git;
 mod graph;
+mod markers;
 mod memory;
 mod mcp;
 mod model;
@@ -13,6 +15,7 @@ mod prefs;
 mod protocol;
 mod reasoner;
 mod search;
+mod session_store;
 mod watcher;
 
 use std::collections::{HashSet, VecDeque};

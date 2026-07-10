@@ -27,6 +27,8 @@ const UNCACHEABLE: &[&str] = &[
     "explain_dependency_path",
     "begin_protocol_session",
     "get_session_health",
+    "flush_knowledge_markers",
+    "closeout_session",
 ];
 
 pub fn serve(
@@ -474,6 +476,37 @@ fn tools_list() -> Value {
                                 pending proposals. Run after bootstrap to confirm readiness and \
                                 before ending a session to confirm closeout.",
                 "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "flush_knowledge_markers",
+                "description": "Scan recent VS Code session turns for CORTEX-* knowledge markers and stage them \
+                                in the Cortex DB. Markers are STAGED but not committed until closeout_session \
+                                is called with inline_approve=true. Call this before closeout or \
+                                any time you've written markers you want captured.",
+                "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "closeout_session",
+                "description": "Complete session closeout. Set inline_approve=true ONLY when the user has \
+                                typed 'KNOWLEDGE COMMITTED' — this immediately commits all session markers to \
+                                the Cortex DB without deferred review. Stages markers when inline_approve=false (default).",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "outcome_type": {
+                            "type": "string",
+                            "enum": ["build_pass", "build_fail", "test_fail", "review_findings", "research_only"],
+                            "description": "What happened this session."
+                        },
+                        "inline_approve": {
+                            "type": "boolean",
+                            "description": "true = immediately commit all session knowledge. Use ONLY when user typed KNOWLEDGE COMMITTED."
+                        },
+                        "error_text":   { "type": "string", "description": "Optional error context if failure." },
+                        "diff_symbols": { "type": "string", "description": "Optional comma-separated symbols changed." }
+                    },
+                    "required": ["outcome_type"]
+                }
             }
         ]
     })
@@ -496,7 +529,8 @@ mod tests {
         let tools = list["tools"].as_array().expect("tools array");
 
         for name in ["get_usage_examples", "get_helper", "explain_dependency_path",
-                     "begin_protocol_session", "get_session_health"] {
+                     "begin_protocol_session", "get_session_health",
+                     "flush_knowledge_markers", "closeout_session"] {
             assert!(find_tool(tools, name).is_some(), "missing tool in tools/list: {name}");
         }
     }

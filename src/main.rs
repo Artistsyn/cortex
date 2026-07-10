@@ -553,6 +553,7 @@ fn run_bootstrap(args: BootstrapArgs, db_path: &Path) -> Result<()> {
     };
 
     let script_path = cortex_dir.join("cortex.ps1");
+    let sync_continue_path = cortex_dir.join("sync-continue-mcp.ps1");
     let reset_path = cortex_dir.join("cortex-reset.ps1");
     let notes_path = cortex_dir.join("FIRST_RUN_SETUP_NOTES.md");
     let index_path = cortex_dir.join("index-sources.json");
@@ -564,6 +565,14 @@ fn run_bootstrap(args: BootstrapArgs, db_path: &Path) -> Result<()> {
         println!("wrote {}", script_path.display());
     } else {
         println!("kept existing {}", script_path.display());
+    }
+
+    if args.force || !sync_continue_path.exists() {
+        std::fs::write(&sync_continue_path, bootstrap_sync_continue_mcp_template())
+            .with_context(|| format!("failed to write {}", sync_continue_path.display()))?;
+        println!("wrote {}", sync_continue_path.display());
+    } else {
+        println!("kept existing {}", sync_continue_path.display());
     }
 
     if args.force || !reset_path.exists() {
@@ -1305,6 +1314,17 @@ switch ($Command) {
     "setup-mcp" {
         Setup-Mcp
     }
+    "sync-continue-mcp" {
+        $syncScript = Join-Path $PSScriptRoot "sync-continue-mcp.ps1"
+        if (-not (Test-Path $syncScript)) {
+            Write-Error "Missing sync helper script: $syncScript"
+            exit 1
+        }
+
+        & $syncScript @Rest
+        $syncExit = $LASTEXITCODE
+        if ($syncExit -ne 0) { exit $syncExit }
+    }
     "status" {
         & $BIN --db $DB --format json status --full
         exit $LASTEXITCODE
@@ -1450,6 +1470,317 @@ if ($buildExit -ne 0) {
     exit $buildExit
 }
 "#
+}
+
+fn bootstrap_sync_continue_mcp_template() -> &'static str {
+    r##"# sync-continue-mcp.ps1 (bootstrap template)
+# Sync workspace MCP servers (.vscode/mcp.json) into Continue config (~/.continue/config.yaml).
+
+param(
+    [string]$WorkspaceRoot = "",
+    [string]$McpConfigPath = "",
+    [string]$ContinueConfigPath = "",
+    [switch]$DryRun
+)
+
+function Write-Prefix {
+    param([string]$Message)
+    Write-Host "[continue-sync] $Message"
+}
+
+function Convert-ToYamlQuoted {
+    param([string]$Value)
+
+    if ($null -eq $Value) {
+        return '""'
+    }
+
+    $escaped = $Value -replace '\\', '\\\\' -replace '"', '\\"'
+    return '"' + $escaped + '"'
+}
+
+function Convert-ToYamlPath {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $Value
+    }
+
+    return ($Value -replace '\\', '/')
+}
+
+function Resolve-WorkspacePath {
+    param(
+        [string]$Workspace,
+        [string]$Value,
+        [switch]$AllowNonExisting
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $Value
+    }
+
+    if ($Value -match '^[a-zA-Z]+://') {
+        return $Value
+    }
+
+    $looksLikePath = ($Value -match '[\\/]') -or $Value.StartsWith('.')
+    if (-not $looksLikePath) {
+        return $Value
+    }
+
+    if ([System.IO.Path]::IsPathRooted($Value)) {
+        return $Value
+    }
+
+    $candidate = Join-Path $Workspace $Value
+    if ((Test-Path $candidate) -or $AllowNonExisting) {
+        return $candidate
+    }
+
+    return $Value
+}
+
+if ([string]::IsNullOrWhiteSpace($WorkspaceRoot)) {
+    $WorkspaceRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+
+if ([string]::IsNullOrWhiteSpace($McpConfigPath)) {
+    $McpConfigPath = Join-Path $WorkspaceRoot ".vscode\mcp.json"
+}
+
+if ([string]::IsNullOrWhiteSpace($ContinueConfigPath)) {
+    $ContinueConfigPath = Join-Path $env:USERPROFILE ".continue\config.yaml"
+}
+
+$WorkspaceRoot = (Resolve-Path $WorkspaceRoot).Path
+$workspaceRootYaml = Convert-ToYamlPath -Value $WorkspaceRoot
+
+if (-not (Test-Path $McpConfigPath)) {
+    Write-Error "Workspace MCP config not found: $McpConfigPath"
+    exit 1
+}
+
+if (-not (Test-Path $ContinueConfigPath)) {
+    Write-Error "Continue config not found: $ContinueConfigPath"
+    exit 1
+}
+
+try {
+    $mcp = Get-Content -Raw -Path $McpConfigPath | ConvertFrom-Json
+}
+catch {
+    Write-Error ("Failed to parse JSON in " + $McpConfigPath + "; details: " + $_)
+    exit 1
+}
+
+if (-not $mcp.servers) {
+    Write-Error "No servers object found in $McpConfigPath"
+    exit 1
+}
+
+$serverProps = @($mcp.servers.PSObject.Properties)
+if ($serverProps.Count -eq 0) {
+    Write-Error "No MCP servers found in $McpConfigPath"
+    exit 1
+}
+
+$managedStart = "# BEGIN FLOWMAKE MCP SYNC - DO NOT EDIT"
+$managedEnd = "# END FLOWMAKE MCP SYNC - DO NOT EDIT"
+
+$generated = New-Object System.Collections.Generic.List[string]
+$generated.Add($managedStart)
+$generated.Add("mcpServers:")
+
+foreach ($prop in $serverProps) {
+    $name = [string]$prop.Name
+    $srv = $prop.Value
+
+    $typeRaw = ""
+    if ($srv.PSObject.Properties.Name -contains "type") {
+        $typeRaw = [string]$srv.type
+    }
+    $type = $typeRaw.ToLowerInvariant()
+
+    $isHttp = @("http", "sse", "streamable-http") -contains $type
+    if (-not $isHttp -and ($srv.PSObject.Properties.Name -contains "url")) {
+        $isHttp = $true
+    }
+
+    $generated.Add(("  - name: {0}" -f (Convert-ToYamlQuoted -Value $name)))
+
+    if ($isHttp) {
+        $continueType = if ($type -eq "sse") { "sse" } else { "streamable-http" }
+
+        $url = ""
+        if ($srv.PSObject.Properties.Name -contains "url") {
+            $url = [string]$srv.url
+        }
+
+        if ([string]::IsNullOrWhiteSpace($url)) {
+            Write-Prefix "WARN: skipping server '$name' because url is missing"
+            $generated.RemoveAt($generated.Count - 1)
+            continue
+        }
+
+        $timeout = if ($name -match "(?i)shadervine") { 2500 } else { 5000 }
+
+        $generated.Add(("    type: {0}" -f $continueType))
+        $generated.Add(("    url: {0}" -f (Convert-ToYamlQuoted -Value $url)))
+        $generated.Add(("    connectionTimeout: {0}" -f $timeout))
+        continue
+    }
+
+    $command = ""
+    if ($srv.PSObject.Properties.Name -contains "command") {
+        $command = [string]$srv.command
+    }
+
+    if ([string]::IsNullOrWhiteSpace($command)) {
+        Write-Prefix "WARN: skipping server '$name' because command is missing"
+        $generated.RemoveAt($generated.Count - 1)
+        continue
+    }
+
+    $resolvedCommand = Resolve-WorkspacePath -Workspace $WorkspaceRoot -Value $command
+    $commandYaml = Convert-ToYamlPath -Value $resolvedCommand
+
+    $generated.Add("    type: stdio")
+    $generated.Add(("    command: {0}" -f (Convert-ToYamlQuoted -Value $commandYaml)))
+
+    $serverArgs = @()
+    if ($srv.PSObject.Properties.Name -contains "args") {
+        $serverArgs = @($srv.args)
+    }
+
+    if ($serverArgs.Count -gt 0) {
+        $pathFlags = @("--source", "--db", "--repo", "--api-graph", "--manifest-path")
+        $normalizedArgs = New-Object System.Collections.Generic.List[string]
+
+        for ($idx = 0; $idx -lt $serverArgs.Count; $idx++) {
+            $argText = [string]$serverArgs[$idx]
+            $prevArg = if ($idx -gt 0) { [string]$serverArgs[$idx - 1] } else { "" }
+
+            $resolvedArg = $argText
+            if ($pathFlags -contains $prevArg) {
+                if ($prevArg -eq "--repo" -and $argText -eq ".") {
+                    $resolvedArg = $WorkspaceRoot
+                }
+                else {
+                    $resolvedArg = Resolve-WorkspacePath -Workspace $WorkspaceRoot -Value $argText -AllowNonExisting
+                }
+            }
+
+            $normalizedArgs.Add($resolvedArg)
+        }
+
+        $generated.Add("    args:")
+        foreach ($arg in $normalizedArgs) {
+            $argYaml = Convert-ToYamlPath -Value ([string]$arg)
+            $generated.Add(("      - {0}" -f (Convert-ToYamlQuoted -Value $argYaml)))
+        }
+    }
+
+    $generated.Add(("    cwd: {0}" -f (Convert-ToYamlQuoted -Value $workspaceRootYaml)))
+    $generated.Add("    connectionTimeout: 20000")
+}
+
+$generated.Add($managedEnd)
+
+$lines = @()
+$lines = Get-Content -Path $ContinueConfigPath
+
+$startIdx = -1
+$endIdx = -1
+for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i].Trim() -eq $managedStart) {
+        $startIdx = $i
+        break
+    }
+}
+
+if ($startIdx -ge 0) {
+    for ($i = $startIdx + 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i].Trim() -eq $managedEnd) {
+            $endIdx = $i
+            break
+        }
+    }
+    if ($endIdx -lt 0) {
+        $endIdx = $lines.Count - 1
+    }
+
+    $before = @()
+    if ($startIdx -gt 0) {
+        $before = $lines[0..($startIdx - 1)]
+    }
+
+    $after = @()
+    if (($endIdx + 1) -le ($lines.Count - 1)) {
+        $after = $lines[($endIdx + 1)..($lines.Count - 1)]
+    }
+
+    $lines = @($before + $after)
+}
+
+$mcpKeyIdx = -1
+for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -match '^mcpServers\s*:\s*$') {
+        $mcpKeyIdx = $i
+        break
+    }
+}
+
+if ($mcpKeyIdx -ge 0) {
+    $blockEnd = $lines.Count
+    for ($j = $mcpKeyIdx + 1; $j -lt $lines.Count; $j++) {
+        if ($lines[$j] -match '^[A-Za-z_][A-Za-z0-9_-]*\s*:') {
+            $blockEnd = $j
+            break
+        }
+    }
+
+    $before = @()
+    if ($mcpKeyIdx -gt 0) {
+        $before = $lines[0..($mcpKeyIdx - 1)]
+    }
+
+    $after = @()
+    if ($blockEnd -le ($lines.Count - 1)) {
+        $after = $lines[$blockEnd..($lines.Count - 1)]
+    }
+
+    $lines = @($before + $after)
+}
+
+$final = New-Object System.Collections.Generic.List[string]
+foreach ($line in $lines) {
+    $final.Add($line)
+}
+
+while ($final.Count -gt 0 -and [string]::IsNullOrWhiteSpace($final[$final.Count - 1])) {
+    $final.RemoveAt($final.Count - 1)
+}
+
+if ($final.Count -gt 0) {
+    $final.Add("")
+}
+
+foreach ($line in $generated) {
+    $final.Add($line)
+}
+$final.Add("")
+
+if ($DryRun) {
+    Write-Prefix "Dry-run mode: preview only"
+    $final -join "`n" | Write-Output
+    exit 0
+}
+
+Set-Content -Path $ContinueConfigPath -Value $final -Encoding UTF8
+Write-Prefix ("Synced {0} server(s) from {1} into {2}" -f $serverProps.Count, $McpConfigPath, $ContinueConfigPath)
+exit 0
+"##
 }
 
 fn bootstrap_first_run_notes_template() -> &'static str {

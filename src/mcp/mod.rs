@@ -25,6 +25,8 @@ const UNCACHEABLE: &[&str] = &[
     "recurrent_think",
     "simulate_change",
     "explain_dependency_path",
+    "begin_protocol_session",
+    "get_session_health",
 ];
 
 pub fn serve(
@@ -64,10 +66,10 @@ pub fn serve(
         store.all_anti_patterns().map(|p| p.len()).unwrap_or(0),
     );
 
-    // Session ID: for now we use a single implicit session per server process.
-    // A future extension could derive this from an MCP session header if VS Code
-    // starts sending one.
-    let session_id = format!("session_{}", std::process::id());
+    // Phase 0B: derive logical session key from mcp_calls timing window.
+    // Falls back to process-id-based key if DB not yet populated.
+    let session_id = crate::protocol::current_session_key(store.conn())
+        .unwrap_or_else(|_| format!("session_{}", std::process::id()));
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -100,6 +102,41 @@ pub fn serve(
                         call_id,
                         tool,
                     );
+                }
+
+                // Phase 0B: auto-record bootstrap steps when completed.
+                // Also gate work tools if this is a PROTOCOL session and Phase 0 is incomplete.
+                {
+                    use crate::protocol::ProtocolStep;
+                    match tool {
+                        "get_delta"         => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetDelta); }
+                        "get_preferences"   => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetPreferences); }
+                        "get_anti_patterns" => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetAntiPatterns); }
+                        "get_context" | "list_patterns" => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetContext); }
+                        // Work tools: blocked in PROTOCOL mode until Phase 0 complete.
+                        "semantic_search" | "get_item" | "get_syntax" | "get_usage_examples"
+                        | "get_helper" | "recall" | "query_graph" | "simulate_change"
+                        | "suggest_pattern" => {
+                            let is_protocol = crate::protocol::is_protocol_mode(store.conn(), &session_id)
+                                .unwrap_or(false);
+                            if is_protocol {
+                                let bootstrap_done = crate::protocol::is_bootstrap_complete(store.conn(), &session_id)
+                                    .unwrap_or(false);
+                                if !bootstrap_done {
+                                    let msg = crate::protocol::gate_error_message(&session_id, store.conn())
+                                        .unwrap_or_else(|_| "PROTOCOL_PHASE_0_INCOMPLETE".to_string());
+                                    let resp = json!({
+                                        "content": [{ "type": "text", "text": msg }]
+                                    });
+                                    let response = json!({ "jsonrpc": "2.0", "id": id, "result": resp });
+                                    writeln!(out, "{}", serde_json::to_string(&response)?)?;
+                                    out.flush()?;
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
                 }
 
                 // Check response cache (skip for volatile tools).
@@ -410,6 +447,33 @@ fn tools_list() -> Value {
                         }
                     }
                 }
+            },
+            {
+                "name": "begin_protocol_session",
+                "description": "Start a PROTOCOL-mode session. Enables Phase 0 enforcement and session tracking. \
+                                Call this immediately when the user's message contains PROTOCOL. \
+                                Returns current session health. Work tools (semantic_search, recall, get_item, etc.) \
+                                are gated until Phase 0 is complete.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "task": { "type": "string", "description": "Brief task description for session tracking." },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["cortex", "quartz", "graphify", "full"],
+                            "description": "Which subsystems are active (informational only)."
+                        }
+                    },
+                    "required": ["task"]
+                }
+            },
+            {
+                "name": "get_session_health",
+                "description": "One-call session status: Phase 0 completion, knowledge markers written, \
+                                pending observations, closeout status, top query gaps, pattern health, \
+                                pending proposals. Run after bootstrap to confirm readiness and \
+                                before ending a session to confirm closeout.",
+                "inputSchema": { "type": "object", "properties": {} }
             }
         ]
     })
@@ -431,7 +495,8 @@ mod tests {
         let list = tools_list();
         let tools = list["tools"].as_array().expect("tools array");
 
-        for name in ["get_usage_examples", "get_helper", "explain_dependency_path"] {
+        for name in ["get_usage_examples", "get_helper", "explain_dependency_path",
+                     "begin_protocol_session", "get_session_health"] {
             assert!(find_tool(tools, name).is_some(), "missing tool in tools/list: {name}");
         }
     }

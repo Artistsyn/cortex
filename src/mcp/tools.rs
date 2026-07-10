@@ -23,24 +23,27 @@ pub fn dispatch(
     prefs_summary: &str,
 ) -> Result<Value, String> {
     let text = match tool {
-        "semantic_search"   => tool_semantic_search(args, store, units, sessions, session_id),
-        "get_item"          => tool_get_item(args, store, units, sessions, session_id),
-        "get_syntax"        => tool_get_syntax(args, store, units, session_id),
-        "get_usage_examples" => tool_get_usage_examples(args, store, units, session_id),
-        "get_helper"        => tool_get_helper(args, store, units, session_id),
-        "get_context"       => tool_get_context(args, store, units, repo_root, prefs_summary),
-        "get_delta"         => tool_get_delta(args, repo_root),
-        "query_graph"       => tool_query_graph(args, store, session_id),
+        "semantic_search"      => tool_semantic_search(args, store, units, sessions, session_id),
+        "get_item"             => tool_get_item(args, store, units, sessions, session_id),
+        "get_syntax"           => tool_get_syntax(args, store, units, session_id),
+        "get_usage_examples"   => tool_get_usage_examples(args, store, units, session_id),
+        "get_helper"           => tool_get_helper(args, store, units, session_id),
+        "get_context"          => tool_get_context(args, store, units, repo_root, prefs_summary),
+        "get_delta"            => tool_get_delta(args, repo_root),
+        "query_graph"          => tool_query_graph(args, store, session_id),
         "explain_dependency_path" => tool_explain_dependency_path(args, store),
-        "get_preferences"   => tool_get_preferences(prefs_summary),
-        "recurrent_think"   => tool_recurrent_think(args, store),
-        "simulate_change"   => tool_simulate_change(args, store),
-        "recall"            => tool_recall(args, store, units, sessions, session_id),
-        "list_patterns"     => tool_list_patterns(args, store, session_id),
-        "get_anti_patterns" => tool_get_anti_patterns(store, session_id),
-        "suggest_pattern"   => tool_suggest_pattern(args, store),
-        "list_all"          => tool_list_all(args, units),
-        other               => Err(format!("unknown tool: {other}")),
+        "get_preferences"      => tool_get_preferences(prefs_summary),
+        "recurrent_think"      => tool_recurrent_think(args, store),
+        "simulate_change"      => tool_simulate_change(args, store),
+        "recall"               => tool_recall(args, store, units, sessions, session_id),
+        "list_patterns"        => tool_list_patterns(args, store, session_id),
+        "get_anti_patterns"    => tool_get_anti_patterns(store, session_id),
+        "suggest_pattern"      => tool_suggest_pattern(args, store),
+        "list_all"             => tool_list_all(args, units),
+        // Phase 0B: protocol session management tools.
+        "begin_protocol_session" => tool_begin_protocol_session(args, store, session_id),
+        "get_session_health"   => tool_get_session_health(store, session_id),
+        other                  => Err(format!("unknown tool: {other}")),
     }?;
 
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
@@ -1187,6 +1190,79 @@ fn bfs_dependency_path(
     }
 
     Ok(None)
+}
+
+// ── Phase 0B: protocol session tools ─────────────────────────────────────────
+
+/// begin_protocol_session — activate PROTOCOL mode and return session health.
+fn tool_begin_protocol_session(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+) -> Result<String, String> {
+    let task = args.get("task").and_then(|v| v.as_str()).unwrap_or("unspecified task");
+
+    // Activate PROTOCOL mode for this session.
+    crate::protocol::activate_protocol_mode(store.conn(), session_id)
+        .map_err(|e| e.to_string())?;
+
+    let gaps = crate::protocol::top_query_gaps(store.conn(), 3)
+        .unwrap_or_default();
+    let health = crate::protocol::pattern_health_summary(store.conn())
+        .unwrap_or_default();
+    let markers = crate::protocol::session_marker_counts(store.conn(), session_id)
+        .unwrap_or((0, 0, 0));
+    let pending_obs = store.all_observations()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let pending_proposals = crate::protocol::pending_proposal_count(store.conn())
+        .unwrap_or(0);
+
+    let mut report = crate::protocol::status_report(
+        store.conn(),
+        session_id,
+        pending_obs,
+        Some(markers),
+        &gaps,
+        &health,
+        pending_proposals,
+    ).map_err(|e| e.to_string())?;
+
+    report.insert_str(0, &format!(
+        "PROTOCOL session started — task: \"{}\"\n\n",
+        task.chars().take(120).collect::<String>()
+    ));
+    report.push_str("\n\nPhase 0 required: call get_delta → get_preferences → get_anti_patterns → get_context\nWork tools are gated until Phase 0 is complete.");
+
+    Ok(report)
+}
+
+/// get_session_health — one-call session status report.
+fn tool_get_session_health(
+    store: &Store,
+    session_id: &str,
+) -> Result<String, String> {
+    let gaps = crate::protocol::top_query_gaps(store.conn(), 3)
+        .unwrap_or_default();
+    let health = crate::protocol::pattern_health_summary(store.conn())
+        .unwrap_or_default();
+    let markers = crate::protocol::session_marker_counts(store.conn(), session_id)
+        .unwrap_or((0, 0, 0));
+    let pending_obs = store.all_observations()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let pending_proposals = crate::protocol::pending_proposal_count(store.conn())
+        .unwrap_or(0);
+
+    crate::protocol::status_report(
+        store.conn(),
+        session_id,
+        pending_obs,
+        Some(markers),
+        &gaps,
+        &health,
+        pending_proposals,
+    ).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

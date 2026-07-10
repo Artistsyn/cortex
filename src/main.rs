@@ -10,6 +10,7 @@ mod mcp;
 mod model;
 mod planner;
 mod prefs;
+mod protocol;
 mod reasoner;
 mod search;
 mod watcher;

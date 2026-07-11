@@ -15,9 +15,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 // ── Session key derivation ────────────────────────────────────────────────────
 
-/// Derive the current logical session key from the most recent mcp_calls row.
+/// Derive the current logical session key from the most recent mcp_calls row
+/// and the repo root (to avoid cross-project collisions).
 /// Returns a new session key if no calls exist or the last call is > 2 hours ago.
-pub fn current_session_key(conn: &Connection) -> Result<String> {
+pub fn current_session_key(conn: &Connection, repo_root: Option<&str>) -> Result<String> {
     // Find the timestamp of the most recent mcp_call in the current window.
     let two_hours_ago = Utc::now().timestamp() - 7200;
 
@@ -40,16 +41,22 @@ pub fn current_session_key(conn: &Connection) -> Result<String> {
         }
     };
 
-    Ok(sha256_minute(anchor))
+    Ok(make_session_key(anchor, repo_root))
 }
 
-/// Generate a stable, human-readable session key from a unix-minute timestamp.
-fn sha256_minute(unix_minute: i64) -> String {
+/// Generate a stable, human-readable session key from a unix-minute timestamp
+/// and an optional repo root discriminator (prevents cross-project collision).
+fn make_session_key(unix_minute: i64, repo_root: Option<&str>) -> String {
     use std::fmt::Write;
-    // Simple stable key: hex of the minute timestamp (no crypto needed here,
-    // just needs to be compact and unique per window boundary).
     let mut s = String::new();
     write!(s, "session_{:016x}", unix_minute).unwrap();
+    if let Some(root) = repo_root {
+        // Append a short hash of the repo root to disambiguate projects
+        // within the same 2-hour window.
+        let root_hash = root.as_bytes().iter()
+            .fold(0u64, |h, &b| h.wrapping_mul(31).wrapping_add(b as u64));
+        write!(s, "_{:x}", root_hash % 0xFFFF).unwrap();
+    }
     s
 }
 

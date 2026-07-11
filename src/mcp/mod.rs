@@ -78,7 +78,9 @@ pub fn serve(
 
     // Phase 0B: derive logical session key from mcp_calls timing window.
     // Falls back to process-id-based key if DB not yet populated.
-    let session_id = crate::protocol::current_session_key(store.conn())
+    // Pass repo_root to disambiguate projects within the same 2-hour window.
+    let repo_root_str = repo_root.to_string_lossy();
+    let session_id = crate::protocol::current_session_key(store.conn(), Some(&repo_root_str))
         .unwrap_or_else(|_| format!("session_{}", std::process::id()));
 
     // Initialize protocol state cache (avoids DB queries on every tool call).

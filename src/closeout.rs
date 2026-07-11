@@ -157,8 +157,24 @@ pub fn run_closeout(
     }
 
     // ── Step 6: Write agent-memory mirror ─────────────────────────────────────
+    // Enforce max mirror files before writing.
     let mirror_dir = repo_root.join(".agent-memory").join("mirrors").join("repo");
     if std::fs::create_dir_all(&mirror_dir).is_ok() {
+        // Prune oldest mirrors if over limit (max 200).
+        const MAX_MIRROR_FILES: usize = 200;
+        let mut mirrors: Vec<_> = std::fs::read_dir(&mirror_dir)
+            .into_iter()
+            .flat_map(|rd| rd.flatten())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+            .collect();
+        mirrors.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        while mirrors.len() > MAX_MIRROR_FILES {
+            if let Some(old) = mirrors.pop() {
+                let _ = std::fs::remove_file(&old);
+            }
+        }
+
         let date = Utc::now().format("%Y-%m-%d");
         let mirror_path = mirror_dir.join(format!("session-closeout-{date}.md"));
         if let Ok(content) = build_mirror_content(

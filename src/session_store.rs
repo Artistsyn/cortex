@@ -14,6 +14,8 @@ use rusqlite::{Connection, OpenFlags, params};
 // ── Path discovery ────────────────────────────────────────────────────────────
 
 /// Find the most recently modified VS Code Copilot session store DB.
+/// Limits scan to the first 50 workspace folders to avoid long pauses
+/// on machines with many workspaces.
 pub fn find_session_store() -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
     let ws = PathBuf::from(appdata)
@@ -26,9 +28,12 @@ pub fn find_session_store() -> Option<PathBuf> {
     }
 
     let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    let mut scanned = 0usize;
 
     if let Ok(entries) = std::fs::read_dir(&ws) {
         for entry in entries.flatten() {
+            if scanned >= 50 { break; } // safety limit
+            scanned += 1;
             let db = entry.path()
                 .join("GitHub.copilot-chat")
                 .join("chat-session-resources")

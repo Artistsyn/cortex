@@ -233,10 +233,15 @@ fn extract_code_blocks(text: &str) -> Vec<String> {
 /// Gate 3 helper: compute credibility from the proposals evidence or DB.
 pub fn compute_credibility(store: &Store, session_keys: &[String]) -> f32 {
     if session_keys.is_empty() { return 0.0; }
-    let pass_count = session_keys.iter().filter(|_key| {
-        // Count sessions with build_pass outcome (approximate via session_snapshots).
-        // Best-effort: if we can't find the snapshot, assume unknown = neutral.
-        true
+    let pass_count = session_keys.iter().filter(|key| {
+        // Count sessions with build_pass outcome via session_snapshots.
+        let has_pass = store.conn().query_row(
+            "SELECT COUNT(*) > 0 FROM session_snapshots
+             WHERE session_key = ?1 AND outcome_type = 'build_pass'",
+            rusqlite::params![key],
+            |r| r.get::<_, bool>(0),
+        ).unwrap_or(false);
+        has_pass
     }).count();
     // credibility = min(occurrences, 10) / 10 — mirrors the patterns.credibility column.
     (pass_count.min(10) as f32) / 10.0
@@ -436,39 +441,52 @@ pub fn evaluate_trial_proposals(store: &Store) -> Result<usize> {
 ///   get_anti_patterns → (get_context | list_patterns) → [work tools] → closeout_session
 ///
 /// Returns a score 0.0–1.0 and a list of missing steps.
-pub fn score_process_fidelity(tool_sequence: &[String]) -> (f32, Vec<String>) {
-    let required = [
-        "begin_protocol_session",
-        "get_delta",
-        "get_preferences",
-        "get_anti_patterns",
-        "closeout_session",
-    ];
-    let partial = [
-        "get_context",
-        "list_patterns",
-    ];
+///
+/// `penalties` optionally overrides the default per-step penalties.
+/// Default: 0.2 for each required step, 0.1 for the partial step.
+/// Important steps (like closeout_session) can be weighted higher.
+/// Default fidelity penalty weights: closeout is weighted highest (0.25),
+/// then bootstrap steps (0.15 each), then other steps (0.10 each).
+const DEFAULT_FIDELITY_PENALTIES: &[(f32, &[&str])] = &[
+    (0.25, &["closeout_session"]),
+    (0.15, &["begin_protocol_session"]),
+    (0.10, &["get_delta"]),
+    (0.10, &["get_preferences"]),
+    (0.10, &["get_anti_patterns"]),
+    (0.10, &["get_context", "list_patterns"]),
+];
 
+/// Score a session's process fidelity: did the agent follow the ideal PROTOCOL sequence?
+///
+/// Ideal sequence: begin_protocol_session → get_delta → get_preferences →
+///   get_anti_patterns → (get_context | list_patterns) → [work tools] → closeout_session
+///
+/// Returns a score 0.0–1.0 and a list of missing steps.
+///
+/// `penalties` optionally overrides the default per-step penalties.
+/// Default: closeout=0.25, bootstrap=0.15, steps=0.10, partial=0.10.
+pub fn score_process_fidelity(
+    tool_sequence: &[String],
+    penalties: Option<&[(f32, &[&str])]>,
+) -> (f32, Vec<String>) {
     let seq_set: std::collections::HashSet<&str> = tool_sequence.iter()
         .map(|s| s.as_str())
         .collect();
 
+    let active = penalties.unwrap_or(DEFAULT_FIDELITY_PENALTIES);
+
     let mut missing = Vec::new();
     let mut score = 1.0f32;
 
-    for step in &required {
-        if !seq_set.contains(step) {
-            missing.push(step.to_string());
-            score -= 0.2; // each missing required step costs 0.2
+    for &(penalty, steps) in active {
+        let present = steps.iter().any(|s| seq_set.contains(s));
+        if !present {
+            let key = if steps.len() == 1 { steps[0].to_string() }
+                      else { format!("{}|{}", steps[0], steps[1]) };
+            missing.push(key);
+            score -= penalty;
         }
     }
-
-    // Partial credit: at least one of get_context or list_patterns.
-    if !seq_set.contains("get_context") && !seq_set.contains("list_patterns") {
-        missing.push("get_context|list_patterns".to_string());
-        score -= 0.1;
-    }
-    let _ = partial; // used in the check above
 
     (score.max(0.0), missing)
 }
@@ -505,7 +523,7 @@ mod tests {
             "get_anti_patterns", "get_context", "semantic_search",
             "recall", "closeout_session",
         ].into_iter().map(str::to_string).collect::<Vec<_>>();
-        let (score, missing) = score_process_fidelity(&seq);
+        let (score, missing) = score_process_fidelity(&seq, None);
         assert!(score >= 0.9, "perfect sequence should score >= 0.9, got {score}");
         assert!(missing.is_empty(), "no missing steps, got: {missing:?}");
     }
@@ -515,7 +533,7 @@ mod tests {
         let seq = vec![
             "begin_protocol_session", "get_delta", "get_preferences", "get_anti_patterns",
         ].into_iter().map(str::to_string).collect::<Vec<_>>();
-        let (score, missing) = score_process_fidelity(&seq);
+        let (score, missing) = score_process_fidelity(&seq, None);
         assert!(score < 1.0);
         assert!(missing.contains(&"closeout_session".to_string()));
     }

@@ -41,13 +41,14 @@ pub struct PipelineResult {
     pub drift_report_written:   bool,
     pub high_drift_communities: usize,
     pub drift_based_proposals:  usize,
+    pub meta_proposals_staged:  usize,
     pub last_run_updated:       bool,
 }
 
 impl PipelineResult {
     pub fn summary(&self) -> String {
         format!(
-            "Pipeline complete: {} snapshots → {} clusters → {} skill candidates ({} drafts) | {} gap proposals ({} trials, {} rejected) | {} survival proposals | {} fidelity sessions scored | {} trial promotions | drift: {} communities ({} proposals)",
+            "Pipeline complete: {} snapshots → {} clusters → {} skill candidates ({} drafts) | {} gap proposals ({} trials, {} rejected) | {} survival proposals | {} fidelity sessions scored | {} trial promotions | drift: {} communities ({} proposals) | meta: {} proposals staged",
             self.snapshots_read,
             self.clusters_found,
             self.skill_candidates_new,
@@ -60,6 +61,7 @@ impl PipelineResult {
             self.trial_promotions,
             self.high_drift_communities,
             self.drift_based_proposals,
+            self.meta_proposals_staged,
         )
     }
 }
@@ -252,6 +254,28 @@ pub fn run(
         }
     }
 
+    // ── Stage 8: Meta-analysis (Phase 5b) ────────────────────────────────────
+    {
+        let rejected_log = repo_root.join(".cortex").join("rejected-proposals.jsonl");
+        match crate::meta::build_meta_report(store, &rejected_log) {
+            Ok(report) => {
+                if report.total_proposals > 0 {
+                    match crate::meta::stage_meta_proposals(store, &report) {
+                        Ok(staged) => {
+                            result.meta_proposals_staged = staged;
+                        }
+                        Err(e) => {
+                            eprintln!("[consolidator] warn: stage_meta_proposals failed: {e}");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[consolidator] warn: meta report failed: {e}");
+            }
+        }
+    }
+
     // ── Update last-run timestamp ─────────────────────────────────────────────
     let _ = store.conn().execute(
         "INSERT INTO annotations (topic, body, tags, added_at)
@@ -422,7 +446,7 @@ fn score_session_fidelity(store: &Store) -> Result<usize> {
 
     for (session_key, seq_json) in sessions {
         let seq: Vec<String> = serde_json::from_str(&seq_json).unwrap_or_default();
-        let (score, missing) = verify::score_process_fidelity(&seq);
+        let (score, missing) = verify::score_process_fidelity(&seq, None);
         let _ = store.conn().execute(
             "UPDATE session_snapshots
              SET marker_counts = json_set(marker_counts,
@@ -439,6 +463,12 @@ fn score_session_fidelity(store: &Store) -> Result<usize> {
 }
 
 /// Returns true if the last consolidation run was more than `staleness_hours` ago.
+/// Returns true if the last consolidation run was more than `staleness_hours` ago,
+/// OR if many sessions occurred since the last run (session-frequency scaling).
+///
+/// Session-frequency scaling: if >= 5 sessions completed since the last run,
+/// treat as stale regardless of clock time. This ensures high-activity periods
+/// get more frequent consolidation.
 pub fn is_stale(store: &Store, staleness_hours: u32) -> bool {
     let cutoff = Utc::now().timestamp() - (staleness_hours as i64 * 3600);
 
@@ -447,15 +477,29 @@ pub fn is_stale(store: &Store, staleness_hours: u32) -> bool {
         [], |r| r.get(0),
     ).ok().flatten();
 
-    match last_run {
-        None => true, // never run
-        Some(ts) => {
-            let last_ts = chrono::DateTime::parse_from_rfc3339(&ts)
-                .map(|dt| dt.timestamp())
-                .unwrap_or(0);
-            last_ts < cutoff
-        }
+    let last_ts = match last_run {
+        None => return true, // never run
+        Some(ref ts) => chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0),
+    };
+
+    // Clock-based staleness check.
+    let clock_stale = last_ts < cutoff;
+    if clock_stale {
+        return true;
     }
+
+    // Session-frequency scaling: count sessions closed since last run.
+    let recent_sessions: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM protocol_sessions
+         WHERE closeout_run = 1 AND closed_at >= ?1",
+        rusqlite::params![last_ts],
+        |r| r.get(0),
+    ).unwrap_or(0);
+
+    // If >= 5 sessions completed since last run, treat as stale.
+    recent_sessions >= 5
 }
 
 // ── Simple hash for content dedup ─────────────────────────────────────────────

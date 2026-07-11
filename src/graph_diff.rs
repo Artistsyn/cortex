@@ -70,6 +70,15 @@ impl GraphData {
 
 // ── Drift metrics ────────────────────────────────────────────────────────────
 
+/// Threshold above which a community is considered "high drift" (0.0–1.0).
+/// Communities with drift >= this value get flagged in high_drift_communities.
+pub const DRIFT_HIGH_THRESHOLD: f64 = 0.3;
+
+/// Threshold above which drift scores get a priority boost in the pipeline.
+pub const DRIFT_BOOST_HIGH: f64 = 0.5;
+pub const DRIFT_BOOST_MEDIUM: f64 = 0.3;
+pub const DRIFT_BOOST_LOW: f64 = 0.1;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CommunityDrift {
     pub community_id:       u32,
@@ -145,7 +154,7 @@ pub fn compare_graphs(current: &GraphData, previous: &GraphData) -> DriftReport 
     community_drifts.sort_by(|a, b| b.drift_score.partial_cmp(&a.drift_score).unwrap_or(std::cmp::Ordering::Equal));
 
     let high_drift: Vec<CommunityDrift> = community_drifts.iter()
-        .filter(|c| c.drift_score >= 0.3)
+        .filter(|c| c.drift_score >= DRIFT_HIGH_THRESHOLD)
         .cloned()
         .collect();
 
@@ -238,11 +247,11 @@ pub struct CommunityWeight {
 /// are reviewed sooner.
 pub fn compute_community_weights(report: &DriftReport) -> Vec<CommunityWeight> {
     report.community_drifts.iter().map(|c| {
-        let boost = if c.drift_score >= 0.5 {
+        let boost = if c.drift_score >= DRIFT_BOOST_HIGH {
             3.0  // high drift → triple priority
-        } else if c.drift_score >= 0.3 {
+        } else if c.drift_score >= DRIFT_BOOST_MEDIUM {
             2.0  // moderate drift → double priority
-        } else if c.drift_score >= 0.1 {
+        } else if c.drift_score >= DRIFT_BOOST_LOW {
             1.5  // mild drift → slight boost
         } else {
             1.0  // stable → normal priority

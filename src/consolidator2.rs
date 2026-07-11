@@ -1,12 +1,15 @@
 /// Phase 1: Consolidation pipeline orchestrator.
 ///
-/// Runs the 6-stage pipeline that feeds the nightly consolidation:
+/// Phase 2 additions: deterministic verification gates applied to every proposal
+/// before it enters the `proposals` table. Gates live in `verify.rs`.
+///
+/// Stage notes:
 ///   1. health-check   → .cortex/health-report.json
 ///   2. cluster-sessions → .cortex/clusters.json
 ///   3. detect-skills  → .cortex/proposals/skill_*.md
-///   4. propose-gaps   → .cortex/proposals/pref_gap_*.json
-///   5. propose-survival → .cortex/proposals/ap_*.json (dying patterns)
-///   6. propose-instructions → (stub for Phase 2)
+///   4. propose-gaps   → gated (trial for seen_count < 5)
+///   5. propose-survival → gated (dedup + survival trend)
+///   6. process-fidelity → score each session; flag low-fidelity patterns
 ///
 /// Each stage is idempotent — safe to re-run.
 use std::path::Path;
@@ -16,33 +19,42 @@ use chrono::Utc;
 use serde_json::{json, Value};
 
 use crate::memory::Store;
-use crate::miner::{self, SessionCluster};
+use crate::miner;
 use crate::prefs::Preferences;
 use crate::skills;
+use crate::verify;
 
 // ── Pipeline result ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Default)]
 pub struct PipelineResult {
-    pub snapshots_read:       usize,
-    pub clusters_found:       usize,
-    pub skill_candidates_new: usize,
-    pub skill_drafts_written: usize,
-    pub gap_proposals:        usize,
-    pub survival_proposals:   usize,
-    pub last_run_updated:     bool,
+    pub snapshots_read:         usize,
+    pub clusters_found:         usize,
+    pub skill_candidates_new:   usize,
+    pub skill_drafts_written:   usize,
+    pub gap_proposals:          usize,
+    pub gap_trials:             usize,
+    pub gap_rejected:           usize,
+    pub survival_proposals:     usize,
+    pub fidelity_sessions:      usize,
+    pub trial_promotions:       usize,
+    pub last_run_updated:       bool,
 }
 
 impl PipelineResult {
     pub fn summary(&self) -> String {
         format!(
-            "Pipeline complete: {} snapshots → {} clusters → {} skill candidates ({} drafts) | {} gap proposals | {} survival proposals",
+            "Pipeline complete: {} snapshots → {} clusters → {} skill candidates ({} drafts) | {} gap proposals ({} trials, {} rejected) | {} survival proposals | {} fidelity sessions scored | {} trial promotions",
             self.snapshots_read,
             self.clusters_found,
             self.skill_candidates_new,
             self.skill_drafts_written,
             self.gap_proposals,
+            self.gap_trials,
+            self.gap_rejected,
             self.survival_proposals,
+            self.fidelity_sessions,
+            self.trial_promotions,
         )
     }
 }
@@ -60,8 +72,12 @@ pub fn run(
     let proposals_dir   = repo_root.join(".cortex").join("proposals");
     let clusters_path   = repo_root.join(".cortex").join("clusters.json");
     let health_path     = repo_root.join(".cortex").join("health-report.json");
+    let rejected_log    = repo_root.join(".cortex").join("rejected-proposals.jsonl");
 
     std::fs::create_dir_all(&proposals_dir)?;
+
+    // ── Phase 2: Promote any expired trial proposals before new pipeline run ─
+    result.trial_promotions = verify::evaluate_trial_proposals(store)?;
 
     // ── Stage 1: Health report ────────────────────────────────────────────────
     let health = build_health_report(store)?;
@@ -101,46 +117,82 @@ pub fn run(
         }
     }
 
-    // ── Stage 4: Gap-driven proposals ─────────────────────────────────────────
+    // ── Stage 4: Gap-driven proposals (Phase 2: gated) ───────────────────────
     let gap_proposals = skills::detect_gap_proposals(store, 3)?;
     result.gap_proposals = gap_proposals.len();
 
     for (i, gap) in gap_proposals.iter().enumerate() {
-        let proposal = json!({
-            "proposal_type": "pref_note",
-            "tool_name":  gap.tool_name,
-            "query_text": gap.query_text,
+        let content_hash = format!("{:x}", simple_hash(
+            format!("gap:{}:{}", gap.tool_name, gap.query_text).as_bytes()
+        ));
+
+        // Phase 2 gate: check rejection log first.
+        if verify::is_recently_rejected(&rejected_log, &content_hash) {
+            result.gap_rejected += 1;
+            continue;
+        }
+
+        let evidence = json!({
+            "source": "query_gap_log",
             "seen_count": gap.seen_count,
-            "proposed_note": gap.proposed_note,
+            "source_query": gap.query_text,
         });
-        let path = proposals_dir.join(format!("pref_gap_{i:02}.json"));
-        std::fs::write(path, serde_json::to_string_pretty(&proposal)?)?;
 
-        // Record in proposals table with content hash for dedup.
-        let content_hash = {
-            use std::fmt::Write;
-            let mut h = String::new();
-            write!(h, "gap:{}:{}", gap.tool_name, gap.query_text).ok();
-            format!("{:x}", simple_hash(h.as_bytes()))
-        };
-
-        let _ = store.conn().execute(
-            "INSERT OR IGNORE INTO proposals
-                 (proposal_type, content_hash, target_file, proposed_text, evidence, status)
-             VALUES ('pref_note', ?1, '.cortex/prefs.toml', ?2, ?3, 'pending')",
-            rusqlite::params![
-                content_hash,
-                gap.proposed_note,
-                json!({"source": "query_gap_log", "seen_count": gap.seen_count}).to_string(),
-            ],
+        let (outcome, signals) = verify::run_gates(
+            store, "pref_note", &content_hash, &gap.proposed_note, &evidence
         );
+
+        match outcome {
+            verify::GateOutcome::Pass => {
+                // Stage immediately.
+                let _ = store.conn().execute(
+                    "INSERT OR IGNORE INTO proposals
+                         (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
+                     VALUES ('pref_note', ?1, '.cortex/prefs.toml', ?2, ?3, 'pending', ?4)",
+                    rusqlite::params![
+                        content_hash, gap.proposed_note,
+                        evidence.to_string(), signals.to_json(),
+                    ],
+                );
+                // Write JSON file for review.
+                let path = proposals_dir.join(format!("pref_gap_{i:02}.json"));
+                let _ = std::fs::write(path, serde_json::to_string_pretty(&json!({
+                    "proposal_type": "pref_note",
+                    "tool_name": gap.tool_name,
+                    "query_text": gap.query_text,
+                    "seen_count": gap.seen_count,
+                    "proposed_note": gap.proposed_note,
+                }))?);
+            }
+            verify::GateOutcome::Trial { trial_days, .. } => {
+                // Stage as trial; will be promoted after trial period expires.
+                let _ = store.conn().execute(
+                    "INSERT OR IGNORE INTO proposals
+                         (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
+                     VALUES ('pref_note', ?1, '.cortex/prefs.toml', ?2, ?3, 'trial', ?4)",
+                    rusqlite::params![
+                        content_hash, gap.proposed_note,
+                        evidence.to_string(), signals.to_json(),
+                    ],
+                );
+                let _ = verify::stage_as_trial(store, &content_hash, trial_days);
+                result.gap_trials += 1;
+            }
+            verify::GateOutcome::Reject(reason) => {
+                verify::log_rejection(
+                    &rejected_log, "pref_note", &content_hash,
+                    &gap.proposed_note, &reason, &signals,
+                );
+                result.gap_rejected += 1;
+            }
+        }
     }
 
-    // ── Stage 5: Survival-based proposals (dying patterns → anti-pattern candidates) ─
-    result.survival_proposals = propose_survival(store, &proposals_dir)?;
+    // ── Stage 5: Survival-based proposals (Phase 2: gated) ───────────────────
+    result.survival_proposals = propose_survival_gated(store, &proposals_dir, &rejected_log)?;
 
-    // ── Stage 6: Instruction proposals (stub — implemented in Phase 2) ────────
-    // Phase 2 will add deterministic rule-based instruction edits here.
+    // ── Stage 6: Process fidelity scoring (Phase 2) ──────────────────────────
+    result.fidelity_sessions = score_session_fidelity(store)?;
 
     // ── Update last-run timestamp ─────────────────────────────────────────────
     let _ = store.conn().execute(
@@ -217,10 +269,13 @@ fn build_health_report(store: &Store) -> Result<Value> {
     }))
 }
 
-// ── Survival proposals ────────────────────────────────────────────────────────
+// ── Survival proposals (Phase 2: gated) ──────────────────────────────────────
 
-fn propose_survival(store: &Store, proposals_dir: &Path) -> Result<usize> {
-    // Find patterns used 3+ times with survival_rate < 0.4.
+fn propose_survival_gated(
+    store: &Store,
+    proposals_dir: &Path,
+    rejected_log: &Path,
+) -> Result<usize> {
     let mut stmt = store.conn().prepare(
         "SELECT id, name, intent, body, use_count, reverted_count, survival_rate
          FROM patterns
@@ -244,43 +299,86 @@ fn propose_survival(store: &Store, proposals_dir: &Path) -> Result<usize> {
     let mut count = 0usize;
     for row in rows {
         let (id, name, intent, body, uses, reverts, rate) = row?;
-
-        let proposal = json!({
-            "proposal_type": "dying_pattern",
-            "pattern_id":    id,
-            "name":          name,
-            "intent":        intent,
-            "body_preview":  body.chars().take(200).collect::<String>(),
-            "use_count":     uses,
-            "reverted_count": reverts,
-            "survival_rate": rate,
-            "suggested_action": "Consider converting to anti-pattern or removing if superseded.",
-        });
-
-        let safe_name = name.replace(['/', '\\', ' '], "-");
-        let path = proposals_dir.join(format!("ap_dying_{safe_name}.json"));
-        std::fs::write(path, serde_json::to_string_pretty(&proposal)?)?;
-
-        // Record in proposals table.
         let content_hash = format!("{:x}", simple_hash(format!("dying:{id}:{name}").as_bytes()));
-        let _ = store.conn().execute(
-            "INSERT OR IGNORE INTO proposals
-                 (proposal_type, content_hash, target_file, proposed_text, evidence, status)
-             VALUES ('anti_pattern', ?1, 'patterns', ?2, ?3, 'pending')",
-            rusqlite::params![
-                content_hash,
-                format!("Pattern '{name}' has {rate:.0}% survival after {uses} uses — review for removal or anti-pattern conversion"),
-                json!({"pattern_id": id, "use_count": uses, "reverted_count": reverts}).to_string(),
-            ],
+
+        if verify::is_recently_rejected(rejected_log, &content_hash) { continue; }
+
+        let evidence = json!({"pattern_id": id, "use_count": uses, "reverted_count": reverts});
+        let proposed_text = format!(
+            "Pattern '{name}' has {rate:.0}% survival after {uses} uses — review for removal or anti-pattern conversion"
         );
 
-        count += 1;
+        let (outcome, signals) = verify::run_gates(
+            store, "anti_pattern", &content_hash, &proposed_text, &evidence
+        );
+
+        match outcome {
+            verify::GateOutcome::Pass => {
+                let safe_name = name.replace(['/', '\\', ' '], "-");
+                let path = proposals_dir.join(format!("ap_dying_{safe_name}.json"));
+                let _ = std::fs::write(path, serde_json::to_string_pretty(&json!({
+                    "proposal_type": "dying_pattern",
+                    "pattern_id": id, "name": name, "intent": intent,
+                    "body_preview": body.chars().take(200).collect::<String>(),
+                    "use_count": uses, "reverted_count": reverts, "survival_rate": rate,
+                }))?);
+                let _ = store.conn().execute(
+                    "INSERT OR IGNORE INTO proposals
+                         (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
+                     VALUES ('anti_pattern', ?1, 'patterns', ?2, ?3, 'pending', ?4)",
+                    rusqlite::params![content_hash, proposed_text, evidence.to_string(), signals.to_json()],
+                );
+                count += 1;
+            }
+            verify::GateOutcome::Reject(reason) => {
+                verify::log_rejection(rejected_log, "anti_pattern", &content_hash, &proposed_text, &reason, &signals);
+            }
+            verify::GateOutcome::Trial { .. } => {}
+        }
     }
 
     Ok(count)
 }
 
-// ── Staleness check ───────────────────────────────────────────────────────────
+/// CLI wrapper called by `propose-survival` and tests.
+pub fn propose_survival_pub(store: &Store, proposals_dir: &Path) -> Result<usize> {
+    let rejected_log = proposals_dir.parent()
+        .unwrap_or(proposals_dir)
+        .join("rejected-proposals.jsonl");
+    propose_survival_gated(store, proposals_dir, &rejected_log)
+}
+
+// ── Stage 6: Process fidelity scoring ────────────────────────────────────────
+
+fn score_session_fidelity(store: &Store) -> Result<usize> {
+    let mut stmt = store.conn().prepare(
+        "SELECT session_key, tool_sequence FROM session_snapshots
+         WHERE json_extract(marker_counts, '$.fidelity_score') IS NULL
+         ORDER BY created_at DESC LIMIT 50"
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })?;
+    let sessions: Vec<(String, String)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let scored = sessions.len();
+
+    for (session_key, seq_json) in sessions {
+        let seq: Vec<String> = serde_json::from_str(&seq_json).unwrap_or_default();
+        let (score, missing) = verify::score_process_fidelity(&seq);
+        let _ = store.conn().execute(
+            "UPDATE session_snapshots
+             SET marker_counts = json_set(marker_counts,
+                 '$.fidelity_score', ?1, '$.fidelity_missing', ?2)
+             WHERE session_key = ?3",
+            rusqlite::params![
+                score,
+                serde_json::to_string(&missing).unwrap_or_default(),
+                session_key,
+            ],
+        );
+    }
+    Ok(scored)
+}
 
 /// Returns true if the last consolidation run was more than `staleness_hours` ago.
 pub fn is_stale(store: &Store, staleness_hours: u32) -> bool {
@@ -312,13 +410,6 @@ fn simple_hash(data: &[u8]) -> u64 {
         h = h.wrapping_mul(1099511628211u64);
     }
     h
-}
-
-// ── Survival proposals (public entry point for CLI) ───────────────────────────
-
-/// Public wrapper called by the CLI `propose-survival` command.
-pub fn propose_survival_pub(store: &Store, proposals_dir: &Path) -> Result<usize> {
-    propose_survival(store, proposals_dir)
 }
 
 #[derive(Debug, Clone)]

@@ -19,6 +19,7 @@ mod reasoner;
 mod search;
 mod session_store;
 mod skills;
+mod verify;
 mod watcher;
 
 use std::collections::{HashSet, VecDeque};

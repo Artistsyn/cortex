@@ -5,6 +5,13 @@ use super::scratchpad::Scratchpad;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+/// Words that negate an anti-pattern match when they precede the matched text.
+const NEGATION_WORDS: &[&str] = &[
+    "not ", "n't ", "avoid ", "never ", "instead of ",
+    "shouldn't ", "should not ", "don't ", "do not ",
+    "without ", "except ", "skip ", "omit ",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecurrentContext {
     pub loop_index: u8,
@@ -68,7 +75,18 @@ pub fn run_recurrent_loop(
     })
 }
 
+/// Check whether text found at `match_start` is negated by surrounding context.
+/// Looks backwards up to 30 chars for negation words.
+fn is_negated(text: &str, match_start: usize) -> bool {
+    let window_start = match_start.saturating_sub(30);
+    let prefix = &text[window_start..match_start];
+    let prefix_lower = prefix.to_lowercase();
+    NEGATION_WORDS.iter().any(|&neg| prefix_lower.contains(neg))
+}
+
 /// Critique hypothesis against anti-patterns and graph conflicts.
+/// Negation-aware: if the hypothesis uses "not X" or "avoid X",
+/// a match on X is NOT flagged as a violation.
 fn critique_hypothesis(hypothesis: &str, conn: &Connection) -> crate::Result<Vec<String>> {
     let mut critiques = vec![];
 
@@ -86,11 +104,25 @@ fn critique_hypothesis(hypothesis: &str, conn: &Connection) -> crate::Result<Vec
 
     for ap_result in anti_patterns {
         let (wrong, right) = ap_result?;
+        // Negation-aware: find ALL occurrences of `wrong` in hypothesis
+        // and only flag if at least one is NOT negated.
         if hypothesis.contains(&wrong) {
-            critiques.push(format!(
-                "Anti-pattern detected: uses '{}'. Should use '{}' instead.",
-                wrong, right
-            ));
+            let mut is_effectively_negated = false;
+            let mut search_start = 0usize;
+            while let Some(pos) = hypothesis[search_start..].find(&wrong) {
+                let abs_pos = search_start + pos;
+                if is_negated(hypothesis, abs_pos) {
+                    is_effectively_negated = true;
+                    break;
+                }
+                search_start = abs_pos + 1;
+            }
+            if !is_effectively_negated {
+                critiques.push(format!(
+                    "Anti-pattern detected: uses '{}'. Should use '{}' instead.",
+                    wrong, right
+                ));
+            }
         }
     }
 
@@ -194,8 +226,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_is_negated_detects_negation() {
+        assert!(is_negated("avoid using Action::SetPosition", 20));
+        assert!(is_negated("do not use unwrap()", 12));
+        assert!(is_negated("shouldn't use raw pointers", 14));
+        assert!(is_negated("without momentum, this breaks", 10));
+    }
+
+    #[test]
+    fn test_is_negated_passes_non_negated() {
+        assert!(!is_negated("use Action::SetPosition to teleport", 30));
+        assert!(!is_negated("momentum carries through", 10));
+        assert!(!is_negated("this uses unwrap() safely", 12));
+    }
+
+    #[test]
+    fn test_is_negated_edge_cases() {
+        // Match at start of string (no room for negation prefix)
+        assert!(!is_negated("Action::SetPosition is fine", 0));
+        // Single char string
+        assert!(!is_negated("x", 0));
+        // Empty string after match
+        assert!(!is_negated("", 0));
+    }
+
+    #[test]
     fn test_stability_detection() {
-        let mut scratchpad = Scratchpad::new("test task");
+        let mut scratchpad = Scratchpad::new("test task", None);
         scratchpad.add_hypothesis(1, "spawn player at x=0, y=0").ok();
         scratchpad.add_hypothesis(2, "spawn player at x=0, y=0").ok();
         assert!(scratchpad.is_stable(), "Identical hypotheses should be stable");

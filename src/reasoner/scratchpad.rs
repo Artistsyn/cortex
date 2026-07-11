@@ -29,9 +29,16 @@ pub struct Scratchpad {
 }
 
 impl Scratchpad {
-    pub fn new(task: &str) -> Self {
+    /// Create a new scratchpad scoped to an optional session key.
+    /// When `session_key` is provided, it is incorporated into the hash
+    /// so that different sessions with the same task get distinct scratchpads.
+    pub fn new(task: &str, session_key: Option<&str>) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(task.as_bytes());
+        if let Some(sk) = session_key {
+            hasher.update(b"::session::");
+            hasher.update(sk.as_bytes());
+        }
         let id = format!("{:x}", hasher.finalize());
         
         let now = Utc::now();
@@ -116,10 +123,14 @@ pub fn init_store(conn: &Connection) -> crate::Result<()> {
     Ok(())
 }
 
-/// Load scratchpad from database by task hash.
-pub fn load_from_db(conn: &Connection, task: &str) -> crate::Result<Option<Scratchpad>> {
+/// Load scratchpad from database by task hash (optionally scoped to a session).
+pub fn load_from_db(conn: &Connection, task: &str, session_key: Option<&str>) -> crate::Result<Option<Scratchpad>> {
     let mut hasher = Sha256::new();
     hasher.update(task.as_bytes());
+    if let Some(sk) = session_key {
+        hasher.update(b"::session::");
+        hasher.update(sk.as_bytes());
+    }
     let id = format!("{:x}", hasher.finalize());
     
     let mut stmt = conn.prepare(

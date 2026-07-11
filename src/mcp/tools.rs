@@ -835,6 +835,7 @@ fn tool_recurrent_think(args: &Value, store: &Store) -> Result<String, String> {
     let hypothesis = args["hypothesis"].as_str();
     let loop_index = args["loop"].as_u64().unwrap_or(0) as u8;
     let depth_mode = args["depth_mode"].as_str().unwrap_or("auto");
+    let session_key = args["session_key"].as_str();
     let max_loops = match depth_mode {
         "shallow" => 2u8,
         "deep" => args["max_loops"].as_u64().unwrap_or(12).min(16) as u8,
@@ -842,9 +843,12 @@ fn tool_recurrent_think(args: &Value, store: &Store) -> Result<String, String> {
     };
 
     // Load persisted scratchpad from SQLite or initialize a new one.
-    let mut scratchpad = crate::reasoner::scratchpad::load_from_db(store.conn(), task)
-        .map_err(|e| format!("Failed to load scratchpad: {}", e))?
-        .unwrap_or_else(|| crate::reasoner::scratchpad::Scratchpad::new(task));
+    // session_key scopes the scratchpad — different sessions with the same task
+    // get distinct scratchpads (Phase 4).
+    let mut scratchpad =
+        crate::reasoner::scratchpad::load_from_db(store.conn(), task, session_key)
+            .map_err(|e| format!("Failed to load scratchpad: {}", e))?
+            .unwrap_or_else(|| crate::reasoner::scratchpad::Scratchpad::new(task, session_key));
 
     // Add hypothesis if provided. If this is the first invocation and no hypothesis
     // was provided, seed one from task text so the loop can critique/refine.

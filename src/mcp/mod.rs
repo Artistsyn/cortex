@@ -13,6 +13,13 @@ use crate::cache::{
 use crate::memory::Store;
 use crate::model::CodeUnit;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// In-memory cache of protocol state — avoids DB queries on every tool call.
+/// Refreshed only when a bootstrap tool fires or begin_protocol_session is called.
+static PROTOCOL_MODE: AtomicBool = AtomicBool::new(false);
+static BOOTSTRAP_DONE: AtomicBool = AtomicBool::new(false);
+
 /// Max response cache entries before LRU eviction kicks in.
 const CACHE_MAX_ENTRIES: usize = 256;
 
@@ -74,6 +81,16 @@ pub fn serve(
     let session_id = crate::protocol::current_session_key(store.conn())
         .unwrap_or_else(|_| format!("session_{}", std::process::id()));
 
+    // Initialize protocol state cache (avoids DB queries on every tool call).
+    PROTOCOL_MODE.store(
+        crate::protocol::is_protocol_mode(store.conn(), &session_id).unwrap_or(false),
+        Ordering::Relaxed,
+    );
+    BOOTSTRAP_DONE.store(
+        crate::protocol::is_bootstrap_complete(store.conn(), &session_id).unwrap_or(false),
+        Ordering::Relaxed,
+    );
+
     for line in stdin.lock().lines() {
         let line = line?;
         if line.trim().is_empty() { continue; }
@@ -109,22 +126,25 @@ pub fn serve(
 
                 // Phase 0B: auto-record bootstrap steps when completed.
                 // Also gate work tools if this is a PROTOCOL session and Phase 0 is incomplete.
+                // Protocol state is cached in-memory to avoid DB queries on every tool call.
                 {
                     use crate::protocol::ProtocolStep;
+                    // Update cached protocol state when bootstrap tools fire.
+                    let mut protocol_state_changed = false;
                     match tool {
-                        "get_delta"         => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetDelta); }
-                        "get_preferences"   => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetPreferences); }
-                        "get_anti_patterns" => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetAntiPatterns); }
-                        "get_context" | "list_patterns" => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetContext); }
+                        "get_delta"         => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetDelta); protocol_state_changed = true; }
+                        "get_preferences"   => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetPreferences); protocol_state_changed = true; }
+                        "get_anti_patterns" => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetAntiPatterns); protocol_state_changed = true; }
+                        "get_context" | "list_patterns" => { let _ = crate::protocol::record_step(store.conn(), &session_id, ProtocolStep::GetContext); protocol_state_changed = true; }
+                        "begin_protocol_session" => { protocol_state_changed = true; }
                         // Work tools: blocked in PROTOCOL mode until Phase 0 complete.
+                        // Uses cached protocol state — refreshed only when state changes.
                         "semantic_search" | "get_item" | "get_syntax" | "get_usage_examples"
                         | "get_helper" | "recall" | "query_graph" | "simulate_change"
                         | "suggest_pattern" => {
-                            let is_protocol = crate::protocol::is_protocol_mode(store.conn(), &session_id)
-                                .unwrap_or(false);
+                            let is_protocol = PROTOCOL_MODE.load(std::sync::atomic::Ordering::Relaxed);
                             if is_protocol {
-                                let bootstrap_done = crate::protocol::is_bootstrap_complete(store.conn(), &session_id)
-                                    .unwrap_or(false);
+                                let bootstrap_done = BOOTSTRAP_DONE.load(std::sync::atomic::Ordering::Relaxed);
                                 if !bootstrap_done {
                                     let msg = crate::protocol::gate_error_message(&session_id, store.conn())
                                         .unwrap_or_else(|_| "PROTOCOL_PHASE_0_INCOMPLETE".to_string());
@@ -139,6 +159,13 @@ pub fn serve(
                             }
                         }
                         _ => {}
+                    }
+                    // Refresh cache if protocol state may have changed.
+                    if protocol_state_changed {
+                        let is_p = crate::protocol::is_protocol_mode(store.conn(), &session_id).unwrap_or(false);
+                        let is_b = crate::protocol::is_bootstrap_complete(store.conn(), &session_id).unwrap_or(false);
+                        PROTOCOL_MODE.store(is_p, std::sync::atomic::Ordering::Relaxed);
+                        BOOTSTRAP_DONE.store(is_b, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
 

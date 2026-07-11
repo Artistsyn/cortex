@@ -11,6 +11,7 @@ mod graph_diff;
 mod markers;
 mod memory;
 mod mcp;
+mod meta;
 mod miner;
 mod model;
 mod planner;
@@ -113,6 +114,10 @@ enum Command {
         #[arg(long)]
         full: bool,
     },
+
+    /// Run meta-analysis: analyze proposal effectiveness and stage threshold suggestions.
+    #[command(subcommand)]
+    Meta(MetaCmd),
 
     /// Run production-style workflow health checks.
     #[command(subcommand)]
@@ -489,6 +494,14 @@ struct DoctorWorkflowArgs {
 }
 
 #[derive(Subcommand, Debug)]
+enum MetaCmd {
+    /// Show meta-analysis report.
+    Report,
+    /// Stage meta-proposals based on current analysis.
+    Propose,
+}
+
+#[derive(Subcommand, Debug)]
 enum GraphCmd {
     Sync,
     AddPair {
@@ -589,6 +602,7 @@ fn main() -> Result<()> {
         Command::Annotate(cmd)     => run_annotate(cmd, &db_path, format),
         Command::Prune { keep_calls } => run_prune(keep_calls, &db_path),
         Command::Status { full }   => run_status(&db_path, full, format),
+        Command::Meta(cmd)        => run_meta(cmd, &db_path, format),
         Command::Doctor(cmd)       => run_doctor(cmd, &db_path, format),
         Command::Recall { topic }  => run_recall(&topic, &db_path, format),
         Command::GitReview { base, repo } => run_git_review(&base, repo.as_deref(), &db_path),
@@ -2816,6 +2830,41 @@ fn run_doctor(cmd: DoctorCmd, db_path: &Path, format: OutputFormat) -> Result<()
     match cmd {
         DoctorCmd::Workflow(args) => run_doctor_workflow(args, db_path, format),
     }
+}
+
+fn run_meta(cmd: MetaCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
+    let rejected_log = repo_root.join(".cortex").join("rejected-proposals.jsonl");
+
+    match cmd {
+        MetaCmd::Report => {
+            let report = meta::build_meta_report(&store, &rejected_log)?;
+            if format == OutputFormat::Json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("=== META ANALYSIS REPORT ===");
+                println!("Total proposals: {}", report.total_proposals);
+                println!("Approved: {} | Rejected: {} | Pending: {} | Trial: {}", 
+                    report.approved, report.rejected, report.pending, report.trial);
+                println!("Approval rate: {:.1}%", report.approval_rate * 100.0);
+                println!("Gate rejection rate: {:.1}%", report.gate_rejection_rate * 100.0);
+                if !report.top_rejected_types.is_empty() {
+                    println!("\nTop rejection types:");
+                    for (t, c) in &report.top_rejected_types {
+                        println!("  {}: {}", t, c);
+                    }
+                }
+                println!("=============================");
+            }
+        }
+        MetaCmd::Propose => {
+            let report = meta::build_meta_report(&store, &rejected_log)?;
+            let staged = meta::stage_meta_proposals(&store, &report)?;
+            println!("Staged {} meta-proposal(s) for review.", staged);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]

@@ -274,6 +274,7 @@ fn gate_survival_trend(store: &Store, pattern_id: i64) -> Result<bool> {
 // ── Rejection log ─────────────────────────────────────────────────────────────
 
 /// Append a rejected proposal to `.cortex/rejected-proposals.jsonl`.
+/// Auto-rotates entries older than 90 days to keep the file bounded.
 pub fn log_rejection(
     rejected_log_path: &Path,
     proposal_type: &str,
@@ -282,6 +283,9 @@ pub fn log_rejection(
     reason: &str,
     signals: &GateSignals,
 ) {
+    // Rotate: remove entries older than 90 days.
+    rotate_rejection_log(rejected_log_path, 90);
+
     let entry = json!({
         "timestamp":     Utc::now().to_rfc3339(),
         "proposal_type": proposal_type,
@@ -320,6 +324,36 @@ pub fn is_recently_rejected(rejected_log_path: &Path, content_hash: &str) -> boo
         }
     }
     false
+}
+
+/// Rotate the rejection log: rewrite only entries newer than `max_age_days`.
+/// Keeps the log bounded so it doesn't grow forever.
+fn rotate_rejection_log(path: &Path, max_age_days: i64) {
+    let cutoff = Utc::now().timestamp() - max_age_days * 86400;
+    let Ok(content) = std::fs::read_to_string(path) else { return; };
+
+    let keep: Vec<&str> = content.lines()
+        .filter(|line| {
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                if let Some(ts) = v.get("timestamp").and_then(|t| t.as_str()) {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                        return dt.timestamp() >= cutoff;
+                    }
+                }
+            }
+            false
+        })
+        .collect();
+
+    if keep.len() < content.lines().count() {
+        // Some entries were pruned — rewrite.
+        if let Ok(mut file) = std::fs::File::create(path) {
+            use std::io::Write;
+            for line in keep {
+                let _ = writeln!(file, "{}", line);
+            }
+        }
+    }
 }
 
 // ── Trial period management ───────────────────────────────────────────────────

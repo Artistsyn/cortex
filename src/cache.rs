@@ -174,22 +174,51 @@ pub fn cache_stats(conn: &Connection) -> Result<CacheStats> {
 
 // ── Index version ─────────────────────────────────────────────────────────────
 
-/// Compute a version hash from all indexed unit IDs and their timestamps.
-/// Changes whenever anything is re-indexed. Cheap to compute.
+/// Compute a version hash from all indexed unit IDs and their timestamps,
+/// plus pattern and anti-pattern row counts (so adding a pattern invalidates cache).
+/// Changes whenever anything is re-indexed or a pattern/anti-pattern is added.
+/// Cheap to compute.
 pub fn compute_index_version(conn: &Connection) -> Result<String> {
-    let mut stmt =
-        conn.prepare("SELECT id, indexed_at FROM code_units ORDER BY id")?;
     let mut hasher = Sha256::new();
 
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
+    // Hash code_units (existing behavior).
+    if let Ok(mut stmt) = conn.prepare("SELECT id, indexed_at FROM code_units ORDER BY id") {
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            if let Ok((id, ts)) = row {
+                hasher.update(id.as_bytes());
+                hasher.update(b"|");
+                hasher.update(ts.as_bytes());
+                hasher.update(b"\n");
+            }
+        }
+    }
 
-    for row in rows {
-        let (id, ts) = row?;
-        hasher.update(id.as_bytes());
-        hasher.update(b"|");
-        hasher.update(ts.as_bytes());
+    // Hash pattern count + latest approved_at — invalidates when a pattern is added.
+    if let Ok((count, latest)) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(approved_at), '') FROM patterns",
+        [],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+    ) {
+        hasher.update(b"patterns:");
+        hasher.update(count.to_string().as_bytes());
+        hasher.update(b"@");
+        hasher.update(latest.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    // Hash anti-pattern count + latest added_at.
+    if let Ok((count, latest)) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(added_at), '') FROM anti_patterns",
+        [],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+    ) {
+        hasher.update(b"anti_patterns:");
+        hasher.update(count.to_string().as_bytes());
+        hasher.update(b"@");
+        hasher.update(latest.as_bytes());
         hasher.update(b"\n");
     }
 

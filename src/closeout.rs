@@ -4,7 +4,7 @@
 /// With inline_approve=true (triggered by "KNOWLEDGE COMMITTED"), all markers are
 /// immediately committed to the DB. With inline_approve=false (default), markers
 /// are staged in knowledge_markers for later review.
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -53,7 +53,11 @@ pub fn run_closeout(
     let mut result = CloseoutResult::default();
 
     // ── Step 1: Flush knowledge markers from session store ───────────────────
-    let markers = extract_session_markers().unwrap_or_default();
+    let markers = extract_session_markers().unwrap_or_else(|e| {
+        eprintln!("[closeout] warn: session store unavailable ({e}) — no markers from store");
+        // Fallback: try to extract markers from recent mcp_calls in DB
+        extract_markers_from_mcp_calls(store).unwrap_or_default()
+    });
     let extracted_markers = markers.clone();
 
     if inline_approve {
@@ -475,7 +479,25 @@ fn build_mirror_content(
     Ok(out)
 }
 
+/// Fallback marker extraction: scan recent mcp_calls arguments for CORTEX-* tags.
+/// Used when the VS Code session store is inaccessible.
+fn extract_markers_from_mcp_calls(store: &Store) -> Result<Vec<KnowledgeMarker>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT args FROM mcp_calls
+         WHERE called_at > datetime('now', '-1 day')
+         ORDER BY id DESC LIMIT 30"
+    )?;
+    let args_list: Vec<String> = stmt.query_map([], |r| {
+        r.get::<_, String>(0)
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let all_text = args_list.join("\n\n---\n\n");
+    Ok(markers::parse_markers(&all_text))
+}
+
 // ── Graph snapshot pruning ────────────────────────────────────────────────────
+
+const MAX_SNAPSHOTS: usize = 50;
 
 fn prune_old_snapshots(dir: &Path, max_age_days: u64) {
     let cutoff = std::time::SystemTime::now()
@@ -491,6 +513,20 @@ fn prune_old_snapshots(dir: &Path, max_age_days: u64) {
                     }
                 }
             }
+        }
+    }
+
+    // Count-based pruning: keep only the N newest snapshots.
+    let mut snapshots: Vec<_> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            snapshots.push(entry.path());
+        }
+    }
+    snapshots.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    while snapshots.len() > MAX_SNAPSHOTS {
+        if let Some(old) = snapshots.pop() {
+            let _ = std::fs::remove_file(&old);
         }
     }
 }

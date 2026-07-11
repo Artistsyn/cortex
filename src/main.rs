@@ -7,6 +7,7 @@ mod consolidator2;
 mod crystallizer;
 mod git;
 mod graph;
+mod graph_diff;
 mod markers;
 mod memory;
 mod mcp;
@@ -80,6 +81,9 @@ enum Command {
     /// Graph relation management and querying.
     #[command(subcommand)]
     Graph(GraphCmd),
+
+    /// Run graph drift analysis between current graph and latest snapshot.
+    GraphDiff,
 
     /// Preference file management.
     #[command(subcommand)]
@@ -578,6 +582,7 @@ fn main() -> Result<()> {
         Command::Dismiss(args)     => run_dismiss(args, &db_path),
         Command::Context(args)     => run_context(args, &db_path),
         Command::Graph(cmd)        => run_graph(cmd, &db_path),
+        Command::GraphDiff         => run_graph_diff_cmd(&db_path, format),
         Command::Prefs(cmd)        => run_prefs(cmd),
         Command::Pattern(cmd)      => run_pattern(cmd, &db_path, format),
         Command::AntiPattern(cmd)  => run_anti_pattern(cmd, &db_path, format),
@@ -2067,6 +2072,49 @@ fn run_graph(cmd: GraphCmd, db_path: &Path) -> Result<()> {
                 }
             } else {
                 println!("no unit found for {}", name);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_graph_diff_cmd(db_path: &Path, format: OutputFormat) -> Result<()> {
+    let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
+    let snapshots_dir = repo_root.join(".graphify-output").join("snapshots");
+    let current_graph = repo_root.join(".graphify-output").join("graph.json");
+
+    let report = graph_diff::run_graph_diff(&snapshots_dir, &current_graph)?;
+
+    match report {
+        None => {
+            if format == OutputFormat::Json {
+                println!("{}", serde_json::json!({"error": "no previous snapshot available"}));
+            } else {
+                println!("No previous graph snapshot found. Run closeout first to create one.");
+            }
+        }
+        Some(r) => {
+            if format == OutputFormat::Json {
+                println!("{}", graph_diff::drift_report_to_json(&r));
+            } else {
+                println!("=== GRAPH DRIFT REPORT ===");
+                println!("Current:  {} ({} nodes, {} links)", r.current_graph_path, r.total_nodes_current, r.total_links_current);
+                println!("Previous: {} ({} nodes, {} links)", r.previous_graph_path, r.total_nodes_previous, r.total_links_previous);
+                println!("Node delta: {:+}", r.node_count_delta);
+                println!("Link delta: {:+}", r.link_count_delta);
+                println!("Communities affected: {}/{}", r.communities_affected, r.community_drifts.len());
+                println!();
+                if r.high_drift_communities.is_empty() {
+                    println!("No high-drift communities detected.");
+                } else {
+                    println!("HIGH-DRIFT COMMUNITIES (score >= 0.3):");
+                    for c in &r.high_drift_communities {
+                        println!("  Community {}: drift={:.2}, +{}/-{} nodes (now {}, was {})",
+                            c.community_id, c.drift_score, c.nodes_added, c.nodes_removed,
+                            c.node_count_current, c.node_count_previous);
+                    }
+                }
+                println!("===========================");
             }
         }
     }

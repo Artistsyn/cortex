@@ -38,13 +38,16 @@ pub struct PipelineResult {
     pub survival_proposals:     usize,
     pub fidelity_sessions:      usize,
     pub trial_promotions:       usize,
+    pub drift_report_written:   bool,
+    pub high_drift_communities: usize,
+    pub drift_based_proposals:  usize,
     pub last_run_updated:       bool,
 }
 
 impl PipelineResult {
     pub fn summary(&self) -> String {
         format!(
-            "Pipeline complete: {} snapshots → {} clusters → {} skill candidates ({} drafts) | {} gap proposals ({} trials, {} rejected) | {} survival proposals | {} fidelity sessions scored | {} trial promotions",
+            "Pipeline complete: {} snapshots → {} clusters → {} skill candidates ({} drafts) | {} gap proposals ({} trials, {} rejected) | {} survival proposals | {} fidelity sessions scored | {} trial promotions | drift: {} communities ({} proposals)",
             self.snapshots_read,
             self.clusters_found,
             self.skill_candidates_new,
@@ -55,6 +58,8 @@ impl PipelineResult {
             self.survival_proposals,
             self.fidelity_sessions,
             self.trial_promotions,
+            self.high_drift_communities,
+            self.drift_based_proposals,
         )
     }
 }
@@ -193,6 +198,59 @@ pub fn run(
 
     // ── Stage 6: Process fidelity scoring (Phase 2) ──────────────────────────
     result.fidelity_sessions = score_session_fidelity(store)?;
+
+    // ── Stage 7: Graphify drift analysis (Phase 3) ───────────────────────────
+    {
+        let snapshots_dir = repo_root.join(".graphify-output").join("snapshots");
+        let current_graph = repo_root.join(".graphify-output").join("graph.json");
+        match crate::graph_diff::run_graph_diff(&snapshots_dir, &current_graph) {
+            Ok(Some(report)) => {
+                result.drift_report_written = true;
+                result.high_drift_communities = report.high_drift_communities.len();
+
+                // Write drift report to .cortex/drift-report.json
+                let drift_path = repo_root.join(".cortex").join("drift-report.json");
+                let _ = std::fs::write(&drift_path, serde_json::to_string_pretty(
+                    &crate::graph_diff::drift_report_to_json(&report),
+                )?);
+
+                // Generate drift-based proposals for high-drift communities.
+                let weights = crate::graph_diff::compute_community_weights(&report);
+                for w in &weights {
+                    if w.priority_boost >= 2.0 {
+                        // Stage a proposal flagging this community.
+                        let content_hash = format!("{:x}", simple_hash(
+                            format!("drift:comm:{}", w.community_id).as_bytes()
+                        ));
+                        let proposed_text = format!(
+                            "Community {} has drift score {:.2} — review for architectural attention",
+                            w.community_id, w.drift_score,
+                        );
+                        let evidence = json!({
+                            "source": "graph_drift",
+                            "community_id": w.community_id,
+                            "drift_score": w.drift_score,
+                            "priority_boost": w.priority_boost,
+                        });
+                        let _ = store.conn().execute(
+                            "INSERT OR IGNORE INTO proposals
+                             (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
+                             VALUES ('drift_flag', ?1, '.graphify-output/graph.json', ?2, ?3, 'pending', ?4)",
+                            rusqlite::params![
+                                content_hash, proposed_text,
+                                evidence.to_string(), serde_json::to_string(&json!({"gate":"drift_analysis"})).unwrap_or_default(),
+                            ],
+                        );
+                        result.drift_based_proposals += 1;
+                    }
+                }
+            }
+            Ok(None) => { /* no previous snapshot — skip */ }
+            Err(e) => {
+                eprintln!("[consolidator] warn: graph drift analysis failed: {e}");
+            }
+        }
+    }
 
     // ── Update last-run timestamp ─────────────────────────────────────────────
     let _ = store.conn().execute(

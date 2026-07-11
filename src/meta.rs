@@ -1,8 +1,14 @@
 /// Phase 5b: Meta-analysis for the consolidation pipeline.
 ///
-/// Analyzes pipeline outputs to track proposal effectiveness and detect
-/// threshold drift. All findings are staged as `meta_*` proposals in the
-/// existing proposals table — never auto-applied, never source-modifying.
+/// Four analyzers — each returns `MetaSignal`s which are then staged as proposals:
+///   1. `analyze_rejection_rates`   — gate firing patterns (Phase 5b)
+///   2. `analyze_fidelity_trends`   — protocol step adherence over time (Phase 5c)
+///   3. `analyze_gap_evolution`     — persistent unresolved query gaps (Phase 5c)
+///   4. `analyze_threshold_impact`  — per-type approval rates vs thresholds (Phase 5c)
+///
+/// All findings are staged as `meta_*` proposals — never auto-applied,
+/// never source-modifying. Apply via `cortex meta apply <id>`.
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -17,18 +23,203 @@ use crate::verify;
 
 #[derive(Debug, Default, Serialize)]
 pub struct MetaReport {
-    pub generated_at:        String,
-    pub total_proposals:     usize,
-    pub approved:            usize,
-    pub rejected:            usize,
-    pub pending:             usize,
-    pub trial:               usize,
-    pub approval_rate:       f32,
-    pub gate_rejection_rate: f32,
-    pub top_rejected_types:  Vec<(String, usize)>,
+    pub generated_at:           String,
+    pub total_proposals:        usize,
+    pub approved:               usize,
+    pub rejected:               usize,
+    pub pending:                usize,
+    pub trial:                  usize,
+    pub approval_rate:          f32,
+    /// Fraction of proposals rejected by a gate (gate: prefix) vs human rejection.
+    pub gate_rejection_rate:    f32,
+    pub top_rejected_gates:     Vec<(String, usize)>,
+    pub avg_fidelity_score:     f32,
+    pub low_fidelity_sessions:  usize,
+    pub most_missed_step:       Option<String>,
+    pub persistent_gaps:        usize,
+    pub threshold_alerts:       Vec<String>,
 }
 
-/// Build a meta-analysis report from the proposals table + rejection log.
+// ── Signal: atomic insight from one analyzer ─────────────────────────────────
+
+#[derive(Debug)]
+struct MetaSignal {
+    hash:          String,
+    proposal_type: &'static str,
+    target:        &'static str,
+    text:          String,
+    evidence:      Value,
+}
+
+fn simple_hash(data: &[u8]) -> String {
+    let h = data.iter()
+        .fold(14695981039346656037u64, |h, &b| h.wrapping_mul(1099511628211u64) ^ b as u64);
+    format!("{h:016x}")
+}
+
+// ── Phase 5b: Rejection rate analysis ────────────────────────────────────────
+
+/// Analyze gate rejection patterns from the rejected-proposals.jsonl log.
+/// Returns (gate_rejection_rate, gate_counts by gate name).
+fn analyze_rejection_rates(
+    store: &Store,
+    rejected_log: &Path,
+) -> Result<(f32, Vec<(String, usize)>)> {
+    let total_proposals: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM proposals", [], |r| r.get(0),
+    ).unwrap_or(0);
+
+    let mut gate_counts: HashMap<String, usize> = HashMap::new();
+
+    if let Ok(content) = std::fs::read_to_string(rejected_log) {
+        for line in content.lines() {
+            if let Ok(v) = serde_json::from_str::<Value>(line) {
+                if let Some(reason) = v.get("reason").and_then(|r| r.as_str()) {
+                    let gate = if reason.starts_with("duplicate:") { "duplicate"
+                    } else if reason.starts_with("rust_syntax:") { "rust_syntax"
+                    } else if reason.starts_with("credibility:") { "credibility"
+                    } else if reason.starts_with("gap_trial:") { "gap_trial"
+                    } else if reason.starts_with("survival_trend:") { "survival_trend"
+                    } else { "other" };
+                    *gate_counts.entry(gate.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    let log_total: usize = gate_counts.values().sum();
+    let gate_rejection_rate = if total_proposals > 0 {
+        log_total as f32 / total_proposals as f32
+    } else {
+        0.0
+    };
+
+    let mut sorted: Vec<(String, usize)> = gate_counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+
+    Ok((gate_rejection_rate.min(1.0), sorted))
+}
+
+// ── Phase 5c: Fidelity trend analysis ────────────────────────────────────────
+
+/// Analyze session fidelity scores over recent sessions.
+/// Returns (avg_score, low_fidelity_count, most_missed_step).
+fn analyze_fidelity_trends(store: &Store) -> Result<(f32, usize, Option<String>)> {
+    // Read last 20 sessions that have fidelity scores.
+    let mut stmt = store.conn().prepare(
+        "SELECT marker_counts FROM session_snapshots
+         WHERE json_extract(marker_counts, '$.fidelity_score') IS NOT NULL
+         ORDER BY created_at DESC LIMIT 20"
+    )?;
+
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mc_list: Vec<String> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if mc_list.is_empty() {
+        return Ok((1.0, 0, None));
+    }
+
+    let mut scores: Vec<f32> = Vec::new();
+    let mut miss_counts: HashMap<String, usize> = HashMap::new();
+
+    for mc_json in &mc_list {
+        if let Ok(mc) = serde_json::from_str::<Value>(mc_json) {
+            if let Some(score) = mc.get("fidelity_score").and_then(|s| s.as_f64()) {
+                scores.push(score as f32);
+            }
+            if let Some(missing) = mc.get("fidelity_missing").and_then(|m| m.as_array()) {
+                for step in missing {
+                    if let Some(s) = step.as_str() {
+                        *miss_counts.entry(s.to_string()).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let avg = if scores.is_empty() { 1.0 } else {
+        scores.iter().sum::<f32>() / scores.len() as f32
+    };
+    let low_count = scores.iter().filter(|&&s| s < 0.6).count();
+    let most_missed = miss_counts.into_iter().max_by_key(|(_, c)| *c).map(|(k, _)| k);
+
+    Ok((avg, low_count, most_missed))
+}
+
+// ── Phase 5c: Gap evolution analysis ─────────────────────────────────────────
+
+/// Find persistent unresolved gaps: query_gap_log entries with high seen_count
+/// that have no corresponding approved or pending proposal.
+fn analyze_gap_evolution(store: &Store) -> Result<usize> {
+    let cutoff = Utc::now().timestamp() - 30 * 86400; // 30-day window
+
+    let mut stmt = store.conn().prepare(
+        "SELECT query_text, seen_count FROM query_gap_log
+         WHERE seen_count >= 3 AND last_seen_at >= ?1
+         ORDER BY seen_count DESC LIMIT 20"
+    )?;
+
+    let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+    })?;
+    let gaps: Vec<(String, i64)> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let mut unresolved = 0usize;
+    for (query, _count) in &gaps {
+        let has_proposal: bool = store.conn().query_row(
+            "SELECT COUNT(*) > 0 FROM proposals
+             WHERE proposed_text LIKE ?1 AND status IN ('approved','pending')",
+            rusqlite::params![format!("%{}%", &query.chars().take(40).collect::<String>())],
+            |r| r.get(0),
+        ).unwrap_or(false);
+        if !has_proposal {
+            unresolved += 1;
+        }
+    }
+
+    Ok(unresolved)
+}
+
+// ── Phase 5c: Threshold impact analysis ──────────────────────────────────────
+
+/// Compute per-type approval rates and return alerts for types with consistently
+/// low approval (< 20% with >= 5 samples).
+fn analyze_threshold_impact(store: &Store) -> Result<Vec<String>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT proposal_type,
+                COUNT(*) as total,
+                SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) as approved_count
+         FROM proposals
+         GROUP BY proposal_type
+         HAVING total >= 5"
+    )?;
+
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+        ))
+    })?;
+
+    let mut alerts = Vec::new();
+    for row in rows {
+        let (ptype, total, approved) = row?;
+        let rate = approved as f32 / total as f32;
+        if rate < 0.2 {
+            alerts.push(format!(
+                "Type '{}': {}/{} approved ({:.0}%) — consider adjusting gate thresholds",
+                ptype, approved, total, rate * 100.0
+            ));
+        }
+    }
+
+    Ok(alerts)
+}
+
+// ── Main API ──────────────────────────────────────────────────────────────────
+
+/// Build a full meta-analysis report combining all four analyzers.
 pub fn build_meta_report(store: &Store, rejected_log: &Path) -> Result<MetaReport> {
     let total: i64 = store.conn().query_row(
         "SELECT COUNT(*) FROM proposals", [], |r| r.get(0),
@@ -50,59 +241,12 @@ pub fn build_meta_report(store: &Store, rejected_log: &Path) -> Result<MetaRepor
         "SELECT COUNT(*) FROM proposals WHERE status = 'trial'", [], |r| r.get(0),
     ).unwrap_or(0);
 
-    let approval_rate = if total > 0 {
-        approved as f32 / total as f32
-    } else {
-        0.0
-    };
+    let approval_rate = if total > 0 { approved as f32 / total as f32 } else { 0.0 };
 
-    // Count gate rejection types from proposals table.
-    let mut rejected_by_type: Vec<(String, usize)> = {
-        let mut stmt = store.conn().prepare(
-            "SELECT proposal_type, COUNT(*) as cnt FROM proposals
-             WHERE status = 'rejected'
-             GROUP BY proposal_type ORDER BY cnt DESC LIMIT 5"
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, usize>(1)?))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-
-    // Also scan rejection log for gate-level rejection counts.
-    if let Ok(content) = std::fs::read_to_string(rejected_log) {
-        let mut gate_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for line in content.lines() {
-            if let Ok(v) = serde_json::from_str::<Value>(line) {
-                if let Some(reason) = v.get("reason").and_then(|r| r.as_str()) {
-                    let gate = if reason.starts_with("duplicate:") { "duplicate"
-                        } else if reason.starts_with("rust_syntax:") { "rust_syntax"
-                        } else if reason.starts_with("credibility:") { "credibility"
-                        } else if reason.starts_with("gap_trial:") { "gap_trial"
-                        } else if reason.starts_with("survival_trend:") { "survival_trend"
-                        } else { "other" };
-                    *gate_counts.entry(gate.to_string()).or_default() += 1;
-                }
-            }
-        }
-        // Merge gate counts into rejected_by_type as "gate:<name>" entries.
-        for (gate, count) in gate_counts {
-            rejected_by_type.push((format!("gate:{gate}"), count));
-        }
-    }
-    rejected_by_type.sort_by(|a, b| b.1.cmp(&a.1));
-
-    let trej = rejected as f64;
-    let tpro = total as f64;
-    let sum_non_gate: usize = rejected_by_type.iter()
-        .filter(|(t, _)| !t.starts_with("gate:"))
-        .map(|(_, c)| c)
-        .sum();
-    let gate_rejection_rate = if tpro > 0.0 {
-        ((trej - sum_non_gate as f64).max(0.0) / tpro) as f32
-    } else {
-        0.0
-    };
+    let (gate_rejection_rate, top_rejected_gates) = analyze_rejection_rates(store, rejected_log)?;
+    let (avg_fidelity, low_fidelity, most_missed) = analyze_fidelity_trends(store)?;
+    let persistent_gaps = analyze_gap_evolution(store)?;
+    let threshold_alerts = analyze_threshold_impact(store)?;
 
     Ok(MetaReport {
         generated_at: Utc::now().to_rfc3339(),
@@ -113,100 +257,203 @@ pub fn build_meta_report(store: &Store, rejected_log: &Path) -> Result<MetaRepor
         trial: trial as usize,
         approval_rate,
         gate_rejection_rate,
-        top_rejected_types: rejected_by_type,
+        top_rejected_gates,
+        avg_fidelity_score: avg_fidelity,
+        low_fidelity_sessions: low_fidelity,
+        most_missed_step: most_missed,
+        persistent_gaps,
+        threshold_alerts,
     })
 }
 
-/// Stage a meta-proposal if analysis reveals a configurable issue.
-/// Example: if credibility gate rejects >60% of proposals, suggest raising min_cred.
+/// Stage meta-proposals based on analysis findings.
+/// Returns count of new proposals staged.
 pub fn stage_meta_proposals(store: &Store, report: &MetaReport) -> Result<usize> {
-    let mut staged = 0usize;
+    let mut signals: Vec<MetaSignal> = Vec::new();
 
-    let _content_hash_base = format!("meta_{}", Utc::now().timestamp());
-    let simple_hash = |data: &[u8]| -> String {
-        let mut h: u64 = 14695981039346656037u64;
-        for &b in data {
-            h ^= b as u64;
-            h = h.wrapping_mul(1099511628211u64);
-        }
-        format!("{:x}", h)
-    };
-
-    // Rule 1: If gate rejection rate > 60%, suggest threshold review.
+    // Signal 1: High gate rejection rate.
     if report.gate_rejection_rate > 0.6 && report.total_proposals >= 5 {
-        let hash = simple_hash(b"meta:gate_rejection_rate");
-        let rejected_log = Path::new(".cortex").join("rejected-proposals.jsonl");
-        let rejected_log = if rejected_log.exists() { rejected_log } else { Path::new(".").join("rejected-proposals.jsonl") };
-        if !verify::is_recently_rejected(&rejected_log, &hash) {
-            let proposed_text = format!(
-                "Meta: Gate rejection rate is {:.0}% across {} proposals. \
-                 Review verification thresholds (credibility filter, gap trial).",
-                report.gate_rejection_rate * 100.0, report.total_proposals
-            );
-            let evidence = json!({
+        let text = format!(
+            "Meta: Gate rejection rate is {:.0}% across {} proposals. \
+             Review verification thresholds (credibility filter, gap trial).",
+            report.gate_rejection_rate * 100.0, report.total_proposals
+        );
+        signals.push(MetaSignal {
+            hash: simple_hash(b"meta:gate_rejection_rate_high"),
+            proposal_type: "meta_threshold",
+            target: ".cortex/prefs.toml",
+            evidence: json!({
                 "source": "meta_analysis",
                 "gate_rejection_rate": report.gate_rejection_rate,
                 "approval_rate": report.approval_rate,
-                "total_proposals": report.total_proposals,
-            });
-            let _ = store.conn().execute(
-                "INSERT OR IGNORE INTO proposals
-                 (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
-                 VALUES ('meta_threshold', ?1, '.cortex/prefs.toml', ?2, ?3, 'pending', '{\"gate\":\"meta_analysis\"}')",
-                rusqlite::params![hash, proposed_text, evidence.to_string()],
-            );
-            staged += 1;
-        }
+            }),
+            text,
+        });
     }
 
-    // Rule 2: If approval rate is 0 after 5+ proposals, flag for investigation.
+    // Signal 2: Zero approval rate after enough data.
     if report.approval_rate == 0.0 && report.total_proposals >= 5 {
-        let hash = simple_hash(b"meta:zero_approval");
-        let proposed_text = format!(
-            "Meta: Zero proposals approved out of {} total. \
-             Pipeline may be generating low-quality proposals — review gate thresholds.",
-            report.total_proposals
-        );
-        let evidence = json!({
-            "source": "meta_analysis",
-            "total_proposals": report.total_proposals,
-            "approved": 0,
+        signals.push(MetaSignal {
+            hash: simple_hash(b"meta:zero_approval"),
+            proposal_type: "meta_threshold",
+            target: ".cortex/prefs.toml",
+            text: format!(
+                "Meta: Zero proposals approved out of {}. \
+                 Pipeline may be generating low-quality proposals — review gate thresholds.",
+                report.total_proposals
+            ),
+            evidence: json!({"source": "meta_analysis", "total": report.total_proposals}),
         });
-        let _ = store.conn().execute(
+    }
+
+    // Signal 3: Low average fidelity score.
+    if report.avg_fidelity_score < 0.6 && report.low_fidelity_sessions >= 3 {
+        let step_hint = report.most_missed_step.as_deref().unwrap_or("unknown");
+        signals.push(MetaSignal {
+            hash: simple_hash(format!("meta:low_fidelity:{step_hint}").as_bytes()),
+            proposal_type: "meta_instruction",
+            target: ".github/copilot-instructions.md",
+            text: format!(
+                "Meta: Average fidelity score {:.0}% across {} sessions. \
+                 Most missed step: '{}'. \
+                 Consider strengthening the instruction for this protocol step.",
+                report.avg_fidelity_score * 100.0, report.low_fidelity_sessions, step_hint
+            ),
+            evidence: json!({
+                "source": "meta_analysis",
+                "avg_fidelity": report.avg_fidelity_score,
+                "most_missed_step": step_hint,
+            }),
+        });
+    }
+
+    // Signal 4: Persistent unresolved gaps.
+    if report.persistent_gaps >= 3 {
+        signals.push(MetaSignal {
+            hash: simple_hash(b"meta:persistent_gaps"),
+            proposal_type: "meta_gap_priority",
+            target: ".cortex/prefs.toml",
+            text: format!(
+                "Meta: {} persistent query gaps (seen ≥3 times in 30 days) have no approved proposal. \
+                 Run 'cortex propose-gaps' or lower gap_trial threshold.",
+                report.persistent_gaps
+            ),
+            evidence: json!({"source": "meta_analysis", "gap_count": report.persistent_gaps}),
+        });
+    }
+
+    // Signal 5: Per-type threshold alerts.
+    for alert in &report.threshold_alerts {
+        signals.push(MetaSignal {
+            hash: simple_hash(format!("meta:threshold_alert:{alert}").as_bytes()),
+            proposal_type: "meta_threshold",
+            target: ".cortex/prefs.toml",
+            text: format!("Meta: {alert}"),
+            evidence: json!({"source": "meta_analysis"}),
+        });
+    }
+
+    // Stage all signals as proposals (skip duplicates via INSERT OR IGNORE).
+    let mut staged = 0usize;
+    for sig in signals {
+        let result = store.conn().execute(
             "INSERT OR IGNORE INTO proposals
              (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
-             VALUES ('meta_threshold', ?1, '.cortex/prefs.toml', ?2, ?3, 'pending', '{\"gate\":\"meta_analysis\"}')",
-            rusqlite::params![hash, proposed_text, evidence.to_string()],
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', '{\"gate\":\"meta_analysis\"}')",
+            rusqlite::params![
+                sig.proposal_type,
+                sig.hash,
+                sig.target,
+                sig.text,
+                sig.evidence.to_string(),
+            ],
         );
-        staged += 1;
-    }
-
-    // Rule 3: If any single rejection type dominates (>70%), suggest per-type threshold.
-    for (rtype, count) in &report.top_rejected_types {
-        if report.total_proposals >= 5 && *count as f32 / report.total_proposals as f32 > 0.7 {
-            let hash = simple_hash(format!("meta:dominant_rejection:{rtype}").as_bytes());
-            let proposed_text = format!(
-                "Meta: '{rtype}' accounts for {}/{} rejections ({:.0}%). \
-                 Consider adjusting this gate threshold.",
-                count, report.total_proposals, (*count as f32 / report.total_proposals as f32) * 100.0
-            );
-            let evidence = json!({
-                "source": "meta_analysis",
-                "dominant_type": rtype,
-                "count": count,
-                "total": report.total_proposals,
-            });
-            let _ = store.conn().execute(
-                "INSERT OR IGNORE INTO proposals
-                 (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
-                 VALUES ('meta_threshold', ?1, '.cortex/prefs.toml', ?2, ?3, 'pending', '{\"gate\":\"meta_analysis\"}')",
-                rusqlite::params![hash, proposed_text, evidence.to_string()],
-            );
+        if result.map(|n| n > 0).unwrap_or(false) {
             staged += 1;
         }
     }
 
     Ok(staged)
+}
+
+/// Apply an approved meta-proposal to its target file.
+/// For `meta_threshold` / `meta_gap_priority` targeting prefs.toml:
+///   appends the proposed_text as a note in [project].notes.
+/// For `meta_instruction` targeting copilot-instructions.md:
+///   appends the proposed_text as a comment at the end.
+///
+/// Returns `(applied, dry_run_diff)`.
+pub fn apply_meta_proposal(
+    store: &Store,
+    proposal_id: i64,
+    repo_root: &Path,
+    dry_run: bool,
+) -> Result<(bool, String)> {
+    // Load the proposal.
+    let (proposal_type, target, proposed_text, status): (String, String, String, String) =
+        store.conn().query_row(
+            "SELECT proposal_type, target_file, proposed_text, status
+             FROM proposals WHERE id = ?1",
+            rusqlite::params![proposal_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+
+    if status != "approved" && status != "pending" {
+        return Ok((false, format!("Proposal {} has status '{}' — only approved/pending proposals can be applied.", proposal_id, status)));
+    }
+
+    let target_path = repo_root.join(&target);
+    let diff;
+
+    match proposal_type.as_str() {
+        "meta_threshold" | "meta_gap_priority" if target.ends_with("prefs.toml") => {
+            if !target_path.exists() {
+                return Ok((false, format!("Target file '{}' does not exist.", target_path.display())));
+            }
+            let existing = std::fs::read_to_string(&target_path)?;
+            let note_line = format!("  \"META({}): {}\",", Utc::now().format("%Y-%m-%d"),
+                proposed_text.chars().take(120).collect::<String>().replace('"', "'"));
+
+            // Append into [project].notes if present, else append at end.
+            let new_content = if existing.contains("[project]") && existing.contains("notes = [") {
+                existing.replacen("notes = [", &format!("notes = [\n{note_line}"), 1)
+            } else {
+                format!("{existing}\n# Meta proposal applied {}\n# {}\n",
+                    Utc::now().format("%Y-%m-%d"), proposed_text)
+            };
+
+            diff = format!("+ {note_line}");
+            if !dry_run {
+                std::fs::write(&target_path, &new_content)?;
+                store.conn().execute(
+                    "UPDATE proposals SET status = 'committed', committed_at = unixepoch() WHERE id = ?1",
+                    rusqlite::params![proposal_id],
+                )?;
+            }
+        }
+        "meta_instruction" if target.contains("copilot-instructions") => {
+            if !target_path.exists() {
+                return Ok((false, format!("Target file '{}' does not exist.", target_path.display())));
+            }
+            let existing = std::fs::read_to_string(&target_path)?;
+            let note = format!("\n<!-- META {} -->\n<!-- {} -->\n",
+                Utc::now().format("%Y-%m-%d"),
+                proposed_text.chars().take(200).collect::<String>());
+            diff = format!("+ <!-- META {} -->", Utc::now().format("%Y-%m-%d"));
+            if !dry_run {
+                std::fs::write(&target_path, format!("{existing}{note}"))?;
+                store.conn().execute(
+                    "UPDATE proposals SET status = 'committed', committed_at = unixepoch() WHERE id = ?1",
+                    rusqlite::params![proposal_id],
+                )?;
+            }
+        }
+        _ => {
+            return Ok((false, format!("Proposal type '{}' targeting '{}' is not auto-applicable.", proposal_type, target)));
+        }
+    }
+
+    Ok((true, diff))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -215,7 +462,6 @@ pub fn stage_meta_proposals(store: &Store, report: &MetaReport) -> Result<usize>
 mod tests {
     use super::*;
     use crate::memory::Store;
-    use std::path::PathBuf;
 
     fn test_store(name: &str) -> Store {
         let dir = std::env::temp_dir().join("cortex-meta-test");
@@ -232,6 +478,8 @@ mod tests {
         let report = build_meta_report(&store, &log).unwrap();
         assert_eq!(report.total_proposals, 0);
         assert_eq!(report.approval_rate, 0.0);
+        assert_eq!(report.persistent_gaps, 0);
+        assert!(report.threshold_alerts.is_empty());
     }
 
     #[test]
@@ -239,7 +487,6 @@ mod tests {
         let store = test_store("counts");
         let log = std::env::temp_dir().join("cortex-meta-test-counts.jsonl");
 
-        // Insert a few proposals with different statuses.
         store.conn().execute_batch(
             "INSERT INTO proposals (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
              VALUES ('pref_note', 'a', 'x', 'test', '{}', 'approved', '{}');
@@ -257,5 +504,56 @@ mod tests {
         assert_eq!(report.rejected, 1);
         assert_eq!(report.pending, 1);
         assert_eq!(report.trial, 1);
+        assert!((0.0..=1.0).contains(&report.approval_rate));
+    }
+
+    #[test]
+    fn gate_rejection_rate_uses_log_only() {
+        // The gate rejection rate should come from the log, not the DB rejected count.
+        let store = test_store("gaterate");
+        let log = std::env::temp_dir().join("cortex-meta-gate-rate.jsonl");
+        // Write 2 gate rejections to log.
+        let mut f = std::fs::File::create(&log).unwrap();
+        use std::io::Write;
+        writeln!(f, r#"{{"timestamp":"{}","reason":"credibility: low","content_hash":"x"}}"#,
+            Utc::now().to_rfc3339()).unwrap();
+        writeln!(f, r#"{{"timestamp":"{}","reason":"duplicate: hash exists","content_hash":"y"}}"#,
+            Utc::now().to_rfc3339()).unwrap();
+
+        // Add 4 proposals to DB.
+        store.conn().execute_batch(
+            "INSERT INTO proposals (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
+             VALUES ('pref_note','p1','x','t','{}','approved','{}');
+             INSERT INTO proposals (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
+             VALUES ('pref_note','p2','x','t','{}','pending','{}');
+             INSERT INTO proposals (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
+             VALUES ('pref_note','p3','x','t','{}','pending','{}');
+             INSERT INTO proposals (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
+             VALUES ('pref_note','p4','x','t','{}','pending','{}');"
+        ).unwrap();
+
+        let report = build_meta_report(&store, &log).unwrap();
+        // 2 log rejections / 4 total proposals = 0.5
+        assert!((report.gate_rejection_rate - 0.5).abs() < 0.01,
+            "expected ~0.5, got {}", report.gate_rejection_rate);
+        assert_eq!(report.top_rejected_gates.len(), 2);
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn stage_meta_proposals_deduplicates() {
+        let store = test_store("dedup");
+        let log = std::env::temp_dir().join("cortex-meta-dedup.jsonl");
+        // Build a report that would trigger a zero-approval signal.
+        let report = MetaReport {
+            total_proposals: 5,
+            approval_rate: 0.0,
+            ..Default::default()
+        };
+        let first = stage_meta_proposals(&store, &report).unwrap();
+        let second = stage_meta_proposals(&store, &report).unwrap();
+        assert!(first > 0);
+        assert_eq!(second, 0, "second call should stage 0 (deduplication via INSERT OR IGNORE)");
+        let _ = std::fs::remove_file(&log);
     }
 }

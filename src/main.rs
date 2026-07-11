@@ -495,10 +495,19 @@ struct DoctorWorkflowArgs {
 
 #[derive(Subcommand, Debug)]
 enum MetaCmd {
-    /// Show meta-analysis report.
+    /// Show full meta-analysis report (rejection rates, fidelity trends, gaps, thresholds).
     Report,
-    /// Stage meta-proposals based on current analysis.
+    /// Run all analyzers and stage meta-proposals for review.
     Propose,
+    /// Apply an approved meta-proposal to its target file.
+    Apply {
+        /// Proposal ID from `cortex meta report` or `cortex review-proposals`.
+        id: i64,
+    },
+    /// Show what `apply` would change without writing any files.
+    DryRun {
+        id: i64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -2845,15 +2854,23 @@ fn run_meta(cmd: MetaCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
             } else {
                 println!("=== META ANALYSIS REPORT ===");
                 println!("Total proposals: {}", report.total_proposals);
-                println!("Approved: {} | Rejected: {} | Pending: {} | Trial: {}", 
+                println!("Approved: {} | Rejected: {} | Pending: {} | Trial: {}",
                     report.approved, report.rejected, report.pending, report.trial);
                 println!("Approval rate: {:.1}%", report.approval_rate * 100.0);
                 println!("Gate rejection rate: {:.1}%", report.gate_rejection_rate * 100.0);
-                if !report.top_rejected_types.is_empty() {
-                    println!("\nTop rejection types:");
-                    for (t, c) in &report.top_rejected_types {
-                        println!("  {}: {}", t, c);
-                    }
+                if !report.top_rejected_gates.is_empty() {
+                    println!("\nTop gate rejections:");
+                    for (g, c) in &report.top_rejected_gates { println!("  {g}: {c}"); }
+                }
+                println!("\nFidelity: avg={:.0}%, low-fidelity sessions={}",
+                    report.avg_fidelity_score * 100.0, report.low_fidelity_sessions);
+                if let Some(ref step) = report.most_missed_step {
+                    println!("  Most missed step: '{step}'");
+                }
+                println!("Persistent unresolved gaps: {}", report.persistent_gaps);
+                if !report.threshold_alerts.is_empty() {
+                    println!("\nThreshold alerts:");
+                    for a in &report.threshold_alerts { println!("  ! {a}"); }
                 }
                 println!("=============================");
             }
@@ -2862,6 +2879,18 @@ fn run_meta(cmd: MetaCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
             let report = meta::build_meta_report(&store, &rejected_log)?;
             let staged = meta::stage_meta_proposals(&store, &report)?;
             println!("Staged {} meta-proposal(s) for review.", staged);
+        }
+        MetaCmd::Apply { id } => {
+            let (applied, diff) = meta::apply_meta_proposal(&store, id, repo_root, false)?;
+            if applied {
+                println!("Applied proposal {}:\n{}", id, diff);
+            } else {
+                println!("Could not apply: {}", diff);
+            }
+        }
+        MetaCmd::DryRun { id } => {
+            let (_applied, diff) = meta::apply_meta_proposal(&store, id, repo_root, true)?;
+            println!("[dry-run] Proposal {} would change:\n{}", id, diff);
         }
     }
     Ok(())

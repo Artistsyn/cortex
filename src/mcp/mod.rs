@@ -29,6 +29,7 @@ const UNCACHEABLE: &[&str] = &[
     "get_session_health",
     "flush_knowledge_markers",
     "closeout_session",
+    "propose_skill",
 ];
 
 pub fn serve(
@@ -507,6 +508,22 @@ fn tools_list() -> Value {
                     },
                     "required": ["outcome_type"]
                 }
+            },
+            {
+                "name": "propose_skill",
+                "description": "Propose a new skill file based on a workflow you've been executing. \
+                                Use when you notice you're following the same multi-step procedure \
+                                across multiple requests. Writes a draft to .cortex/proposals/ for review.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name":      { "type": "string", "description": "Short kebab-case skill name." },
+                        "trigger":   { "type": "string", "description": "Conditions that should invoke this skill." },
+                        "procedure": { "type": "string", "description": "Ordered steps the skill performs." },
+                        "tools":     { "type": "string", "description": "Comma-separated tool names used." }
+                    },
+                    "required": ["name", "procedure"]
+                }
             }
         ]
     })
@@ -530,7 +547,7 @@ mod tests {
 
         for name in ["get_usage_examples", "get_helper", "explain_dependency_path",
                      "begin_protocol_session", "get_session_health",
-                     "flush_knowledge_markers", "closeout_session"] {
+                     "flush_knowledge_markers", "closeout_session", "propose_skill"] {
             assert!(find_tool(tools, name).is_some(), "missing tool in tools/list: {name}");
         }
     }

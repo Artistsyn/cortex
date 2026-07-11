@@ -3,12 +3,14 @@ mod cache;
 mod closeout;
 mod compressor;
 mod consolidator;
+mod consolidator2;
 mod crystallizer;
 mod git;
 mod graph;
 mod markers;
 mod memory;
 mod mcp;
+mod miner;
 mod model;
 mod planner;
 mod prefs;
@@ -16,6 +18,7 @@ mod protocol;
 mod reasoner;
 mod search;
 mod session_store;
+mod skills;
 mod watcher;
 
 use std::collections::{HashSet, VecDeque};
@@ -167,8 +170,76 @@ enum Command {
     /// Apply weighted pattern confidence updates from retrieval + outcome evidence.
     OutcomeApply(OutcomeApplyArgs),
 
-    /// Run lightweight benchmark harnesses for syntax lookup and dependency precision.
+    /// Run lightweight benchmark harnesses for syntax lookup and dependency persistence.
     Benchmark(BenchmarkArgs),
+
+    // ── Phase 1: Session mining + consolidation pipeline ──────────────────────
+
+    /// Cluster session snapshots from .cortex/mined-tasks/ by TF-IDF tool-sequence similarity.
+    ClusterSessions {
+        /// Cosine similarity threshold for clustering (default: 0.55).
+        #[arg(long, default_value_t = 0.55)]
+        threshold: f32,
+        /// Output file for cluster JSON (default: .cortex/clusters.json).
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Detect skill candidates from session clusters and stage drafts in .cortex/proposals/.
+    DetectSkills {
+        /// Minimum sessions in a cluster before a skill candidate is drafted.
+        #[arg(long, default_value_t = 3)]
+        min_occurrences: u32,
+    },
+
+    /// Surface hot query gaps (seen >= N times) as prefs.toml note proposals.
+    ProposeGaps {
+        /// Minimum seen_count before a gap becomes a proposal (default: 3).
+        #[arg(long, default_value_t = 3)]
+        min_count: i64,
+    },
+
+    /// Flag patterns with survival_rate < 0.4 and use_count >= 3 for review.
+    ProposeSurvival,
+
+    /// Run the full 6-stage consolidation pipeline.
+    /// Equivalent to: cluster-sessions → detect-skills → propose-gaps → propose-survival.
+    ConsolidatePipeline,
+
+    /// Run consolidation only if last run was more than N hours ago (for runOn:folderOpen).
+    ConsolidateIfStale {
+        /// Staleness threshold in hours (default: 8).
+        #[arg(long, default_value_t = 8)]
+        staleness_hours: u32,
+    },
+
+    /// Interactively review pending cross-session proposals (approve / reject / defer).
+    ReviewProposals {
+        /// Filter by proposal type (e.g. skill, pref_note, dying_pattern).
+        #[arg(long)]
+        kind: Option<String>,
+    },
+
+    /// List skill candidates detected from session patterns.
+    SkillStatus,
+
+    /// Approve a skill candidate draft (mark as approved in DB).
+    SkillApprove {
+        /// Skill name (as shown by skill-status).
+        name: String,
+    },
+
+    /// Reject a skill candidate draft.
+    SkillReject {
+        /// Skill name.
+        name: String,
+    },
+
+    /// Find sessions without a closeout record.
+    SessionOrphans,
+
+    /// Print a one-line system health report.
+    HealthReport,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -525,6 +596,26 @@ fn main() -> Result<()> {
         Command::Outcome(args) => run_outcome(args, &db_path, format),
         Command::OutcomeApply(args) => run_outcome_apply(args, &db_path, format),
         Command::Benchmark(args) => run_benchmark(args, &db_path, format),
+
+        // ── Phase 1 commands ──────────────────────────────────────────────────
+        Command::ClusterSessions { threshold, output } => {
+            run_cluster_sessions(threshold, output.as_deref(), &db_path)
+        }
+        Command::DetectSkills { min_occurrences } => {
+            run_detect_skills(min_occurrences, &db_path)
+        }
+        Command::ProposeGaps { min_count } => run_propose_gaps(min_count, &db_path),
+        Command::ProposeSurvival                => run_propose_survival(&db_path),
+        Command::ConsolidatePipeline            => run_consolidate_pipeline(&db_path),
+        Command::ConsolidateIfStale { staleness_hours } => {
+            run_consolidate_if_stale(staleness_hours, &db_path)
+        }
+        Command::ReviewProposals { kind }       => run_review_proposals(kind.as_deref(), &db_path),
+        Command::SkillStatus                    => run_skill_status(&db_path),
+        Command::SkillApprove { name }          => run_skill_approve(&name, &db_path),
+        Command::SkillReject { name }           => run_skill_reject(&name, &db_path),
+        Command::SessionOrphans                 => run_session_orphans(&db_path),
+        Command::HealthReport                   => run_health_report(&db_path),
     }
 }
 
@@ -3338,4 +3429,226 @@ mod tests {
 
         let _ = std::fs::remove_file(&db_path);
     }
+}
+
+// ── Phase 1: CLI handler functions ────────────────────────────────────────────
+
+fn run_cluster_sessions(threshold: f32, output: Option<&Path>, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
+    let mined_tasks_dir = repo_root.join(".cortex").join("mined-tasks");
+
+    let snapshots = miner::load_snapshots(&mined_tasks_dir)?;
+    if snapshots.is_empty() {
+        println!("[cortex] No session snapshots found in {}.", mined_tasks_dir.display());
+        println!("         Run closeout_session (or cortex.ps1 post-session) to generate snapshots.");
+        return Ok(());
+    }
+
+    let clusters = miner::cluster_snapshots(&snapshots, threshold);
+    let report   = miner::format_cluster_report(&clusters);
+    println!("{report}");
+
+    let out_path = output
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| repo_root.join(".cortex").join("clusters.json"));
+    std::fs::write(&out_path, miner::clusters_to_json(&clusters))?;
+    println!("[cortex] Cluster JSON written to {}", out_path.display());
+
+    let _ = store; // keep borrow alive
+    Ok(())
+}
+
+fn run_detect_skills(min_occurrences: u32, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
+
+    // Load clusters from existing clusters.json if present, otherwise re-cluster.
+    let clusters_path = repo_root.join(".cortex").join("clusters.json");
+    let clusters: Vec<miner::SessionCluster> = if clusters_path.exists() {
+        let raw = std::fs::read_to_string(&clusters_path)?;
+        serde_json::from_str(&raw).unwrap_or_default()
+    } else {
+        let mined_tasks_dir = repo_root.join(".cortex").join("mined-tasks");
+        let snapshots = miner::load_snapshots(&mined_tasks_dir)?;
+        miner::cluster_snapshots(&snapshots, 0.55)
+    };
+
+    let prefs = load_prefs_from_repo(repo_root);
+    let skills_dir = &prefs.skills.skills_dir;
+    let proposals_dir = repo_root.join(".cortex").join("proposals");
+
+    let candidates = skills::detect_skill_candidates(&store, &clusters, min_occurrences)?;
+
+    if candidates.is_empty() {
+        println!("[cortex] No skill candidates with >= {} occurrences found.", min_occurrences);
+        return Ok(());
+    }
+
+    println!("[cortex] {} skill candidate(s) detected:", candidates.len());
+    for c in &candidates {
+        match skills::draft_skill_file(
+            &c.name, &c.tool_sequence, c.occurrence_count, c.confidence,
+            &proposals_dir, skills_dir,
+        ) {
+            Ok(path) => {
+                let _ = skills::set_skill_draft_path(&store, &c.name, &path);
+                println!("  [drafted] {} → {}", c.name, path);
+            }
+            Err(e) => println!("  [error]   {}: {e}", c.name),
+        }
+    }
+    Ok(())
+}
+
+fn run_propose_gaps(min_count: i64, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let proposals = skills::detect_gap_proposals(&store, min_count)?;
+    if proposals.is_empty() {
+        println!("[cortex] No hot query gaps with >= {min_count} occurrences.");
+        return Ok(());
+    }
+    println!("[cortex] {} gap proposal(s):", proposals.len());
+    for p in &proposals {
+        println!("  [{}x] {} (via {}) → {}", p.seen_count, p.query_text, p.tool_name, &p.proposed_note[..p.proposed_note.len().min(80)]);
+    }
+    Ok(())
+}
+
+fn run_propose_survival(db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
+    let proposals_dir = repo_root.join(".cortex").join("proposals");
+    std::fs::create_dir_all(&proposals_dir)?;
+    let count = consolidator2::propose_survival_pub(&store, &proposals_dir)?;
+    println!("[cortex] {} dying pattern proposal(s) written to {}", count, proposals_dir.display());
+    Ok(())
+}
+
+fn run_consolidate_pipeline(db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let repo_root = db_path.parent().and_then(|p| p.parent()).unwrap_or(Path::new("."));
+    let prefs = load_prefs_from_repo(repo_root);
+    let result = consolidator2::run(&store, repo_root, &prefs)?;
+    println!("[cortex] {}", result.summary());
+    Ok(())
+}
+
+fn run_consolidate_if_stale(staleness_hours: u32, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    if !consolidator2::is_stale(&store, staleness_hours) {
+        println!("[cortex] consolidation is fresh (last run < {staleness_hours}h ago). Skipping.");
+        return Ok(());
+    }
+    drop(store);
+    run_consolidate_pipeline(db_path)
+}
+
+fn run_review_proposals(kind: Option<&str>, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let mut proposals = consolidator2::load_pending_proposals(&store)?;
+    if let Some(k) = kind {
+        proposals.retain(|p| p.proposal_type.contains(k));
+    }
+    if proposals.is_empty() {
+        println!("[cortex] No pending proposals{}.",
+            kind.map(|k| format!(" of type '{k}'")).unwrap_or_default());
+        return Ok(());
+    }
+    println!("{}", consolidator2::format_pending_proposals(&proposals));
+    println!("To approve: cortex.exe --db <db> proposal-approve <id>");
+    println!("To reject:  cortex.exe --db <db> proposal-reject <id>");
+    Ok(())
+}
+
+fn run_skill_status(db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let candidates = skills::list_skill_candidates(&store)?;
+    print!("{}", skills::format_skill_status(&candidates));
+    Ok(())
+}
+
+fn run_skill_approve(name: &str, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let changed = skills::set_skill_status(&store, name, "approved")?;
+    if changed > 0 {
+        println!("[cortex] Skill '{name}' marked as approved.");
+    } else {
+        println!("[cortex] No skill candidate named '{name}' found.");
+    }
+    Ok(())
+}
+
+fn run_skill_reject(name: &str, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let changed = skills::set_skill_status(&store, name, "rejected")?;
+    if changed > 0 {
+        println!("[cortex] Skill '{name}' rejected.");
+    } else {
+        println!("[cortex] No skill candidate named '{name}' found.");
+    }
+    Ok(())
+}
+
+fn run_session_orphans(db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let grace = chrono::Utc::now().timestamp() - 7200; // 2h grace period
+    let mut stmt = store.conn().prepare(
+        "SELECT session_key, started_at FROM protocol_sessions
+         WHERE closeout_run = 0 AND started_at < ?1
+         ORDER BY started_at DESC"
+    )?;
+    let rows = stmt.query_map(rusqlite::params![grace], |r| {
+        Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?))
+    })?;
+    let orphans: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+    if orphans.is_empty() {
+        println!("[cortex] No orphaned sessions (all sessions closed within grace period).");
+    } else {
+        println!("[cortex] {} orphaned session(s) without closeout:", orphans.len());
+        for (key, ts) in &orphans {
+            let age = (chrono::Utc::now().timestamp() - ts) / 3600;
+            println!("  {} ({} hours ago)", key, age);
+        }
+    }
+    Ok(())
+}
+
+fn run_health_report(db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+
+    let patterns: i64 = store.conn().query_row("SELECT COUNT(*) FROM patterns", [], |r| r.get(0)).unwrap_or(0);
+    let low_survival: i64 = store.conn().query_row("SELECT COUNT(*) FROM patterns WHERE survival_rate < 0.4", [], |r| r.get(0)).unwrap_or(0);
+    let anti_patterns: i64 = store.conn().query_row("SELECT COUNT(*) FROM anti_patterns", [], |r| r.get(0)).unwrap_or(0);
+    let pending_obs: i64 = store.conn().query_row("SELECT COUNT(*) FROM pending_observations", [], |r| r.get(0)).unwrap_or(0);
+    let pending_proposals: i64 = store.conn().query_row("SELECT COUNT(*) FROM proposals WHERE status='pending'", [], |r| r.get(0)).unwrap_or(0);
+    let orphans: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM protocol_sessions WHERE closeout_run=0 AND started_at < (unixepoch()-7200)",
+        [], |r| r.get(0)
+    ).unwrap_or(0);
+    let gaps: i64 = store.conn().query_row(
+        "SELECT COUNT(*) FROM query_gap_log WHERE seen_count >= 3 AND last_seen_at >= (unixepoch()-604800)",
+        [], |r| r.get(0)
+    ).unwrap_or(0);
+
+    println!("=== CORTEX HEALTH REPORT ===");
+    println!("  patterns:          {} ({} below 40% survival)", patterns, low_survival);
+    println!("  anti-patterns:     {}", anti_patterns);
+    println!("  pending review:    {}", pending_obs);
+    println!("  pending proposals: {}", pending_proposals);
+    println!("  orphaned sessions: {}", orphans);
+    println!("  hot gaps (7d):     {}", gaps);
+
+    if low_survival > 0 { println!("  ! {} low-survival patterns — run: cortex.ps1 quality-check", low_survival); }
+    if orphans > 0       { println!("  ! {} orphaned sessions — run: cortex session-orphans", orphans); }
+    if pending_proposals > 0 { println!("  ! {} proposals pending — run: cortex.ps1 review-proposals", pending_proposals); }
+    if gaps > 0          { println!("  ! {} hot query gaps — run: cortex.ps1 propose-gaps", gaps); }
+    println!("===========================");
+    Ok(())
+}
+
+// Helper: load prefs from repo root (best-effort — returns defaults on failure).
+fn load_prefs_from_repo(repo_root: &Path) -> prefs::Preferences {
+    let path = repo_root.join(".cortex").join("prefs.toml");
+    prefs::load(&path).unwrap_or_default()
 }

@@ -46,6 +46,8 @@ pub fn dispatch(
         // Phase 0C/0D: knowledge capture tools.
         "flush_knowledge_markers" => tool_flush_knowledge_markers(store, session_id, repo_root),
         "closeout_session"        => tool_closeout_session(args, store, session_id, repo_root),
+        // Phase 1: skill proposal tool.
+        "propose_skill"           => tool_propose_skill(args, store, session_id, repo_root),
         other                  => Err(format!("unknown tool: {other}")),
     }?;
 
@@ -1406,6 +1408,51 @@ fn tool_closeout_session(
     }
 
     Ok(out)
+}
+
+// ── Phase 1: propose_skill ────────────────────────────────────────────────────
+
+/// propose_skill — agent-initiated skill proposal.
+fn tool_propose_skill(
+    args: &Value,
+    store: &Store,
+    _session_id: &str,
+    repo_root: &Path,
+) -> Result<String, String> {
+    let name      = args["name"].as_str().ok_or("missing `name`")?;
+    let trigger   = args.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
+    let procedure = args["procedure"].as_str().ok_or("missing `procedure`")?;
+    let tools_str = args.get("tools").and_then(|v| v.as_str()).unwrap_or("");
+
+    let tool_sequence: Vec<String> = if tools_str.is_empty() {
+        vec![]
+    } else {
+        tools_str.split(',').map(|s| s.trim().to_string()).collect()
+    };
+
+    let proposals_dir = repo_root.join(".cortex").join("proposals");
+    let prefs_path    = repo_root.join(".cortex").join("prefs.toml");
+    let skills_dir    = crate::prefs::load(&prefs_path)
+        .map(|p| p.skills.skills_dir)
+        .unwrap_or_else(|_| "agent_customization/skills".to_string());
+
+    let confidence = 0.8f32; // agent-proposed; assume high until evidence says otherwise
+
+    match crate::skills::draft_skill_file(
+        name, &tool_sequence, 1, confidence, &proposals_dir, &skills_dir,
+    ) {
+        Ok(path) => {
+            let _ = crate::skills::set_skill_draft_path(store, name, &path);
+            Ok(format!(
+                "Skill draft written: {path}\n\
+                 Name: {name}\n\
+                 Trigger: {trigger}\n\
+                 To publish: cortex.ps1 skill-approve {name}\n\
+                 The draft is in .cortex/proposals/ — review and edit before approving."
+            ))
+        }
+        Err(e) => Err(format!("failed to draft skill '{name}': {e}")),
+    }
 }
 
 #[cfg(test)]

@@ -1,8 +1,307 @@
 # cortex
 
-Persistent semantic memory layer for Copilot. Compresses your codebase into dense
-representations, accumulates knowledge across sessions, and serves it as a live MCP
-skill - so Copilot spends fewer tokens, asks smarter questions, and remembers what works.
+Persistent semantic memory and self-learning layer for Copilot. Compresses your codebase
+into dense representations, accumulates knowledge across sessions, runs an 8-stage
+consolidation pipeline to surface patterns and proposals, and serves it all as a live MCP
+skill — so Copilot spends fewer tokens, asks smarter questions, and gets smarter over time.
+
+## Architecture
+
+```
+your source ──► compressor ──► SQLite index (.cortex/memory.db)
+                                        │
+             patterns, anti-patterns ───┤
+             annotations, call log  ───┤
+             session snapshots      ───┤
+             proposals table        ───┤
+                                        │
+                                   MCP server (22 tools)
+                                        │
+                                   Copilot Chat
+
+Self-learning pipeline (runs on staleness or 5+ new sessions):
+  1. health-check → 2. cluster-sessions → 3. detect-skills
+  → 4. propose-gaps → 5. propose-survival → 6. fidelity-scoring
+  → 7. graph-drift → 8. meta-analysis
+  → proposals table → human review → meta apply
+```
+
+Nothing gets written to memory without your explicit approval.
+Meta-proposals can only target `prefs.toml` and `copilot-instructions.md` — never source code.
+
+---
+
+## Setup
+
+```sh
+cargo build --release
+
+# 0. First-time workspace bootstrap
+cortex bootstrap --repo . --source src --name MyProject
+#   Creates: .cortex/cortex.ps1, .cortex/prefs.toml, .vscode/mcp.json
+
+# Validate
+.\.cortex\cortex.ps1 mcp-ready -SelfCheckFormat json
+.\.cortex\cortex.ps1 smoke -SelfCheckFormat json
+
+# 1. Index your source
+cortex index --source src --name MyProject
+
+# 2. Start the MCP server (VS Code picks it up from .vscode/mcp.json)
+cortex serve --source src --name MyProject
+```
+
+### MCP Readiness (required before PROTOCOL sessions)
+
+```powershell
+.\.cortex\cortex.ps1 mcp-ready -SelfCheckFormat json
+```
+
+Required MCP baseline tools: `get_delta`, `get_preferences`, `get_anti_patterns`,
+`list_patterns`, `get_context`. If any fail, run:
+
+```powershell
+.\.cortex\cortex.ps1 doctor --format json
+.\.cortex\cortex.ps1 serve
+# Reload VS Code window, then re-probe
+```
+
+---
+
+## MCP Tools (22 total)
+
+| Tool | Purpose |
+|------|---------|
+| `semantic_search` | Find anything related to a concept |
+| `get_item` | Full details of a type/function |
+| `get_context` | Pre-compiled context packet for a task |
+| `get_delta` | Changes since last checkpoint |
+| `get_preferences` | Style rules and API notes |
+| `get_anti_patterns` | All known bug traps |
+| `list_patterns` | Approved implementation patterns |
+| `recall` | Semantic search across all memory |
+| `suggest_pattern` | Queue a pattern for review |
+| `query_graph` | Cross-crate dependency queries |
+| `simulate_change` | Preview impact of a code change |
+| `recurrent_think` | 4-dimensional iterative hypothesis refinement |
+| `begin_protocol_session` | Activate PROTOCOL mode + Phase 0 gating |
+| `get_session_health` | One-call health: Phase 0 status, gaps, proposals |
+| `flush_knowledge_markers` | Extract CORTEX-* tags from session turns |
+| `closeout_session` | Complete session closeout (Tier 1/2 commit model) |
+| `propose_skill` | Stage a skill candidate for review |
+| `get_syntax` / `get_usage_examples` / `get_helper` / `list_all` / `explain_dependency_path` | Code lookup |
+
+Delta controls: `include`, `exclude`, `max_files`, `max_patch_lines`
+
+---
+
+## CLI Commands
+
+### Core
+
+```sh
+cortex index --source src            # Index / re-index source
+cortex serve --source src            # Start MCP server
+cortex watch --source src            # Watch for changes (never auto-approves)
+cortex review                        # List pending observations
+cortex crystallize <id> --name ...   # Promote observation to pattern
+cortex dismiss <id>                  # Discard observation
+cortex status                        # DB stats
+cortex --format json status --full   # Machine-readable full status
+```
+
+### Knowledge Management
+
+```sh
+cortex pattern list / add / remove
+cortex anti-pattern list / add / remove
+cortex annotate list / add / remove
+cortex recall <topic>
+cortex adr new --title "..." --context "..." --decision "..."
+cortex correction --attempted "..." --reason "..." --fix "..."
+```
+
+### Self-Learning Pipeline
+
+```sh
+# Run full pipeline (health-check → cluster → skills → gaps → survival → fidelity → drift → meta)
+.\.cortex\cortex.ps1 consolidate-pipeline
+
+# Run only if > N hours stale (default 8) OR >= 5 new sessions
+.\.cortex\cortex.ps1 consolidate-if-stale [-StalenessHours N]
+
+# Individual stages
+.\.cortex\cortex.ps1 cluster-sessions    # Cluster session snapshots by tool-sequence similarity
+.\.cortex\cortex.ps1 detect-skills       # Draft SKILL.md files for repeated tool patterns
+.\.cortex\cortex.ps1 propose-gaps        # Propose prefs notes for hot query gaps
+.\.cortex\cortex.ps1 propose-survival    # Flag dying patterns for review
+
+# Review and approval
+.\.cortex\cortex.ps1 review-proposals    # Show pending proposals
+.\.cortex\cortex.ps1 skill-status        # List skill candidates with confidence scores
+.\.cortex\cortex.ps1 skill-approve <n>
+.\.cortex\cortex.ps1 skill-reject <n>
+```
+
+### Meta-Analysis (Stage 8)
+
+```sh
+# Show full analysis: rejection rates, fidelity trends, gap evolution, threshold alerts
+.\.cortex\cortex.ps1 meta report
+
+# Stage meta-proposals based on analysis
+.\.cortex\cortex.ps1 meta propose
+
+# Apply an approved meta-proposal to its target file (prefs.toml or copilot-instructions.md)
+.\.cortex\cortex.ps1 meta apply <id>
+.\.cortex\cortex.ps1 meta dry-run <id>   # Preview without writing
+```
+
+### Diagnostics
+
+```sh
+.\.cortex\cortex.ps1 health-report      # System health: patterns, gaps, proposals, orphans
+.\.cortex\cortex.ps1 graph-diff         # Graph drift: community changes since last snapshot
+.\.cortex\cortex.ps1 session-orphans    # Sessions without a closeout record
+.\.cortex\cortex.ps1 doctor --format json
+```
+
+---
+
+## Self-Learning Pipeline Details
+
+### Stage 1: Health check
+Writes `.cortex/health-report.json` with pattern survival, pending proposals, orphaned sessions.
+
+### Stage 2: Cluster sessions
+TF-IDF cosine similarity over tool sequences. Threshold: 0.55. Results: `.cortex/clusters.json`.
+
+### Stage 3: Detect skills
+Clusters with ≥ `skill_candidate_min_occurrences` (default 3) become SKILL.md drafts.
+
+### Stage 4: Gap proposals
+`query_gap_log` entries with ≥ 3 misses → trial-gated prefs notes.
+Seen count ≥ 5: staged immediately. < 5: 7-day trial period.
+
+### Stage 5: Survival proposals
+Patterns with `use_count ≥ 3` and `survival_rate < 40%` flagged for review/anti-pattern conversion.
+Verification gate: dedup by content hash, survival trend check.
+
+### Stage 6: Fidelity scoring
+Each session snapshot scored against ideal PROTOCOL sequence (closeout=0.25, begin=0.15, others=0.10).
+
+### Stage 7: Graph drift
+Compares current `graph.json` against latest snapshot. Communities with drift ≥ 0.3 flagged.
+High-drift (≥ 0.5): 3× priority boost. Report at `.cortex/drift-report.json`.
+
+### Stage 8: Meta-analysis
+Four analyzers:
+- **Rejection rates**: gate-only counting from `rejected-proposals.jsonl`
+- **Fidelity trends**: average score, low-fidelity sessions, most missed step
+- **Gap evolution**: persistent gaps with no approved/pending proposal
+- **Threshold impact**: per-type approval rates, alerts for types < 20% approved
+
+Meta-proposals target only `prefs.toml` and `copilot-instructions.md`, never source code.
+Apply via `cortex meta apply <id>` after review.
+
+---
+
+## Verification Gates
+
+All proposals pass 5 gates before entering the proposals table:
+
+1. **Duplicate detection** — content hash must be unique
+2. **Rust snippet syntax** — `syn` parse check on any Rust in proposed text
+3. **Credibility filter** — skill/pref proposals need sufficient session evidence
+4. **Gap trial period** — gap proposals with < 5 misses enter 7-day trial
+5. **Survival trend** — dying-pattern proposals require confirmed downward trend
+
+Rejected proposals logged to `.cortex/rejected-proposals.jsonl` (auto-rotated at 100KB).
+
+---
+
+## Session Closeout (KNOWLEDGE COMMITTED)
+
+```markdown
+[CORTEX-PATTERN: name="..." intent="..." trust="verified" uses="..."]body[/CORTEX-PATTERN]
+[CORTEX-AP: description="..." tags="..."]wrong: ...\ncorrect: ...[/CORTEX-AP]
+[CORTEX-CORRECTION: attempted="..." reason="..." fix="..."][/CORTEX-CORRECTION]
+[CORTEX-ADR: title="..." tags="..."]Context: ... Decision: ...[/CORTEX-ADR]
+[CORTEX-PREFS-NOTE: tags="..."]note text[/CORTEX-PREFS-NOTE]
+[CORTEX-SKILL-CANDIDATE: name="..." trigger="..."]summary[/CORTEX-SKILL-CANDIDATE]
+```
+
+When the user types **KNOWLEDGE COMMITTED**:
+```rust
+closeout_session(outcome_type: "build_pass", inline_approve: true)
+```
+All markers are committed immediately (Tier 1). Without it, markers are staged for later review (Tier 2).
+
+`flush_knowledge_markers` fallback: if VS Code session store is unavailable, the tool
+scans recent `mcp_calls` args for embedded markers. "0 markers committed" is normal when
+the store is inaccessible — not a failure.
+
+---
+
+## prefs.toml
+
+```toml
+[style]
+line_length = 100
+indent = "4 spaces"
+naming = "snake_case functions and variables, PascalCase types and enums"
+
+[project]
+name = "YourProject"
+language = "Rust"
+notes = [
+    "MANDATORY PRE-CODE CHECK: before writing any factory/tick/spawn/physics function call get_anti_patterns + get_preferences + list_patterns",
+    "MANDATORY MID-TASK CORTEX USAGE: after first approach fails call recall <error_keyword> before retrying",
+    "session-end: after any coding session, type KNOWLEDGE COMMITTED to trigger closeout",
+]
+
+[enforcement]
+protocol_gate_mode = "protocol_session_only"  # or "always"
+closeout_warning_enabled = true
+closeout_grace_period_hours = 2
+
+[consolidation]
+staleness_hours = 8
+max_commits_per_run = 5
+min_cluster_sessions = 3
+skill_candidate_min_occurrences = 3
+graph_snapshot_days = 30
+
+[skills]
+skills_dir = "agent_customization/skills"
+auto_update_skills = true
+
+[memory]
+max_mirror_files = 200
+mirror_consolidation_threshold = 0.75
+```
+
+---
+
+## Windows / PowerShell notes
+
+- All `--description`, `--body`, `--reason`, `--wrong`, `--correct` values must be **single-line**
+- Use `;` not `&&` for command chaining (PowerShell 5.1)
+- Use ASCII hyphen `-` not em-dash `—` in argument values
+- Use single-quoted `'strings'` for static values
+- After any cortex command, check `$LASTEXITCODE` — silent failure is possible
+- Save `.ps1` files as UTF-8 with BOM to avoid Windows-1252 encoding bugs
+
+---
+
+## Token efficiency
+
+Cortex compresses a 400-line Rust struct to ~8 lines of dense semantic signal.
+`get_context` pre-selects only what's relevant, capped at your token budget.
+The call log reveals what Copilot reaches for most — informing what to pre-inject.
+Over time the pipeline proposes improvements to its own configuration, closing
+the loop between session outcomes and future behavior.
+
 
 ## How it works
 

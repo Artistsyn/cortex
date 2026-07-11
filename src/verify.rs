@@ -279,7 +279,8 @@ fn gate_survival_trend(store: &Store, pattern_id: i64) -> Result<bool> {
 // ── Rejection log ─────────────────────────────────────────────────────────────
 
 /// Append a rejected proposal to `.cortex/rejected-proposals.jsonl`.
-/// Auto-rotates entries older than 90 days to keep the file bounded.
+/// Auto-rotates entries older than 90 days, but only rewrites the file
+/// if it has grown beyond 100KB to avoid rewriting on every rejection.
 pub fn log_rejection(
     rejected_log_path: &Path,
     proposal_type: &str,
@@ -288,8 +289,16 @@ pub fn log_rejection(
     reason: &str,
     signals: &GateSignals,
 ) {
-    // Rotate: remove entries older than 90 days.
-    rotate_rejection_log(rejected_log_path, 90);
+    // Only rotate if the file is large enough to be worth rewriting.
+    const ROTATION_SIZE_THRESHOLD: u64 = 100 * 1024; // 100KB
+    if rejected_log_path.exists() {
+        let file_size = std::fs::metadata(rejected_log_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if file_size > ROTATION_SIZE_THRESHOLD {
+            rotate_rejection_log(rejected_log_path, 90);
+        }
+    }
 
     let entry = json!({
         "timestamp":     Utc::now().to_rfc3339(),

@@ -14,8 +14,8 @@ use rusqlite::{Connection, OpenFlags, params};
 // ── Path discovery ────────────────────────────────────────────────────────────
 
 /// Find the most recently modified VS Code Copilot session store DB.
-/// Limits scan to the first 50 workspace folders to avoid long pauses
-/// on machines with many workspaces.
+/// Limits scan to the 50 most recently modified workspace folders to avoid
+/// long pauses on machines with many workspaces.
 pub fn find_session_store() -> Option<PathBuf> {
     let appdata = std::env::var("APPDATA").ok()?;
     let ws = PathBuf::from(appdata)
@@ -27,22 +27,30 @@ pub fn find_session_store() -> Option<PathBuf> {
         return None;
     }
 
-    let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-    let mut scanned = 0usize;
-
+    // Collect ALL candidates first (only stat the parent dirs, not the DBs yet).
+    let mut folder_mtimes: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&ws) {
         for entry in entries.flatten() {
-            if scanned >= 50 { break; } // safety limit
-            scanned += 1;
-            let db = entry.path()
-                .join("GitHub.copilot-chat")
-                .join("chat-session-resources")
-                .join("state.db");
-            if db.exists() {
-                if let Ok(meta) = std::fs::metadata(&db) {
-                    if let Ok(mtime) = meta.modified() {
-                        candidates.push((db, mtime));
-                    }
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    folder_mtimes.push((entry.path(), mtime));
+                }
+            }
+        }
+    }
+    // Sort by mtime descending so newest workspaces are checked first.
+    folder_mtimes.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    for (folder, _) in folder_mtimes.into_iter().take(50) {
+        let db = folder
+            .join("GitHub.copilot-chat")
+            .join("chat-session-resources")
+            .join("state.db");
+        if db.exists() {
+            if let Ok(meta) = std::fs::metadata(&db) {
+                if let Ok(mtime) = meta.modified() {
+                    candidates.push((db, mtime));
                 }
             }
         }

@@ -51,11 +51,13 @@ fn make_session_key(unix_minute: i64, repo_root: Option<&str>) -> String {
     let mut s = String::new();
     write!(s, "session_{:016x}", unix_minute).unwrap();
     if let Some(root) = repo_root {
-        // Append a short hash of the repo root to disambiguate projects
-        // within the same 2-hour window.
+        // FNV-1a 64-bit hash of the repo root path — full 64-bit space, not truncated.
+        // Collisions still possible for different repos, but astronomically unlikely.
         let root_hash = root.as_bytes().iter()
-            .fold(0u64, |h, &b| h.wrapping_mul(31).wrapping_add(b as u64));
-        write!(s, "_{:x}", root_hash % 0xFFFF).unwrap();
+            .fold(14695981039346656037u64, |h, &b| {
+                h.wrapping_mul(1099511628211u64) ^ b as u64
+            });
+        write!(s, "_{:016x}", root_hash).unwrap();
     }
     s
 }

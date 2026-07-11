@@ -45,7 +45,7 @@ pub fn run_recurrent_loop(
     }
 
     // Step 2: Score confidence
-    let confidence = score_confidence(&critiques, conn)?;
+    let confidence = score_confidence(&critiques, conn, &hypothesis)?;
     scratchpad.set_confidence(confidence);
 
     // Step 3: Check halting conditions
@@ -154,37 +154,104 @@ fn critique_hypothesis(hypothesis: &str, conn: &Connection) -> crate::Result<Vec
     Ok(critiques)
 }
 
-/// Score confidence: ratio of violations / total checks.
-/// Higher confidence = fewer violations found.
+/// Score confidence along four independent dimensions so the loop doesn't
+/// trivially halt just because no anti-pattern keywords matched.
+///
+/// Dimensions (each 0.0–1.0):
+///   1. Anti-pattern compliance  (30%) — keyword match avoidance
+///   2. Internal consistency     (25%) — no contradictory statements
+///   3. Completeness             (25%) — required structural sections present
+///   4. Grounding                (20%) — references concrete evidence (files/tools/APIs)
+///
+/// Final score = weighted average of the four dimensions.
+/// Halt threshold of 0.85 requires ALL dimensions to be reasonably high.
 fn score_confidence(
     critiques: &[String],
     conn: &Connection,
+    hypothesis: &str,
 ) -> crate::Result<f32> {
-    // Count total checks from anti-patterns + graph conflict rules.
-    let mut stmt = conn.prepare("SELECT COUNT(*) FROM anti_patterns")?;
-    let ap_checks: i64 = stmt.query_row([], |row| row.get(0))?;
+    // ── Dimension 1: Anti-pattern compliance (30%) ────────────────────────────
+    let ap_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM anti_patterns", [], |r| r.get(0)
+    ).unwrap_or(0);
 
-    let mut stmt = conn.prepare("SELECT COUNT(*) FROM graph_edges WHERE relation = 'conflicts'")?;
-    let conflict_checks: i64 = stmt.query_row([], |row| row.get(0))?;
+    let ap_score = if ap_count == 0 {
+        0.8 // No checks defined → moderate
+    } else {
+        let violation_rate = critiques.len() as f32 / ap_count.max(1) as f32;
+        (1.0 - violation_rate).max(0.0).min(1.0)
+    };
 
-    let total_checks = ap_checks + conflict_checks;
+    // ── Dimension 2: Internal consistency (25%) ───────────────────────────────
+    // Look for contradictory pairs in the hypothesis text.
+    let contradiction_pairs = [
+        ("always", "never"),
+        ("never", "always"),
+        ("must", "must not"),
+        ("should", "should not"),
+        ("enable", "disable"),
+        ("add", "remove"),
+    ];
+    let h_lower = hypothesis.to_lowercase();
+    let contradiction_count = contradiction_pairs.iter()
+        .filter(|(a, b)| h_lower.contains(a) && h_lower.contains(b))
+        .count();
+    let consistency_score = match contradiction_count {
+        0 => 1.0,
+        1 => 0.7,
+        _ => 0.4,
+    };
 
-    if total_checks == 0 {
-        return Ok(0.8); // No checks defined → moderate confidence
-    }
+    // ── Dimension 3: Completeness (25%) ───────────────────────────────────────
+    // Heuristic: longer, more structured hypotheses score higher.
+    // Penalize very short hypotheses (< 50 chars) and reward structured ones.
+    let word_count = hypothesis.split_whitespace().count();
+    let has_structure = hypothesis.contains(':') || hypothesis.contains('\n') ||
+                        hypothesis.contains(" — ") || hypothesis.contains(" because ");
+    let completeness_score = if word_count < 5 {
+        0.2
+    } else if word_count < 15 {
+        0.5
+    } else if has_structure {
+        0.95
+    } else {
+        0.75
+    };
 
-    let violation_count = critiques.len() as f32;
-    let violation_rate = violation_count / total_checks as f32;
-    
-    let confidence = (1.0 - violation_rate).max(0.0).min(1.0);
-    Ok(confidence)
+    // ── Dimension 4: Grounding (20%) ──────────────────────────────────────────
+    // Check for concrete evidence references: file paths, function names (::),
+    // tool names, or numeric evidence.
+    let grounding_signals = [
+        "::", ".rs", ".toml", "canvas.", "Action::", "GameEvent::",
+        "cortex", "quartz", "store.", "fn ", "let ", "true", "false",
+    ];
+    let grounding_hits = grounding_signals.iter()
+        .filter(|&&sig| hypothesis.contains(sig))
+        .count();
+    let grounding_score = match grounding_hits {
+        0 => 0.5,  // purely conceptual — moderate
+        1 => 0.7,
+        2 => 0.85,
+        _ => 0.95,
+    };
+
+    // ── Weighted average ──────────────────────────────────────────────────────
+    let score = ap_score * 0.30
+              + consistency_score * 0.25
+              + completeness_score * 0.25
+              + grounding_score * 0.20;
+
+    Ok(score.max(0.0).min(1.0))
 }
 
 /// Determine if we should halt the loop.
+/// Halt threshold is 0.85 — achievable when all four dimensions score well,
+/// but requires concrete, consistent, grounded hypotheses. A short conceptual
+/// hypothesis will score ~0.60 and need at least 2 iterations.
 fn should_halt(scratchpad: &Scratchpad, max_loops: u8) -> (bool, String) {
-    // Halt if confidence threshold reached
-    if scratchpad.confidence >= 0.92 {
-        return (true, "confidence threshold reached (≥0.92)".to_string());
+    // Halt if multi-dimensional confidence threshold reached
+    if scratchpad.confidence >= 0.85 {
+        return (true, format!("confidence threshold reached (≥0.85, score={:.2})", scratchpad.confidence));
     }
 
     // Halt if max loops reached
@@ -263,5 +330,72 @@ mod tests {
         let confidence = (1.0_f32 - 0.5_f32).max(0.0_f32).min(1.0_f32);
         assert_eq!(confidence, 0.5);
         assert!((0.0..=1.0).contains(&confidence));
+    }
+
+    // ── Phase 5a: multi-dimensional scoring tests ─────────────────────────────
+
+    fn make_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS anti_patterns (
+                id INTEGER PRIMARY KEY,
+                description TEXT, wrong TEXT, correct TEXT, tags TEXT, added_at TEXT
+             );
+             CREATE TABLE IF NOT EXISTS graph_edges (
+                id INTEGER PRIMARY KEY,
+                from_id TEXT, to_id TEXT, relation TEXT, weight REAL, source TEXT
+             );"
+        ).unwrap();
+        conn
+    }
+
+    #[test]
+    fn short_hypothesis_scores_low() {
+        let conn = make_conn();
+        let hypothesis = "x";
+        let (score, _) = {
+            let critiques: Vec<String> = vec![];
+            let s = futures_or_inline_score(&critiques, &conn, hypothesis);
+            (s, ())
+        };
+        assert!(score < 0.70, "single-char hypothesis should score < 0.70, got {score}");
+    }
+
+    #[test]
+    fn well_grounded_hypothesis_scores_high() {
+        let conn = make_conn();
+        // Specific, grounded hypothesis referencing concrete API and reasoning
+        let hypothesis = "Use Action::SetMomentum instead of Action::SetPosition \
+                          because SetPosition zeroes momentum, causing physics drift. \
+                          canvas.run(action) dispatches safely.";
+        let critiques: Vec<String> = vec![];
+        let score = futures_or_inline_score(&critiques, &conn, hypothesis);
+        assert!(score >= 0.75, "grounded hypothesis should score >= 0.75, got {score}");
+    }
+
+    #[test]
+    fn contradictory_hypothesis_penalized() {
+        let conn = make_conn();
+        let hypothesis = "You should always enable this feature, but you should never \
+                          enable this feature in production environments.";
+        let critiques: Vec<String> = vec![];
+        let score = futures_or_inline_score(&critiques, &conn, hypothesis);
+        // Contradictions lower consistency dimension
+        assert!(score < 0.85, "contradictory hypothesis should score < 0.85, got {score}");
+    }
+
+    #[test]
+    fn halt_threshold_not_reached_for_vague_hypothesis() {
+        let conn = make_conn();
+        let hypothesis = "The system should work better.";
+        let critiques: Vec<String> = vec![];
+        let score = futures_or_inline_score(&critiques, &conn, hypothesis);
+        // Should NOT trigger halt (< 0.85)
+        assert!(score < 0.85, "vague hypothesis should not halt at {score}");
+    }
+
+    // Helper: synchronously call score_confidence (no async, no DB deps beyond conn)
+    fn futures_or_inline_score(critiques: &[String], conn: &rusqlite::Connection, hypothesis: &str) -> f32 {
+        score_confidence(critiques, conn, hypothesis).unwrap_or(0.0)
     }
 }

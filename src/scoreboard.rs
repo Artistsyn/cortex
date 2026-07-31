@@ -38,6 +38,9 @@ pub struct WindowStats {
     /// Lossless output-compaction telemetry (the accuracy/savings instrument).
     pub compact_calls:     i64,
     /// Mean filtered/original ratio — LOWER is better (more redundancy removed).
+    /// Calls whose output actually shrank. The remainder are correct no-ops.
+    pub compact_applicable: i64,
+    /// Mean ratio over `compact_applicable` calls only — see compute().
     pub avg_compression_ratio: f32,
     /// Estimated tokens saved this window: (original - filtered) chars / 4.
     pub est_tokens_saved:  i64,
@@ -101,9 +104,18 @@ fn window_stats(store: &Store, start: i64, end: i64) -> WindowStats {
     let real = |sql: &str| -> f64 {
         store.conn().query_row(sql, rusqlite::params![start, end], |r| r.get(0)).unwrap_or(0.0)
     };
+    // Ratio is averaged over calls that actually had something to drop. Averaging
+    // across every call instead buries the signal: the filter is lossless by
+    // construction, so it correctly no-ops on output with no noise (grep, sed,
+    // git), and those 1.0 ratios drag the mean to ~0.99 no matter how well it
+    // compresses the cargo/build output it is actually for. Applicability is
+    // reported separately because it measures the workload, not the filter.
     let avg_compression_ratio = real(
         "SELECT COALESCE(AVG(ratio), 0.0) FROM compression_savings
-         WHERE saved_at >= ?1 AND saved_at < ?2") as f32;
+         WHERE saved_at >= ?1 AND saved_at < ?2 AND filtered_chars < original_chars") as f32;
+    let compact_applicable = one(
+        "SELECT COUNT(*) FROM compression_savings
+         WHERE saved_at >= ?1 AND saved_at < ?2 AND filtered_chars < original_chars");
     let saved_chars = one(
         "SELECT COALESCE(SUM(original_chars - filtered_chars), 0) FROM compression_savings
          WHERE saved_at >= ?1 AND saved_at < ?2");
@@ -121,6 +133,7 @@ fn window_stats(store: &Store, start: i64, end: i64) -> WindowStats {
         pattern_retrievals,
         reuse_rate: pattern_retrievals as f32 / denom_sessions,
         compact_calls,
+        compact_applicable,
         avg_compression_ratio,
         est_tokens_saved: saved_chars / 4,
     }
@@ -197,8 +210,11 @@ pub fn format_text(sb: &Scoreboard) -> String {
         c.reuse_rate, p.reuse_rate, trend(c.reuse_rate, p.reuse_rate, true),
         c.pattern_retrievals));
     out.push_str(&format!(
-        "  Compaction:          {} calls, avg ratio {:.2} (prev {:.2}) {}   [~{} tokens saved, lossless]\n",
-        c.compact_calls, c.avg_compression_ratio, p.avg_compression_ratio,
+        "  Compaction:          {}/{} calls compressible ({}%), avg ratio {:.2} on those \
+         (prev {:.2}) {}   [~{} tokens saved, lossless]\n",
+        c.compact_applicable, c.compact_calls,
+        if c.compact_calls > 0 { 100 * c.compact_applicable / c.compact_calls } else { 0 },
+        c.avg_compression_ratio, p.avg_compression_ratio,
         trend(c.avg_compression_ratio, p.avg_compression_ratio, false), c.est_tokens_saved));
     out.push_str(&format!(
         "\n  Knowledge store: {} patterns ({} with usage signal — {:.0}% telemetry coverage), {} anti-patterns\n",

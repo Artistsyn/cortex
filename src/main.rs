@@ -2268,7 +2268,9 @@ fn run_context(args: ContextArgs, db_path: &Path) -> Result<()> {
     let prefs = prefs::load(&prefs_path).unwrap_or_default();
     let prefs_summary = prefs::render_for_copilot(&prefs);
     if !prefs_summary.trim().is_empty() {
-        output.push_str(&prefs_summary);
+        // Same tiering the MCP get_context path uses — notes are the bulk of the
+        // blob, so expand only the ones this hint touches. Every note stays listed.
+        output.push_str(&prefs::tier_notes(&prefs_summary, Some(&args.hint), false));
         output.push('\n');
     }
 

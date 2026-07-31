@@ -258,3 +258,195 @@ pub fn render_for_copilot(prefs: &Preferences) -> String {
 
     out
 }
+
+/// Maximum notes expanded to full text for a single hint. Bounds the worst case
+/// when a hint is broad enough to match nearly everything.
+const MAX_EXPANDED_NOTES: usize = 15;
+
+/// Characters of a collapsed note kept as its index entry.
+const NOTE_INDEX_CHARS: usize = 90;
+
+/// Tier the rendered preferences blob so only hint-relevant notes arrive in full.
+///
+/// `project.notes` is by far the largest payload in the preferences string — on
+/// FlowMake it is ~5k tokens of the ~5.4k total — and the mandated boot sequence
+/// pays for it twice, once via `get_preferences` and again inside `get_context`.
+///
+/// This applies the same contract `get_anti_patterns` already uses: **every note
+/// is still listed**, hint-matching ones in full and the rest collapsed to their
+/// opening clause, with a footer saying how to get the remainder. Nothing is ever
+/// hidden, so the reduction stays lossless by construction.
+///
+/// `full` returns the input untouched, which is the pre-tiering behaviour.
+pub fn tier_notes(rendered: &str, hint: Option<&str>, full: bool) -> String {
+    if full {
+        return rendered.to_string();
+    }
+    // `notes:` is emitted last by render_for_copilot, and individual notes may
+    // themselves contain newlines, so the blob runs from the marker to the end.
+    let Some(marker) = rendered.find("\nnotes: ") else {
+        return rendered.to_string();
+    };
+    let head = &rendered[..marker + 1];
+    let blob = rendered[marker + "\nnotes: ".len()..].trim_end();
+    let notes: Vec<&str> = blob.split(" | ").map(str::trim).filter(|n| !n.is_empty()).collect();
+    if notes.len() < 2 {
+        return rendered.to_string();
+    }
+
+    let terms = hint_terms(hint);
+    let mut scored: Vec<(usize, usize)> = notes
+        .iter()
+        .enumerate()
+        .map(|(i, note)| (i, score_note(note, &terms)))
+        .filter(|(_, s)| *s > 0)
+        .collect();
+    // Strongest match first, then original order, so the cap keeps the best ones.
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let expanded: std::collections::HashSet<usize> =
+        scored.iter().take(MAX_EXPANDED_NOTES).map(|(i, _)| *i).collect();
+
+    let mut out = String::from(head);
+    out.push_str("notes:\n");
+    for (i, note) in notes.iter().enumerate() {
+        if expanded.contains(&i) {
+            out.push_str(&format!("  - {note}\n"));
+        } else {
+            out.push_str(&format!("  - {}\n", first_clause(note, NOTE_INDEX_CHARS)));
+        }
+    }
+    let collapsed = notes.len() - expanded.len();
+    if collapsed > 0 {
+        out.push_str(&format!(
+            "\n({collapsed} of {} notes shown as opening clause only — every note is listed above. \
+             For the rest: get_preferences with a narrower hint, or detail=\"full\".)\n",
+            notes.len()
+        ));
+    }
+    out
+}
+
+/// Lowercased hint tokens long enough to be discriminating.
+fn hint_terms(hint: Option<&str>) -> Vec<String> {
+    hint.unwrap_or("")
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|t| t.len() >= 4)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Number of distinct hint terms a note mentions.
+fn score_note(note: &str, terms: &[String]) -> usize {
+    if terms.is_empty() {
+        return 0;
+    }
+    let lower = note.to_lowercase();
+    terms.iter().filter(|t| lower.contains(t.as_str())).count()
+}
+
+/// First sentence of a note, or a word-boundary truncation, whichever is shorter.
+fn first_clause(note: &str, max_chars: usize) -> String {
+    let flat = note.replace('\n', " ");
+    let flat = flat.trim();
+    // A sentence end inside the budget is already a clean cut — take it whole.
+    if let Some(end) = flat.find(". ").map(|i| i + 1).filter(|i| *i <= max_chars) {
+        return format!("{} …", &flat[..end]);
+    }
+    if flat.len() <= max_chars {
+        return flat.to_string();
+    }
+    // Hard truncation: step back to a char boundary, then to the last whole word.
+    let mut cut = max_chars;
+    while cut > 0 && !flat.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let cut = flat[..cut].rfind(' ').unwrap_or(cut);
+    format!("{} …", flat[..cut].trim_end())
+}
+
+#[cfg(test)]
+mod tier_notes_tests {
+    use super::*;
+
+    fn rendered(notes: &[&str]) -> String {
+        format!("=== PREFERENCES ===\nproject: FlowMake\nnotes: {}\n", notes.join(" | "))
+    }
+
+    /// The whole safety claim: tiering may shorten a note, never remove one.
+    #[test]
+    fn every_note_is_still_listed_whatever_the_hint() {
+        let notes: Vec<String> =
+            (0..40).map(|i| format!("note {i} about subject{i} with a long tail of explanatory text \
+                                     that would otherwise cost tokens on every single boot")).collect();
+        let refs: Vec<&str> = notes.iter().map(String::as_str).collect();
+        let input = rendered(&refs);
+        for hint in [None, Some("subject3"), Some("nothing matches this"), Some("note")] {
+            let out = tier_notes(&input, hint, false);
+            let listed = out.lines().filter(|l| l.trim_start().starts_with("- ")).count();
+            assert_eq!(listed, 40, "hint {hint:?} dropped notes");
+        }
+    }
+
+    #[test]
+    fn hint_matched_notes_arrive_in_full_and_others_collapse() {
+        let long_tail = "and here is a great deal of additional trailing detail that pushes this \
+                         note well past the index threshold so truncation is observable";
+        let input = rendered(&[
+            &format!("grapple constraint behaviour. {long_tail}"),
+            &format!("gif decoding behaviour. {long_tail}"),
+        ]);
+        let out = tier_notes(&input, Some("grapple constraint swing"), false);
+        assert!(out.contains(long_tail), "matched note should be complete");
+        assert!(out.contains("gif decoding behaviour. …"), "unmatched note should collapse");
+        assert!(out.contains("1 of 2 notes"), "footer should report what was collapsed");
+    }
+
+    #[test]
+    fn detail_full_is_byte_identical_to_the_input() {
+        let input = rendered(&["alpha one", "beta two"]);
+        assert_eq!(tier_notes(&input, Some("alpha"), true), input);
+    }
+
+    #[test]
+    fn preferences_without_a_notes_field_pass_through_untouched() {
+        let input = "=== PREFERENCES ===\nproject: FlowMake\nlanguage: Rust\n";
+        assert_eq!(tier_notes(input, Some("anything"), false), input);
+    }
+
+    /// Notes contain em-dashes and other multibyte characters; truncation must
+    /// not slice through one.
+    #[test]
+    fn truncation_respects_multibyte_boundaries() {
+        let note = "café — naïve façade ".repeat(20);
+        let input = rendered(&[&note, "unrelated"]);
+        let out = tier_notes(&input, Some("zzz"), false);
+        assert!(out.contains(" …"));
+    }
+}
+
+/// Reports real tiering savings against the live prefs file. Ignored by default
+/// because it depends on the workspace's own .cortex/prefs.toml.
+/// Run: cargo test --quiet measure_real_prefs -- --ignored --nocapture
+#[cfg(test)]
+#[test]
+#[ignore]
+fn measure_real_prefs_savings() {
+    let path = std::path::Path::new("../.cortex/prefs.toml");
+    let Ok(prefs) = load(path) else { return };
+    let full = render_for_copilot(&prefs);
+    println!("  notes entries      : {}", prefs.project.notes.len());
+    println!("  full render        : {:>7} chars (~{} tokens)", full.len(), full.len() / 4);
+    for (label, hint) in [
+        ("boot, no hint      ", None),
+        ("hint: quartz plugin", Some("quartz plugin action dispatch on_action on_call")),
+        ("hint: vr renderer  ", Some("space_soup xr_renderer scope optic avatar rig")),
+    ] {
+        let t = tier_notes(&full, hint, false);
+        println!(
+            "  {label}: {:>7} chars (~{} tokens)  saved {:>6} chars (~{} tokens, {:.0}%)",
+            t.len(), t.len() / 4, full.len() - t.len(), (full.len() - t.len()) / 4,
+            100.0 * (full.len() - t.len()) as f64 / full.len() as f64
+        );
+    }
+}

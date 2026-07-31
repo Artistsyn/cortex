@@ -139,17 +139,6 @@ pub fn render_packet(packet: &ContextPacket) -> String {
         }
     }
 
-    // ADRs — architectural constraints injected before patterns
-    if !packet.adrs.is_empty() {
-        s.push_str("=== ARCHITECTURE DECISIONS ===\n");
-        for adr in &packet.adrs {
-            s.push_str(&format!(
-                "## ADR-{:03}: {} [{}]\nContext: {}\nDecision: {}\n\n",
-                adr.adr_number, adr.title, adr.status, adr.context, adr.decision
-            ));
-        }
-    }
-
     // Patterns
     if !packet.patterns.is_empty() {
         s.push_str("=== KNOWN PATTERNS ===\n");

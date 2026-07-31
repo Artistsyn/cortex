@@ -367,8 +367,28 @@ fn tools_list() -> Value {
             },
             {
                 "name": "get_preferences",
-                "description": "Return the active Copilot coding preferences summary loaded by cortex.",
-                "inputSchema": { "type": "object", "properties": {} }
+                "description": "Return the active coding preferences loaded by cortex. Style, API \
+                                and project fields always come in full. The `notes` list is the bulk \
+                                of the payload, so every note is listed but only hint-matching ones \
+                                are expanded — pass `hint` describing your task to get the relevant \
+                                ones complete on the first call.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "hint": {
+                            "type": "string",
+                            "description": "What you are about to work on. Notes matching this are \
+                                            expanded to full text; the rest are listed as their \
+                                            opening clause."
+                        },
+                        "detail": {
+                            "type": "string",
+                            "enum": ["index", "full"],
+                            "description": "index (default): hint-matched notes in full, rest as \
+                                            opening clause. full: every note complete."
+                        }
+                    }
+                }
             },
             {
                 "name": "recurrent_think",

@@ -32,7 +32,7 @@ pub fn dispatch(
         "get_delta"            => tool_get_delta(args, repo_root),
         "query_graph"          => tool_query_graph(args, store, session_id),
         "explain_dependency_path" => tool_explain_dependency_path(args, store),
-        "get_preferences"      => tool_get_preferences(prefs_summary),
+        "get_preferences"      => tool_get_preferences(args, prefs_summary),
         "recurrent_think"      => tool_recurrent_think(args, store),
         "simulate_change"      => tool_simulate_change(args, store),
         "recall"               => tool_recall(args, store, units, sessions, session_id),
@@ -527,7 +527,10 @@ fn tool_get_context(
 
     let mut out = String::new();
     if !prefs_summary.trim().is_empty() {
-        out.push_str(prefs_summary);
+        // The boot sequence calls get_preferences immediately before this, so
+        // embedding the full notes blob here bills the agent for it twice. Tier
+        // it against this call's own hint — every note is still listed.
+        out.push_str(&crate::prefs::tier_notes(prefs_summary, Some(hint), false));
         out.push('\n');
     }
     out.push_str(&render_packet(&packet));
@@ -600,11 +603,13 @@ fn tool_query_graph(args: &Value, store: &Store, session_id: &str) -> Result<Str
     Ok(out)
 }
 
-fn tool_get_preferences(prefs_summary: &str) -> Result<String, String> {
+fn tool_get_preferences(args: &Value, prefs_summary: &str) -> Result<String, String> {
     if prefs_summary.trim().is_empty() {
         return Ok("No preferences configured.".to_string());
     }
-    Ok(prefs_summary.to_string())
+    let hint = args.get("hint").and_then(|v| v.as_str());
+    let full = args.get("detail").and_then(|v| v.as_str()) == Some("full");
+    Ok(crate::prefs::tier_notes(prefs_summary, hint, full))
 }
 
 // ── recall ────────────────────────────────────────────────────────────────────

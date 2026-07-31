@@ -37,7 +37,7 @@ pub fn dispatch(
         "simulate_change"      => tool_simulate_change(args, store),
         "recall"               => tool_recall(args, store, units, sessions, session_id),
         "list_patterns"        => tool_list_patterns(args, store, session_id),
-        "get_anti_patterns"    => tool_get_anti_patterns(store, session_id),
+        "get_anti_patterns"    => tool_get_anti_patterns(args, store, session_id),
         "suggest_pattern"      => tool_suggest_pattern(args, store),
         "list_all"             => tool_list_all(args, units),
         // Phase 0B: protocol session management tools.
@@ -721,9 +721,21 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
         return Ok("No approved patterns yet.".into());
     }
 
-    let detail = list_detail_tier(args);
+    let detail = pattern_detail_tier(args);
+    let detail_is_summary = detail == "summary";
+    let tokens = args.get("hint").and_then(|v| v.as_str()).map(hint_tokens).unwrap_or_default();
     let mut out = format!("{} approved pattern(s):\n\n", patterns.len());
+    let mut expanded = 0usize;
     for p in &patterns {
+        // A pattern relevant to the stated task gets its body preview even at
+        // the summary tier — the saving should come from the ones you are not
+        // about to use, not from the one you are.
+        let relevant = !tokens.is_empty() && {
+            let hay = format!("{} {} {} {}",
+                p.name, p.intent, p.body, p.uses.join(" ")).to_lowercase();
+            tokens.iter().any(|t| hay.contains(t.as_str()))
+        };
+        let detail = if relevant && detail == "summary" { expanded += 1; "standard" } else { detail };
         let marker = if p.survival_rate < 0.4 {
             "⚠"
         } else if p.survival_rate < 0.8 {
@@ -763,23 +775,88 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
 
         out.push('\n');
     }
+    if detail_is_summary {
+        out.push_str(&format!(
+            "({} shown by name and intent only{} — pass hint=\"<what you are writing>\" \
+             or detail=\"standard\" for the body text.)\n",
+            patterns.len() - expanded,
+            if expanded > 0 { format!(", {expanded} expanded as relevant") } else { String::new() },
+        ));
+    }
     Ok(out)
 }
 
 // ── get_anti_patterns ─────────────────────────────────────────────────────────
 
-fn tool_get_anti_patterns(store: &Store, session_id: &str) -> Result<String, String> {
+/// Words too common to discriminate between anti-patterns.
+const HINT_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "that", "this", "from", "into", "when",
+    "code", "function", "write", "writing", "add", "adding", "new", "make",
+];
+
+/// Tokens from a task hint, lowercased, short and common words removed.
+fn hint_tokens(hint: &str) -> Vec<String> {
+    hint.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.len() >= 4 && !HINT_STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// How many distinct hint tokens this anti-pattern mentions.
+fn hint_score(ap: &crate::model::AntiPattern, tokens: &[String]) -> usize {
+    if tokens.is_empty() {
+        return 0;
+    }
+    let hay = format!("{} {} {} {}", ap.description, ap.wrong, ap.correct, ap.tags.join(" "))
+        .to_lowercase();
+    tokens.iter().filter(|t| hay.contains(t.as_str())).count()
+}
+
+/// Every anti-pattern, every time — but the remedy text only where it earns
+/// its place.
+///
+/// This is called at the start of every session and before any non-trivial
+/// code, and the full dump had grown to ~49,000 chars (~12k tokens) across 122
+/// entries, paid up front, growing with every entry added. Measured against the
+/// live DB, descriptions alone are 69% smaller.
+///
+/// The safety property is that NO anti-pattern is ever hidden: all of them are
+/// always listed by description, and the project convention is that a
+/// description's first sentence states what goes wrong. What `index` withholds
+/// is the wrong/correct remedy pair, which matters once a trap actually
+/// applies — and anything matching `hint` is expanded in place, so the entries
+/// relevant to the task at hand arrive complete without a second call.
+fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
     let aps = store.all_anti_patterns().map_err(|e| e.to_string())?;
     if aps.is_empty() {
         return Ok("No anti-patterns recorded yet.".into());
     }
+    let full = args.get("detail").and_then(|v| v.as_str()) == Some("full");
+    let tokens = args.get("hint").and_then(|v| v.as_str()).map(hint_tokens).unwrap_or_default();
+
     let mut out = format!("{} anti-pattern(s) — DO NOT do these:\n\n", aps.len());
+    let mut expanded = 0usize;
+
     for ap in &aps {
-        out.push_str(&format!("### {}\n✗ wrong:   {}\n✓ correct: {}\n\n",
-            ap.description, ap.wrong, ap.correct));
+        let relevant = hint_score(ap, &tokens) > 0;
+        if full || relevant {
+            out.push_str(&format!("### {}\n✗ wrong:   {}\n✓ correct: {}\n\n",
+                ap.description, ap.wrong, ap.correct));
+            expanded += 1;
+        } else {
+            out.push_str(&format!("- {}\n", ap.description));
+        }
         if let Some(id) = ap.id {
             let _ = store.log_session_retrieval(session_id, "anti_patterns", id, "get_anti_patterns");
         }
+    }
+
+    if !full {
+        let listed = aps.len() - expanded;
+        out.push_str(&format!(
+            "\n({listed} listed by description only — their wrong/correct text is one call away: \
+             get_anti_patterns with hint=\"<what you are writing>\", or detail=\"full\" for all of them.)\n"
+        ));
     }
     Ok(out)
 }
@@ -869,6 +946,26 @@ fn list_detail_tier(args: &Value) -> &str {
         Some("summary") => "summary",
         Some("full") => "full",
         _ => "standard",
+    }
+}
+
+/// Same tiers as `list_detail_tier`, but defaulting to `summary`.
+///
+/// `list_patterns` used to default to `standard`, which appends a four-line
+/// body preview to every one of the 146 approved patterns — ~88,000 chars
+/// (~22k tokens) measured against the live DB, paid at every session boot and
+/// growing with the library. `summary` still names every pattern with its
+/// intent and survival rate, which is what you need to decide whether one
+/// applies; the body arrives via `detail` or a `hint` match.
+///
+/// Deliberately separate from `list_detail_tier`: that one is also used by
+/// `list_all` for code-unit listings, where the caller has asked for a listing
+/// and a quieter default would be a regression rather than a saving.
+fn pattern_detail_tier(args: &Value) -> &str {
+    match args.get("detail").and_then(|v| v.as_str()) {
+        Some("standard") => "standard",
+        Some("full") => "full",
+        _ => "summary",
     }
 }
 
@@ -1606,9 +1703,158 @@ fn tool_propose_skill(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_risk, parse_relation_filter};
+    use super::{classify_risk, parse_relation_filter, tool_get_anti_patterns};
     use crate::reasoner::simulator::RiskLevel;
+    use crate::memory::Store;
     use serde_json::json;
+
+    fn ap_store(name: &str) -> Store {
+        let dir = std::env::temp_dir().join("cortex-tools-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join(format!("{name}.db"));
+        let _ = std::fs::remove_file(&db);
+        let store = Store::open(&db).unwrap();
+        crate::crystallizer::add_anti_pattern(&store,
+            "Pool objects accumulate gravity between uses",
+            "spawn from pool and set position only",
+            "reset momentum on acquire",
+            vec!["pool".into(), "gravity".into()]).unwrap();
+        crate::crystallizer::add_anti_pattern(&store,
+            "Slint Flickable reports no preferred height and collapses to zero",
+            "put a Flickable in a self-sizing Rectangle",
+            "give it an explicit height",
+            vec!["slint".into(), "layout".into()]).unwrap();
+        store
+    }
+
+    /// The combined per-session boot cost, before and after.
+    ///
+    ///     cargo test -- --ignored --nocapture measure_boot_payload
+    #[test]
+    #[ignore]
+    fn measure_boot_payload() {
+        let live = std::path::Path::new("../.cortex/memory.db");
+        if !live.exists() { eprintln!("no live DB"); return; }
+        let tmp = std::env::temp_dir().join("cortex_boot_measure.db");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::copy(live, &tmp).unwrap();
+        let store = Store::open(&tmp).unwrap();
+
+        let ap_old = super::tool_get_anti_patterns(&json!({"detail":"full"}), &store, "m").unwrap();
+        let ap_new = super::tool_get_anti_patterns(&json!({}), &store, "m").unwrap();
+        let lp_old = super::tool_list_patterns(&json!({"detail":"standard"}), &store, "m").unwrap();
+        let lp_new = super::tool_list_patterns(&json!({}), &store, "m").unwrap();
+
+        let (o, n) = (ap_old.chars().count() + lp_old.chars().count(),
+                      ap_new.chars().count() + lp_new.chars().count());
+        println!("\nper-session boot payload (get_anti_patterns + list_patterns)");
+        println!("  before : {o:6} chars  (~{:5} tokens)", o / 4);
+        println!("  after  : {n:6} chars  (~{:5} tokens)", n / 4);
+        println!("  saved  : {:6} chars  (~{:5} tokens)  {:.0}%",
+                 o - n, (o - n) / 4, 100.0 * (o - n) as f64 / o as f64);
+
+        // Nothing may disappear from the listings.
+        for ap in store.all_anti_patterns().unwrap() {
+            assert!(ap_new.contains(&ap.description), "anti-pattern vanished: {}", ap.description);
+        }
+        for p in store.all_patterns().unwrap() {
+            assert!(lp_new.contains(&p.name), "pattern vanished: {}", p.name);
+        }
+        println!("  every anti-pattern and pattern still listed\n");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Measure the two tiers against the live knowledge base.
+    ///
+    ///     cargo test -- --ignored --nocapture measure_anti_pattern_tiers
+    #[test]
+    #[ignore]
+    fn measure_anti_pattern_tiers() {
+        let live = std::path::Path::new("../.cortex/memory.db");
+        if !live.exists() { eprintln!("no live DB"); return; }
+        // Copy: never open the DB the MCP server may be holding.
+        let tmp = std::env::temp_dir().join("cortex_ap_measure.db");
+        let _ = std::fs::remove_file(&tmp);
+        std::fs::copy(live, &tmp).unwrap();
+        let store = Store::open(&tmp).unwrap();
+        let n = store.all_anti_patterns().unwrap().len();
+
+        let index = tool_get_anti_patterns(&json!({}), &store, "measure").unwrap();
+        let full  = tool_get_anti_patterns(&json!({"detail": "full"}), &store, "measure").unwrap();
+        let hinted = tool_get_anti_patterns(
+            &json!({"hint": "spawn pooled object with gravity and momentum"}),
+            &store, "measure").unwrap();
+
+        let pct = |x: usize| 100.0 * (1.0 - x as f64 / full.chars().count() as f64);
+        println!("\n{n} anti-patterns in the live DB");
+        println!("  detail=full  : {:6} chars (~{:5} tok)", full.chars().count(), full.chars().count()/4);
+        println!("  index        : {:6} chars (~{:5} tok)  -> {:.0}% smaller",
+                 index.chars().count(), index.chars().count()/4, pct(index.chars().count()));
+        println!("  index + hint : {:6} chars (~{:5} tok)  -> {:.0}% smaller",
+                 hinted.chars().count(), hinted.chars().count()/4, pct(hinted.chars().count()));
+
+        // Nothing may vanish at any tier.
+        for ap in store.all_anti_patterns().unwrap() {
+            assert!(index.contains(&ap.description), "index dropped: {}", ap.description);
+            assert!(hinted.contains(&ap.description), "hinted dropped: {}", ap.description);
+        }
+        println!("  all {n} descriptions present at every tier\n");
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// The index tier may withhold remedy text. It must never withhold the
+    /// existence of a trap — that is the whole safety function of this call.
+    #[test]
+    fn no_anti_pattern_is_ever_hidden_by_the_index_tier() {
+        let store = ap_store("ap_index");
+        let out = tool_get_anti_patterns(&json!({}), &store, "s1").unwrap();
+        assert!(out.contains("Pool objects accumulate gravity"));
+        assert!(out.contains("Slint Flickable reports no preferred height"));
+        // Count is whatever the store holds (Store::open seeds a baseline set);
+        // what matters is that the header states it and both entries appear.
+        let n = store.all_anti_patterns().unwrap().len();
+        assert!(out.starts_with(&format!("{n} anti-pattern(s)")),
+            "the header must state the true count ({n}): {out}");
+    }
+
+    /// The point of the tier: it is materially smaller than the full dump.
+    #[test]
+    fn the_index_tier_is_smaller_than_the_full_dump() {
+        let store = ap_store("ap_size");
+        let index = tool_get_anti_patterns(&json!({}), &store, "s1").unwrap();
+        let full  = tool_get_anti_patterns(&json!({"detail": "full"}), &store, "s1").unwrap();
+        assert!(index.len() < full.len(),
+            "index {} was not smaller than full {}", index.len(), full.len());
+        assert!(full.contains("reset momentum on acquire"), "full tier must carry the remedy");
+    }
+
+    /// A trap relevant to the task at hand arrives complete, without the agent
+    /// having to know to ask for it.
+    #[test]
+    fn a_hint_expands_the_traps_that_apply_and_leaves_the_rest_indexed() {
+        let store = ap_store("ap_hint");
+        let out = tool_get_anti_patterns(
+            &json!({"hint": "spawn a pooled enemy with gravity"}), &store, "s1").unwrap();
+        assert!(out.contains("reset momentum on acquire"),
+            "the matching anti-pattern must come with its remedy: {out}");
+        assert!(!out.contains("give it an explicit height"),
+            "an unrelated anti-pattern should stay indexed: {out}");
+        assert!(out.contains("Slint Flickable reports no preferred height"),
+            "...but must still be listed");
+    }
+
+    /// A hint of pure noise must not silently expand everything (or nothing
+    /// useful) — stopwords and short words carry no signal.
+    #[test]
+    fn a_hint_of_common_words_matches_nothing() {
+        let store = ap_store("ap_noise");
+        let out = tool_get_anti_patterns(
+            &json!({"hint": "write the new code for this"}), &store, "s1").unwrap();
+        assert!(!out.contains("✗ wrong:"), "no entry should have expanded: {out}");
+        let n = store.all_anti_patterns().unwrap().len();
+        assert!(out.contains(&format!("{n} listed by description only")),
+            "with no matches, every entry stays indexed: {out}");
+    }
 
     #[test]
     fn parse_relation_filter_supports_single_string() {

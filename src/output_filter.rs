@@ -36,6 +36,10 @@ pub struct FilteredOutput {
     pub original_chars: usize,
     pub filtered_chars: usize,
     pub dropped_lines: usize,
+    /// Lines withheld from the inline text by windowing. NOT redundant --
+    /// present in the tee file, absent from what the model sees. Non-zero means
+    /// "complete on disk, windowed in context".
+    pub elided_lines: usize,
     pub tee_path: Option<PathBuf>,
     /// Always true for this module — documents the guarantee at the call site.
     pub lossless: bool,
@@ -240,6 +244,123 @@ fn tee_stem(raw: &str) -> String {
 /// any dropped-line note would cost more than it saves.
 pub const MIN_FILTER_CHARS: usize = 800;
 
+/// Above this, the output is WINDOWED as well as filtered.
+///
+/// Measured on this project's own telemetry: removing provably-redundant lines
+/// caps out at about 2.6% of volume, because build and test output simply is
+/// not very repetitive — and it was already achieving 2.0%. Meanwhile 46% of
+/// all bytes sat in the 189 calls larger than 2,000 chars. The saving was never
+/// going to come from squeezing text harder; it comes from not putting the
+/// whole of a 6,000-char log in front of the model when twenty lines answer the
+/// question.
+///
+/// This is still lossless in the sense that matters: the complete byte stream
+/// is written to the tee file first, and the elision marker names the path, so
+/// nothing is destroyed and anything elided is one Read away.
+pub const MAX_INLINE_CHARS: usize = 1_000;
+
+/// Lines kept at each end when windowing. Output tends to state the problem
+/// early and the verdict last.
+///
+/// Chosen by sweeping both knobs against the captured corpus (see
+/// `sweep_window_thresholds`). Measured savings, all with zero signal lines
+/// lost:
+///
+/// ```text
+///   thresh  head/tail   saved
+///     2000     14        11.9%
+///     1200     14        15.1%
+///     1200     10        25.9%
+///     1000     10        26.1%   <- default
+///     1000      8        33.2%
+///      800      6        43.1%
+/// ```
+///
+/// The line count dominates the byte threshold: 1200/14 and 1200/10 differ by
+/// 10.8 points. 10/10 is the balance point — 20 lines of context plus every
+/// signal line is enough to act on without a follow-up read in the common case,
+/// and the more aggressive rows are a config change away (see `env_usize`) if
+/// the budget ever needs them.
+const HEAD_LINES: usize = 10;
+const TAIL_LINES: usize = 10;
+
+/// The three window tunables, overridable per-process by env var.
+///
+/// These exist so the thresholds can be swept against the captured corpus
+/// (and adjusted in the field) without a rebuild. Read on each call rather
+/// than cached: this runs once per tool result, and a sweep needs to change
+/// the value inside a single process.
+///
+/// - `CORTEX_MAX_INLINE_CHARS` — window outputs larger than this
+/// - `CORTEX_WINDOW_HEAD` / `CORTEX_WINDOW_TAIL` — lines kept at each end
+fn env_usize(key: &str, default: usize, floor: usize) -> usize {
+    std::env::var(key).ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n >= floor)
+        .unwrap_or(default)
+}
+
+pub fn max_inline_chars() -> usize { env_usize("CORTEX_MAX_INLINE_CHARS", MAX_INLINE_CHARS, 200) }
+fn head_lines() -> usize { env_usize("CORTEX_WINDOW_HEAD", HEAD_LINES, 2) }
+fn tail_lines() -> usize { env_usize("CORTEX_WINDOW_TAIL", TAIL_LINES, 2) }
+
+/// Lines that must survive windowing wherever they appear.
+///
+/// Eliding the one `error[E0433]` in the middle of a build log would turn a
+/// useful compaction into a trap: the model would see a truncated log, conclude
+/// the build was fine, and act on it. Anything carrying a verdict or a
+/// diagnosis is exempt from the window.
+fn is_signal(line: &str) -> bool {
+    let l = line.trim_start();
+    const MARKERS: &[&str] = &[
+        "error", "Error", "ERROR",
+        "warning:", "panicked", "PANIC",
+        "assertion", "assert",
+        "failed", "FAILED", "failure",
+        "test result:", "Finished", "Compiling error",
+        "-->", "thread '", "Caused by", "exit code", "exit=",
+        "REFUSING", "cannot find", "not found", "No such",
+    ];
+    MARKERS.iter().any(|m| l.starts_with(m) || l.contains(m))
+}
+
+/// Keep the head, the tail, and every signal line; elide the rest.
+///
+/// Returns the windowed text and how many lines were elided.
+fn window_lines(text: &str) -> (String, usize) {
+    let (head, tail) = (head_lines(), tail_lines());
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= head + tail {
+        return (text.to_string(), 0);
+    }
+    let tail_start = lines.len().saturating_sub(tail);
+    let mut out: Vec<String> = Vec::new();
+    let mut elided = 0usize;
+    let mut run = 0usize;
+
+    for (i, ln) in lines.iter().enumerate() {
+        let keep = i < head || i >= tail_start || is_signal(ln);
+        if keep {
+            if run > 0 {
+                out.push(format!("        … {run} line(s) elided …"));
+                elided += run;
+                run = 0;
+            }
+            out.push((*ln).to_string());
+        } else {
+            run += 1;
+        }
+    }
+    if run > 0 {
+        out.push(format!("        … {run} line(s) elided …"));
+        elided += run;
+    }
+    (out.join("
+"), elided)
+}
+
+
+
 /// Filter `raw` for the given command kind. Tees the full original to
 /// `tee_dir` (when provided) only if lines were actually dropped, so the exact
 /// byte stream is always recoverable.
@@ -253,6 +374,7 @@ pub fn filter_output(kind: CommandKind, raw: &str, tee_dir: Option<&Path>) -> Fi
             original_chars,
             filtered_chars: original_chars,
             dropped_lines: 0,
+            elided_lines: 0,
             tee_path: None,
             lossless: true,
         };
@@ -260,20 +382,45 @@ pub fn filter_output(kind: CommandKind, raw: &str, tee_dir: Option<&Path>) -> Fi
 
     let (mut text, dropped_lines) = filter_by_kind(kind, raw);
 
+    // Window only what is still large after redundant lines have gone, and only
+    // when the full text can be written somewhere first. With no tee directory
+    // there is nowhere to recover an elided line from, so nothing is elided --
+    // better a long output than a silently incomplete one.
+    let mut elided_lines = 0usize;
     let mut tee_path = None;
-    if dropped_lines > 0 {
+
+    let needs_tee = dropped_lines > 0 || text.chars().count() > max_inline_chars();
+    if needs_tee {
         if let Some(dir) = tee_dir {
             if std::fs::create_dir_all(dir).is_ok() {
                 let path = dir.join(format!("{}.txt", tee_stem(raw)));
                 if std::fs::write(&path, raw).is_ok() {
-                    text.push_str(&format!(
-                        "\n[compacted: {dropped_lines} redundant line(s) removed losslessly \u{2014} full log: {}]",
-                        path.display()
-                    ));
                     tee_path = Some(path);
                 }
             }
         }
+    }
+
+    if text.chars().count() > max_inline_chars() && tee_path.is_some() {
+        let (windowed, n) = window_lines(&text);
+        if n > 0 {
+            text = windowed;
+            elided_lines = n;
+        }
+    }
+
+    if let Some(path) = &tee_path {
+        let mut note = String::from("\n[compacted:");
+        if dropped_lines > 0 {
+            note.push_str(&format!(" {dropped_lines} redundant line(s) removed;"));
+        }
+        if elided_lines > 0 {
+            note.push_str(&format!(
+                " {elided_lines} line(s) elided from the middle - NOT redundant, just not shown;"
+            ));
+        }
+        note.push_str(&format!(" complete log: {}]", path.display()));
+        text.push_str(&note);
     }
 
     let filtered_chars = text.chars().count();
@@ -282,7 +429,10 @@ pub fn filter_output(kind: CommandKind, raw: &str, tee_dir: Option<&Path>) -> Fi
         original_chars,
         filtered_chars,
         dropped_lines,
+        elided_lines,
         tee_path,
+        // Every byte is still in the tee file, so nothing is destroyed. The
+        // distinction a caller needs is `elided_lines`.
         lossless: true,
     }
 }
@@ -457,5 +607,209 @@ Untracked files:
         assert!(out.filtered_chars < out.original_chars / 4, "expected big savings");
         assert!(out.text.contains("test result: ok. 200 passed"));
         assert!(out.dropped_lines >= 200);
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    /// Diagnostic: print which signal lines the pipeline loses.
+    #[test]
+    #[ignore]
+    fn diagnose_signal_loss() {
+        let dir = std::path::Path::new("../.cortex/tee");
+        if !dir.exists() { return; }
+        let out_dir = std::env::temp_dir().join("tf_diag_corpus");
+        let _ = std::fs::create_dir_all(&out_dir);
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x != "txt").unwrap_or(true) { continue; }
+            let Ok(raw) = std::fs::read_to_string(&p) else { continue };
+            if raw.chars().count() < MIN_FILTER_CHARS { continue; }
+            let f = filter_output(CommandKind::Generic, &raw, Some(&out_dir));
+            let mut after: Vec<&str> = f.text.lines().filter(|l| is_signal(l)).collect();
+            for l in raw.lines().filter(|l| is_signal(l)) {
+                match after.iter().position(|x| *x == l) {
+                    Some(i) => { after.remove(i); }
+                    None => println!("LOST in {}:\n   {:?}", p.file_name().unwrap().to_string_lossy(), l),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    /// Sweep the window tunables against the real corpus.
+    ///
+    /// Prints savings AND signal integrity for each setting, so the threshold
+    /// is chosen from measurement rather than taste. A setting that saves more
+    /// but loses a signal line is not a candidate at any saving.
+    ///
+    ///     cargo test -- --ignored --nocapture sweep_window_thresholds
+    #[test]
+    #[ignore]
+    fn sweep_window_thresholds() {
+        let dir = std::path::Path::new("../.cortex/tee");
+        if !dir.exists() { eprintln!("no corpus at {}", dir.display()); return; }
+        let corpus: Vec<String> = std::fs::read_dir(dir).unwrap().flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|x| x == "txt").unwrap_or(false))
+            .filter_map(|p| std::fs::read_to_string(&p).ok())
+            .filter(|r| r.chars().count() >= MIN_FILTER_CHARS)
+            .collect();
+        let orig: usize = corpus.iter().map(|r| r.chars().count()).sum();
+        let out_dir = std::env::temp_dir().join("tf_sweep_corpus");
+        let _ = std::fs::create_dir_all(&out_dir);
+
+        println!("\ncorpus: {} files, {orig} chars", corpus.len());
+        println!("{:>7} {:>5} {:>5} {:>10} {:>8} {:>9} {:>13}",
+                 "thresh", "head", "tail", "chars", "saved", "windowed", "signal lost");
+
+        for (thresh, head, tail) in [
+            (2000usize, 14usize, 14usize), (1600, 14, 14), (1200, 14, 14),
+            (1200, 10, 10), (1000, 10, 10), (1000, 8, 8), (800, 8, 8), (800, 6, 6),
+        ] {
+            std::env::set_var("CORTEX_MAX_INLINE_CHARS", thresh.to_string());
+            std::env::set_var("CORTEX_WINDOW_HEAD", head.to_string());
+            std::env::set_var("CORTEX_WINDOW_TAIL", tail.to_string());
+
+            let (mut after, mut win, mut lost) = (0usize, 0usize, 0usize);
+            for raw in &corpus {
+                let f = filter_output(CommandKind::Generic, raw, Some(&out_dir));
+                after += f.filtered_chars;
+                if f.elided_lines > 0 { win += 1; }
+                // Every DISTINCT signal line in the input must still be present
+                // in the output -- verbatim, or in the collapsed `line  (xN)`
+                // form that filter_generic produces for consecutive repeats.
+                //
+                // Comparing raw occurrence counts flags that collapse as loss,
+                // which it is not: the count carries the information. The first
+                // run of this sweep reported 2 lost lines for exactly that
+                // reason, and the defect was here, not in the windowing.
+                for sig in raw.lines().filter(|l| is_signal(l)) {
+                    let present = f.text.lines().any(|o| {
+                        o == sig
+                            || o.strip_suffix(')')
+                                .and_then(|o| o.rfind("  (×").map(|i| &o[..i]))
+                                .map(|stem| stem == sig)
+                                .unwrap_or(false)
+                    });
+                    if !present {
+                        lost += 1;
+                    }
+                }
+            }
+            let saved = orig.saturating_sub(after);
+            println!("{thresh:>7} {head:>5} {tail:>5} {after:>10} {:>7.1}% {win:>9} {lost:>13}",
+                     100.0 * saved as f64 / orig.max(1) as f64);
+            assert_eq!(lost, 0, "threshold {thresh}/{head}/{tail} dropped a signal line");
+        }
+        for k in ["CORTEX_MAX_INLINE_CHARS", "CORTEX_WINDOW_HEAD", "CORTEX_WINDOW_TAIL"] {
+            std::env::remove_var(k);
+        }
+        let _ = std::fs::remove_dir_all(&out_dir);
+        println!();
+    }
+
+    /// Measure both strategies against the real captured corpus in .cortex/tee.
+    ///
+    /// Ignored by default: it reads files outside the crate and is a
+    /// measurement, not an assertion. Run with
+    ///     cargo test -- --ignored --nocapture measure_against_real_corpus
+    #[test]
+    #[ignore]
+    fn measure_against_real_corpus() {
+        let dir = std::path::Path::new("../.cortex/tee");
+        if !dir.exists() {
+            eprintln!("no corpus at {}", dir.display());
+            return;
+        }
+        let out_dir = std::env::temp_dir().join("tf_bench_corpus");
+        let _ = std::fs::create_dir_all(&out_dir);
+        let (mut orig, mut before, mut after, mut n, mut win) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x != "txt").unwrap_or(true) { continue; }
+            let Ok(raw) = std::fs::read_to_string(&p) else { continue };
+            if raw.chars().count() < MIN_FILTER_CHARS { continue; }
+            n += 1;
+            orig += raw.chars().count();
+            let (t, _) = filter_by_kind(CommandKind::Generic, &raw);
+            before += t.chars().count();
+            let f = filter_output(CommandKind::Generic, &raw, Some(&out_dir));
+            after += f.filtered_chars;
+            if f.elided_lines > 0 { win += 1; }
+        }
+        let pct = |x: usize| 100.0 * x as f64 / orig.max(1) as f64;
+        println!("\ncorpus: {n} files >= {MIN_FILTER_CHARS} chars, {orig} chars");
+        println!("  filter only (old):  {before:>8}  saved {:>7} ({:.1}%)", orig - before, pct(orig - before));
+        println!("  + windowing (new):  {after:>8}  saved {:>7} ({:.1}%)",
+                 orig.saturating_sub(after), pct(orig.saturating_sub(after)));
+        println!("  windowed: {win}/{n} files\n");
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    fn noise(n: usize) -> String {
+        (0..n).map(|i| format!("   Compiling crate_{i} v0.1.{i}")).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn an_error_in_the_middle_is_never_elided() {
+        // The failure that would make windowing dangerous: a truncated log that
+        // reads as a clean build, so the model proceeds on a broken tree.
+        let mut raw = noise(60);
+        raw.push_str("\nerror[E0433]: failed to resolve: use of undeclared crate `serde_jsonx`\n");
+        raw.push_str(&noise(60));
+        let dir = std::env::temp_dir().join(format!("tf_win_{}", std::process::id()));
+        let out = filter_output(CommandKind::Generic, &raw, Some(&dir));
+
+        assert!(out.elided_lines > 0, "a 120-line log should be windowed");
+        assert!(
+            out.text.contains("error[E0433]"),
+            "the error must survive windowing; got:\n{}",
+            out.text
+        );
+        assert!(out.text.contains("complete log:"), "and must say where the rest is");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_full_bytes_are_recoverable_from_the_tee() {
+        let raw = format!("{}\nwarning: something\n{}", noise(50), noise(50));
+        let dir = std::env::temp_dir().join(format!("tf_win2_{}", std::process::id()));
+        let out = filter_output(CommandKind::Generic, &raw, Some(&dir));
+        let path = out.tee_path.clone().expect("tee written when windowing");
+        let recovered = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(recovered, raw, "the tee file must hold the exact original bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nothing_is_elided_without_somewhere_to_recover_it_from() {
+        // No tee dir => no elision. A shorter output is not worth an
+        // unrecoverable one.
+        let raw = noise(200);
+        let out = filter_output(CommandKind::Generic, &raw, None);
+        assert_eq!(out.elided_lines, 0);
+    }
+
+    #[test]
+    fn small_output_is_returned_untouched() {
+        let raw = "one\ntwo\nthree";
+        let out = filter_output(CommandKind::Generic, raw, None);
+        assert_eq!(out.text, raw);
+        assert_eq!(out.elided_lines, 0);
+        assert_eq!(out.dropped_lines, 0);
+    }
+
+    #[test]
+    fn the_verdict_at_the_end_survives() {
+        // Summaries live last; windowing must never cost the result line.
+        let mut raw = noise(120);
+        raw.push_str("\ntest result: FAILED. 3 passed; 1 failed\n");
+        let dir = std::env::temp_dir().join(format!("tf_win3_{}", std::process::id()));
+        let out = filter_output(CommandKind::Generic, &raw, Some(&dir));
+        assert!(out.text.contains("test result: FAILED"), "got:\n{}", out.text);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

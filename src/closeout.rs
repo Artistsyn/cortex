@@ -83,6 +83,11 @@ pub fn run_closeout(
         for marker in &markers {
             match commit_marker(store, session_key, marker, prefs_path) {
                 Ok(committed) => {
+                    // Log it either way: a marker that turned out to be a
+                    // duplicate was still produced by this session, and the
+                    // capture metric is about what the agent emitted.
+                    // `promoted` is what distinguishes new from already-known.
+                    let _ = record_marker(store, session_key, marker, committed);
                     if committed {
                         match marker {
                             KnowledgeMarker::Pattern { .. }        => result.patterns_committed += 1,
@@ -95,6 +100,9 @@ pub fn run_closeout(
                     }
                 }
                 Err(e) => {
+                    // Emitted but did not land — log it unpromoted so the
+                    // session is not silently credited with zero output.
+                    let _ = record_marker(store, session_key, marker, false);
                     eprintln!("[closeout] warn: failed to commit marker: {e}");
                 }
             }
@@ -480,6 +488,27 @@ fn mark_promoted_nonfatal(store: &Store, session_key: &str, marker_type: &str, n
 // ── Stage a marker for later review ──────────────────────────────────────────
 
 fn stage_marker(store: &Store, session_key: &str, marker: &KnowledgeMarker) -> Result<()> {
+    record_marker(store, session_key, marker, false)
+}
+
+/// Log a marker to `knowledge_markers` — the record of what this session
+/// actually produced.
+///
+/// Every marker is logged, on BOTH closeout paths. `promoted` says whether it
+/// also landed in its destination table (patterns / anti_patterns / adrs /
+/// prefs) rather than waiting for review.
+///
+/// This exists because the inline-approve path used to commit markers straight
+/// to their destination tables and never write here, so the scoreboard's
+/// marker-capture metric — which reads this table — counted zero for every
+/// session that was successfully closed with KNOWLEDGE COMMITTED. The metric
+/// was measuring un-committed knowledge, which is backwards.
+fn record_marker(
+    store: &Store,
+    session_key: &str,
+    marker: &KnowledgeMarker,
+    promoted: bool,
+) -> Result<()> {
     let body = marker_body(marker);
     let name = marker.display_name();
     let tags = marker_tags_json(marker);
@@ -491,8 +520,9 @@ fn stage_marker(store: &Store, session_key: &str, marker: &KnowledgeMarker) -> R
     store.conn().execute(
         "INSERT INTO knowledge_markers
              (session_key, marker_type, name, body, tags, trust_level, raw_tag, promoted)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', 0)",
-        params![session_key, marker.marker_type(), name, body, tags, trust],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, '', ?7)",
+        params![session_key, marker.marker_type(), name, body, tags, trust,
+                if promoted { 1 } else { 0 }],
     )?;
     Ok(())
 }
@@ -802,6 +832,75 @@ correct: y[/CORTEX-AP]
         let n2: i64 = store.conn().query_row(
             "SELECT COUNT(*) FROM patterns WHERE name = 'test-pattern-count'", [], |r| r.get(0)).unwrap();
         assert_eq!(n2, 1, "no duplicate rows");
+    }
+
+    /// A session closed with KNOWLEDGE COMMITTED must show up in the capture
+    /// metric.
+    ///
+    /// The inline-approve path used to commit markers straight to patterns /
+    /// anti_patterns / adrs and never touch `knowledge_markers`, which is the
+    /// table the scoreboard counts. Every successful closeout therefore scored
+    /// zero markers, so the metric reported the opposite of what it claimed:
+    /// the only sessions it credited were the ones left un-approved.
+    #[test]
+    fn committing_knowledge_is_not_recorded_as_capturing_none() {
+        let store = test_store("inline_capture");
+        let repo_root = std::env::temp_dir().join("cx_inline_capture");
+        let _ = std::fs::create_dir_all(&repo_root);
+        let markers_text = concat!(
+            "[CORTEX-PATTERN: name=\"inline-p\" intent=\"i\" trust=\"verified\" uses=\"\"]b[/CORTEX-PATTERN]\n",
+            "[CORTEX-AP: description=\"inline-ap\" tags=\"t\"]wrong: x\ncorrect: y[/CORTEX-AP]",
+        );
+
+        let result = run_closeout(
+            &store, "s-inline", "build_pass", None, None,
+            true, &repo_root, None, Some(markers_text),
+        ).unwrap();
+        assert_eq!(result.patterns_committed, 1);
+        assert_eq!(result.anti_patterns_committed, 1);
+
+        // This is the assertion that would have failed before the fix.
+        let logged: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM knowledge_markers WHERE session_key = 's-inline'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(logged, 2,
+            "markers committed inline must still be logged for the capture metric");
+
+        // And they must be marked as having landed, not merely staged.
+        let promoted: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM knowledge_markers \
+             WHERE session_key = 's-inline' AND promoted = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(promoted, 2, "committed markers must be flagged promoted");
+
+        let _ = std::fs::remove_dir_all(&repo_root);
+    }
+
+    /// A re-run whose markers are all duplicates still produced work, but
+    /// nothing new landed — the log must be able to tell those apart.
+    #[test]
+    fn a_duplicate_marker_is_logged_but_not_flagged_as_landed() {
+        let store = test_store("dup_capture");
+        let repo_root = std::env::temp_dir().join("cx_dup_capture");
+        let _ = std::fs::create_dir_all(&repo_root);
+        let markers_text =
+            "[CORTEX-PATTERN: name=\"dup-p\" intent=\"i\" trust=\"verified\" uses=\"\"]b[/CORTEX-PATTERN]";
+
+        for key in ["s-dup-1", "s-dup-2"] {
+            run_closeout(&store, key, "build_pass", None, None,
+                         true, &repo_root, None, Some(markers_text)).unwrap();
+        }
+
+        let second_logged: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM knowledge_markers WHERE session_key = 's-dup-2'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(second_logged, 1, "the second session still emitted a marker");
+
+        let second_promoted: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM knowledge_markers \
+             WHERE session_key = 's-dup-2' AND promoted = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(second_promoted, 0, "a duplicate did not land, so it is not promoted");
+
+        let _ = std::fs::remove_dir_all(&repo_root);
     }
 
     /// mark_promoted must be valid SQL on stock SQLite (no UPDATE ... LIMIT).

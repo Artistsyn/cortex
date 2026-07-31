@@ -430,14 +430,24 @@ fn tools_list() -> Value {
                 "name": "list_patterns",
                 "description": "List all approved code patterns with their intents. \
                                 Includes use/revert/survival metrics and flags patterns below 40% survival. \
-                                Check this before implementing any non-trivial logic.",
+                                Check this before implementing any non-trivial logic. Every pattern is \
+                                always listed; pass `hint` describing the task to get body text for the \
+                                ones that apply.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "detail": {
                             "type": "string",
-                            "description": "Output detail tier (default: standard).",
+                            "description": "Output detail tier (default: summary). Every pattern is \
+                                            always listed with its intent and survival rate; the tier \
+                                            controls how much body text comes with it.",
                             "enum": ["summary", "standard", "full"]
+                        },
+                        "hint": {
+                            "type": "string",
+                            "description": "What you are about to write. Patterns matching this are \
+                                            expanded to include their body preview, so the ones \
+                                            relevant to the task arrive complete."
                         }
                     }
                 }
@@ -445,8 +455,28 @@ fn tools_list() -> Value {
             {
                 "name": "get_anti_patterns",
                 "description": "Get all known anti-patterns — things Copilot must NOT do. \
-                                Always check this before generating code.",
-                "inputSchema": { "type": "object", "properties": {} }
+                                Always check this before generating code. Every anti-pattern \
+                                is always listed; `detail` controls whether the remedy text \
+                                comes with it. Pass `hint` describing the task to get the \
+                                full wrong/correct text for the ones that apply.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "detail": {
+                            "type": "string",
+                            "enum": ["index", "full"],
+                            "description": "index (default): every anti-pattern's description, \
+                                            plus full remedy text for any matching `hint`. \
+                                            full: complete wrong/correct text for all of them."
+                        },
+                        "hint": {
+                            "type": "string",
+                            "description": "What you are about to write, e.g. 'spawn pooled \
+                                            enemy with gravity'. Anti-patterns matching this \
+                                            are expanded to full remedy text."
+                        }
+                    }
+                }
             },
             {
                 "name": "suggest_pattern",

@@ -111,11 +111,24 @@ pub fn run_gates(
     }
 
     // Gate 3: Credibility filter for skill/pref proposals.
+    // When the evidence carries session_keys, credibility is COMPUTED from the
+    // DB (build_pass fraction of the cited sessions) — an evidence-supplied
+    // number alone is never trusted. Without session_keys, fall back to the
+    // evidence value (gap proposals have no session backing; the trial gate
+    // covers those instead).
     if proposal_type == "skill" || proposal_type == "pref_note" {
-        let credibility = evidence.get("credibility")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0) as f32;
-        let min_cred = 0.2f32; // at least 2/10 session uses to be credible
+        let credibility = match evidence.get("session_keys").and_then(|v| v.as_array()) {
+            Some(keys) => {
+                let keys: Vec<String> = keys.iter()
+                    .filter_map(|k| k.as_str().map(String::from))
+                    .collect();
+                compute_credibility(store, &keys)
+            }
+            None => evidence.get("credibility")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32,
+        };
+        let min_cred = 0.2f32; // at least 2/10 cited sessions passing to be credible
         let ok = credibility >= min_cred;
         signals.credibility_ok = Some(ok);
         if !ok {

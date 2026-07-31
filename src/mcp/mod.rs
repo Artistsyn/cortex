@@ -37,6 +37,8 @@ const UNCACHEABLE: &[&str] = &[
     "flush_knowledge_markers",
     "closeout_session",
     "propose_skill",
+    // Output varies per call (live command output) — never cache.
+    "compact_output",
 ];
 
 pub fn serve(
@@ -509,11 +511,20 @@ fn tools_list() -> Value {
             },
             {
                 "name": "flush_knowledge_markers",
-                "description": "Scan recent VS Code session turns for CORTEX-* knowledge markers and stage them \
-                                in the Cortex DB. Markers are STAGED but not committed until closeout_session \
-                                is called with inline_approve=true. Call this before closeout or \
-                                any time you've written markers you want captured.",
-                "inputSchema": { "type": "object", "properties": {} }
+                "description": "Stage CORTEX-* knowledge markers into the Cortex DB. \
+                                Pass `text` containing your markers (required on Claude Code / Continue / CLI; \
+                                on VS Code it falls back to scraping the Copilot session store if `text` is omitted). \
+                                Markers are STAGED but not committed until closeout_session is called with \
+                                inline_approve=true. Call this any time you've written markers you want captured.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "text": {
+                            "type": "string",
+                            "description": "Text containing your [CORTEX-*] markers. On non-VS-Code hosts this is required."
+                        }
+                    }
+                }
             },
             {
                 "name": "closeout_session",
@@ -533,25 +544,49 @@ fn tools_list() -> Value {
                             "description": "true = immediately commit all session knowledge. Use ONLY when user typed KNOWLEDGE COMMITTED."
                         },
                         "error_text":   { "type": "string", "description": "Optional error context if failure." },
-                        "diff_symbols": { "type": "string", "description": "Optional comma-separated symbols changed." }
+                        "diff_symbols": { "type": "string", "description": "Optional comma-separated symbols changed." },
+                        "markers_text": { "type": "string", "description": "Text containing your [CORTEX-*] markers to commit/stage. Required on Claude Code / Continue / CLI (VS Code falls back to session-store scraping if omitted)." }
                     },
                     "required": ["outcome_type"]
                 }
             },
             {
                 "name": "propose_skill",
-                "description": "Propose a new skill file based on a workflow you've been executing. \
-                                Use when you notice you're following the same multi-step procedure \
-                                across multiple requests. Writes a draft to .cortex/proposals/ for review.",
+                "description": "Author a new skill from a workflow you've been executing. YOU write the \
+                                content: pass a complete, concrete `procedure` (markdown allowed — numbered \
+                                steps, exact tool calls, API names, pitfalls you hit) drawn from your actual \
+                                session experience. Your text is preserved verbatim in the draft. Use when \
+                                closeout reports a skill-authoring opportunity, or whenever you notice a \
+                                repeatable multi-step workflow. Writes a draft to .cortex/proposals/ for \
+                                human approval via skill-approve.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "name":      { "type": "string", "description": "Short kebab-case skill name." },
-                        "trigger":   { "type": "string", "description": "Conditions that should invoke this skill." },
-                        "procedure": { "type": "string", "description": "Ordered steps the skill performs." },
+                        "trigger":   { "type": "string", "description": "When to invoke this skill (one bullet per line)." },
+                        "procedure": { "type": "string", "description": "The full procedure in markdown — real steps from your experience, not placeholders. Include exact tool calls, argument shapes, and known pitfalls." },
+                        "when_not_to_use": { "type": "string", "description": "When NOT to use this skill (one bullet per line)." },
                         "tools":     { "type": "string", "description": "Comma-separated tool names used." }
                     },
                     "required": ["name", "procedure"]
+                }
+            },
+            {
+                "name": "compact_output",
+                "description": "Losslessly compact command output. Pass the command plus its stdout \
+                                and stderr; returns the same output with only provably-redundant lines \
+                                removed (build/download progress, per-test `... ok` lines == cargo -q, \
+                                duplicate lines). Every error, warning, note, panic, and failure block is \
+                                kept verbatim with its file:line. The full original is saved to .cortex/tee/ \
+                                whenever anything is dropped. Does not execute anything.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "command": { "type": "string", "description": "The command that produced the output (used to pick the filter)." },
+                        "stdout":  { "type": "string", "description": "The command's stdout stream." },
+                        "stderr":  { "type": "string", "description": "The command's stderr stream (cargo/rustc write diagnostics here)." }
+                    },
+                    "required": ["command"]
                 }
             }
         ]

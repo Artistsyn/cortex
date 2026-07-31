@@ -28,7 +28,7 @@ pub fn dispatch(
         "get_syntax"           => tool_get_syntax(args, store, units, session_id),
         "get_usage_examples"   => tool_get_usage_examples(args, store, units, session_id),
         "get_helper"           => tool_get_helper(args, store, units, session_id),
-        "get_context"          => tool_get_context(args, store, units, repo_root, prefs_summary),
+        "get_context"          => tool_get_context(args, store, units, repo_root, prefs_summary, session_id),
         "get_delta"            => tool_get_delta(args, repo_root),
         "query_graph"          => tool_query_graph(args, store, session_id),
         "explain_dependency_path" => tool_explain_dependency_path(args, store),
@@ -44,14 +44,82 @@ pub fn dispatch(
         "begin_protocol_session" => tool_begin_protocol_session(args, store, session_id),
         "get_session_health"     => tool_get_session_health(store, session_id),
         // Phase 0C/0D: knowledge capture tools.
-        "flush_knowledge_markers" => tool_flush_knowledge_markers(store, session_id, repo_root),
+        "flush_knowledge_markers" => tool_flush_knowledge_markers(args, store, session_id, repo_root),
         "closeout_session"        => tool_closeout_session(args, store, session_id, repo_root),
         // Phase 1: skill proposal tool.
         "propose_skill"           => tool_propose_skill(args, store, session_id, repo_root),
+        // Lossless output compaction: post-processes output the agent already
+        // obtained through the normal (permissioned) Bash path. No execution.
+        "compact_output"          => tool_compact_output(args, store, session_id, repo_root),
         other                  => Err(format!("unknown tool: {other}")),
     }?;
 
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+}
+
+// ── compact_output ──────────────────────────────────────────────────────────
+//
+// Lossless compaction of command output. The agent (or a PostToolUse hook)
+// hands us the command plus its stdout/stderr; we strip only provably-redundant
+// content (build/download progress, per-test `... ok` lines, duplicate lines)
+// and return the compacted text, tee'ing the full original to `.cortex/tee/`
+// whenever anything was dropped. Every diagnostic is preserved verbatim.
+//
+// This tool never executes anything — it only reformats text the caller already
+// obtained, so it adds no execution surface and cannot bypass permissions.
+fn tool_compact_output(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+    repo_root: &Path,
+) -> Result<String, String> {
+    let command = args["command"].as_str().ok_or("missing `command`")?;
+    let stdout = args.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+    let stderr = args.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+    // Some callers may still pass a single combined `output`; accept it too.
+    let combined_fallback = args.get("output").and_then(|v| v.as_str()).unwrap_or("");
+
+    // cargo/rustc write diagnostics to STDERR and test results to STDOUT, so we
+    // must consider both streams — an stdout-only filter would miss every error.
+    let raw: String = match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("{stdout}\n{stderr}"),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (true, true) => combined_fallback.to_string(),
+    };
+
+    if raw.is_empty() {
+        return Ok(String::new());
+    }
+
+    let kind = crate::output_filter::detect_command(command);
+    let tee_dir = repo_root.join(".cortex").join("tee");
+    let filtered = crate::output_filter::filter_output(kind, &raw, Some(&tee_dir));
+
+    // Server-side observability (stderr → server log, never shown to the model).
+    if filtered.dropped_lines > 0 {
+        eprintln!(
+            "[cortex] compact_output: {} → {} chars, {} redundant line(s) removed (lossless={}){}",
+            filtered.original_chars,
+            filtered.filtered_chars,
+            filtered.dropped_lines,
+            filtered.lossless,
+            match &filtered.tee_path {
+                Some(p) => format!(", full log: {}", p.display()),
+                None => String::new(),
+            }
+        );
+    }
+
+    // Telemetry: record the saving (non-fatal — never break the tool over it).
+    let _ = store.log_compression_saving(
+        session_id,
+        command,
+        filtered.original_chars,
+        filtered.filtered_chars,
+    );
+
+    Ok(filtered.text)
 }
 
 // ── semantic_search ───────────────────────────────────────────────────────────
@@ -414,6 +482,7 @@ fn tool_get_context(
     units: &[CodeUnit],
     repo_root: &Path,
     prefs_summary: &str,
+    session_id: &str,
 ) -> Result<String, String> {
     let hint = args["hint"].as_str().ok_or("missing `hint`")?;
     let budget = args["token_budget"].as_u64().unwrap_or(2000) as usize;
@@ -445,6 +514,15 @@ fn tool_get_context(
         return Ok(format!(
             "No context found for `{hint}`. Run `cortex index` if the index is empty."
         ));
+    }
+
+    // Targeted-retrieval telemetry: these patterns were surfaced by relevance
+    // to the task hint — closeout joins them with the session outcome to keep
+    // survival_rate honest.
+    for p in &packet.patterns {
+        if let Some(id) = p.id {
+            let _ = store.log_session_retrieval(session_id, "patterns", id, "get_context");
+        }
     }
 
     let mut out = String::new();
@@ -1263,7 +1341,7 @@ fn tool_get_session_health(
     let pending_proposals = crate::protocol::pending_proposal_count(store.conn())
         .unwrap_or(0);
 
-    crate::protocol::status_report(
+    let mut report = crate::protocol::status_report(
         store.conn(),
         session_id,
         pending_obs,
@@ -1271,36 +1349,55 @@ fn tool_get_session_health(
         &gaps,
         &health,
         pending_proposals,
-    ).map_err(|e| e.to_string())
+    ).map_err(|e| e.to_string())?;
+
+    // Self-learning trend line — agents see whether the system is actually
+    // improving, every session.
+    report.push('\n');
+    report.push_str(&crate::scoreboard::compact_line(store));
+    Ok(report)
 }
 
 // ── Phase 0C/0D: knowledge capture tools ─────────────────────────────────────
 
-/// flush_knowledge_markers — scan VS Code session store, extract CORTEX-* tags, stage them.
+/// flush_knowledge_markers — stage CORTEX-* tags into the DB.
+///
+/// Preferred (platform-independent) path: the agent passes `text` containing its own
+/// markers. Fallback path: scrape the VS Code Copilot session store. The fallback only
+/// works inside VS Code; every other host (Claude Code, Continue, CLI) MUST pass `text`.
 fn tool_flush_knowledge_markers(
+    args: &Value,
     store: &Store,
     session_id: &str,
-    repo_root: &Path,
+    _repo_root: &Path,
 ) -> Result<String, String> {
-    let store_path = crate::session_store::find_session_store();
-    let Some(path) = store_path else {
-        return Ok("VS Code session store not found. Ensure VS Code is installed and has been used. No markers extracted.".to_string());
+    // Priority 1: markers supplied directly by the agent — works on any host.
+    let direct_text = args.get("text").and_then(|v| v.as_str()).map(str::trim);
+
+    let all_text = match direct_text.filter(|t| !t.is_empty()) {
+        Some(text) => text.to_string(),
+        None => {
+            // Priority 2: VS Code Copilot session store (VS Code-only).
+            let Some(path) = crate::session_store::find_session_store() else {
+                return Ok("No `text` provided and VS Code session store not found. \
+                    Pass the text containing your CORTEX-* markers as the `text` argument \
+                    (required on Claude Code / Continue / CLI). No markers extracted.".to_string());
+            };
+            let conn = crate::session_store::open_readonly(&path)
+                .map_err(|e| e.to_string())?;
+            let responses = crate::session_store::recent_assistant_responses(&conn, 60)
+                .unwrap_or_default();
+            if responses.is_empty() {
+                return Ok("No `text` provided and no recent assistant responses in the VS Code session store. No markers extracted.".to_string());
+            }
+            responses.join("\n\n---\n\n")
+        }
     };
 
-    let conn = crate::session_store::open_readonly(&path)
-        .map_err(|e| e.to_string())?;
-    let responses = crate::session_store::recent_assistant_responses(&conn, 60)
-        .unwrap_or_default();
-
-    if responses.is_empty() {
-        return Ok("No recent assistant responses found in session store. No markers extracted.".to_string());
-    }
-
-    let all_text = responses.join("\n\n---\n\n");
     let parsed = crate::markers::parse_markers(&all_text);
 
     if parsed.is_empty() {
-        return Ok("No CORTEX-* markers found in recent responses. Write markers like [CORTEX-PATTERN: ...] to capture knowledge.".to_string());
+        return Ok("No CORTEX-* markers found. Write markers like [CORTEX-PATTERN: name=\"...\" ...]body[/CORTEX-PATTERN] and pass them as `text` to capture knowledge.".to_string());
     }
 
     let mut staged = 0usize;
@@ -1357,6 +1454,9 @@ fn tool_closeout_session(
         .unwrap_or(false);
     let error_text   = args.get("error_text").and_then(|v| v.as_str());
     let diff_symbols = args.get("diff_symbols").and_then(|v| v.as_str());
+    // Platform-independent capture: the agent passes the text containing its own
+    // CORTEX-* markers. Falls back to host chat-store scraping when absent.
+    let markers_text = args.get("markers_text").and_then(|v| v.as_str());
 
     // Determine prefs path from repo_root.
     let prefs_path = repo_root.join(".cortex").join("prefs.toml");
@@ -1371,6 +1471,7 @@ fn tool_closeout_session(
         inline_approve,
         repo_root,
         prefs_path_opt,
+        markers_text,
     ).map_err(|e| e.to_string())?;
 
     // Build response.
@@ -1400,15 +1501,56 @@ fn tool_closeout_session(
 
     out.push_str(&format!("\nOutcome logged: {} ({})\n", outcome_type,
         if result.outcome_logged { "✓" } else { "failed" }));
+    if result.patterns_scored > 0 {
+        out.push_str(&format!(
+            "Survival telemetry: {} pattern(s) scored from this session's retrievals × outcome\n",
+            result.patterns_scored));
+    }
 
     if result.graph_snapshot_written {
         out.push_str("Graph snapshot: ✓ written\n");
+    } else {
+        // Absence used to be silent, so a snapshot that never happened looked
+        // identical to one that did. Say so.
+        out.push_str("Graph snapshot: — not written\n");
+    }
+    // Anything the closeout skipped or repaired, in words. A skipped step that
+    // reports nothing is indistinguishable from a step that ran.
+    for note in &result.notes {
+        out.push_str(&format!("  note: {note}\n"));
     }
     if result.session_snapshot_written {
         out.push_str("Session snapshot: ✓ written to .cortex/mined-tasks/\n");
     }
     if result.mirror_written {
         out.push_str("Mirror: ✓ written to .agent-memory/mirrors/repo/\n");
+    }
+
+    // ── Skill-authoring opportunity ───────────────────────────────────────────
+    // Surface undrafted candidates NOW, while the agent still has the session
+    // in context — it is the only party that can write a skill worth loading.
+    let min_occ = crate::prefs::load(&prefs_path)
+        .map(|p| p.consolidation.skill_candidate_min_occurrences as i64)
+        .unwrap_or(3);
+    let candidates: Vec<(String, i64, f64)> = store.conn().prepare(
+        "SELECT name, occurrence_count, confidence FROM skill_candidates
+         WHERE status = 'candidate' AND draft_path IS NULL AND occurrence_count >= ?1
+         ORDER BY occurrence_count DESC LIMIT 2")
+        .and_then(|mut stmt| {
+            let rows = stmt.query_map(rusqlite::params![min_occ], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, f64>(2)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap_or_default();
+
+    for (name, occ, conf) in &candidates {
+        out.push_str(&format!(
+            "\n⚡ SKILL-AUTHORING OPPORTUNITY: '{}' recurred across {} sessions ({:.0}% pass). \
+             You are the author — call propose_skill(name=\"{}\", trigger=..., procedure=<the real \
+             step-by-step workflow from your experience, with exact tool calls and pitfalls>). \
+             Your text is preserved verbatim.\n",
+            name, occ, conf * 100.0, name));
     }
 
     Ok(out)
@@ -1420,12 +1562,13 @@ fn tool_closeout_session(
 fn tool_propose_skill(
     args: &Value,
     store: &Store,
-    _session_id: &str,
+    session_id: &str,
     repo_root: &Path,
 ) -> Result<String, String> {
     let name      = args["name"].as_str().ok_or("missing `name`")?;
     let trigger   = args.get("trigger").and_then(|v| v.as_str()).unwrap_or("");
     let procedure = args["procedure"].as_str().ok_or("missing `procedure`")?;
+    let when_not  = args.get("when_not_to_use").and_then(|v| v.as_str()).unwrap_or("");
     let tools_str = args.get("tools").and_then(|v| v.as_str()).unwrap_or("");
 
     let tool_sequence: Vec<String> = if tools_str.is_empty() {
@@ -1440,19 +1583,21 @@ fn tool_propose_skill(
         .map(|p| p.skills.skills_dir)
         .unwrap_or_else(|_| "agent_customization/skills".to_string());
 
-    let confidence = 0.8f32; // agent-proposed; assume high until evidence says otherwise
-
-    match crate::skills::draft_skill_file(
-        name, &tool_sequence, 1, confidence, &proposals_dir, &skills_dir,
+    // Write the agent's OWN authored content — never the placeholder template.
+    // (A prior version silently discarded `procedure`; see anti-patterns.)
+    match crate::skills::write_authored_skill_file(
+        name, trigger, procedure, when_not, &tool_sequence, &proposals_dir, &skills_dir,
     ) {
         Ok(path) => {
+            let _ = crate::skills::upsert_agent_candidate(
+                store, name, trigger, session_id, &tool_sequence);
             let _ = crate::skills::set_skill_draft_path(store, name, &path);
             Ok(format!(
-                "Skill draft written: {path}\n\
+                "✓ Agent-authored skill draft written: {path}\n\
                  Name: {name}\n\
                  Trigger: {trigger}\n\
-                 To publish: cortex.ps1 skill-approve {name}\n\
-                 The draft is in .cortex/proposals/ — review and edit before approving."
+                 Your procedure text was preserved verbatim in the draft.\n\
+                 To publish: cortex.ps1 skill-approve {name}"
             ))
         }
         Err(e) => Err(format!("failed to draft skill '{name}': {e}")),

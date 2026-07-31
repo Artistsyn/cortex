@@ -216,34 +216,80 @@ pub fn run(
                     &crate::graph_diff::drift_report_to_json(&report),
                 )?);
 
-                // Generate drift-based proposals for high-drift communities.
+                // Generate ONE drift digest proposal per pipeline run instead of one
+                // proposal per community. A whole-graph rebuild after a stale period
+                // makes virtually every community "drift" — the per-community version
+                // once flooded the review funnel with 1300+ ungated pending proposals.
                 let weights = crate::graph_diff::compute_community_weights(&report);
-                for w in &weights {
-                    if w.priority_boost >= 2.0 {
-                        // Stage a proposal flagging this community.
+                let mut hot: Vec<&crate::graph_diff::CommunityWeight> = weights.iter()
+                    .filter(|w| w.priority_boost >= 2.0)
+                    .collect();
+                hot.sort_by(|a, b| b.drift_score.partial_cmp(&a.drift_score)
+                    .unwrap_or(std::cmp::Ordering::Equal));
+
+                if !hot.is_empty() {
+                    // Cap: never allow drift digests to pile up unreviewed.
+                    let pending_drift: i64 = store.conn().query_row(
+                        "SELECT COUNT(*) FROM proposals
+                         WHERE proposal_type = 'drift_flag' AND status IN ('pending','trial')",
+                        [], |r| r.get(0),
+                    ).unwrap_or(0);
+
+                    if pending_drift >= 3 {
+                        eprintln!("[consolidator] drift: {} digests already pending — skipping new digest (review or reject them first)", pending_drift);
+                    } else {
+                        let top: Vec<_> = hot.iter().take(10).collect();
+                        // Hash over the top community ids+scores: identical drift across
+                        // runs dedups via the duplicate gate; changed drift stages fresh.
+                        let hash_src: String = top.iter()
+                            .map(|w| format!("{}:{:.2}", w.community_id, w.drift_score))
+                            .collect::<Vec<_>>().join(",");
                         let content_hash = format!("{:x}", simple_hash(
-                            format!("drift:comm:{}", w.community_id).as_bytes()
+                            format!("drift-digest:{hash_src}").as_bytes()
                         ));
+
+                        let lines: Vec<String> = top.iter()
+                            .map(|w| format!("community {} (drift {:.2})", w.community_id, w.drift_score))
+                            .collect();
                         let proposed_text = format!(
-                            "Community {} has drift score {:.2} — review for architectural attention",
-                            w.community_id, w.drift_score,
+                            "Graph drift digest: {} communities show significant drift. Top: {}. \
+                             Review these areas for stale patterns/ADRs and rebuild-related churn.",
+                            hot.len(), lines.join("; "),
                         );
                         let evidence = json!({
                             "source": "graph_drift",
-                            "community_id": w.community_id,
-                            "drift_score": w.drift_score,
-                            "priority_boost": w.priority_boost,
+                            "high_drift_count": hot.len(),
+                            "top_communities": top.iter().map(|w| json!({
+                                "community_id": w.community_id,
+                                "drift_score": w.drift_score,
+                            })).collect::<Vec<_>>(),
                         });
-                        let _ = store.conn().execute(
-                            "INSERT OR IGNORE INTO proposals
-                             (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
-                             VALUES ('drift_flag', ?1, '.graphify-output/graph.json', ?2, ?3, 'pending', ?4)",
-                            rusqlite::params![
-                                content_hash, proposed_text,
-                                evidence.to_string(), serde_json::to_string(&json!({"gate":"drift_analysis"})).unwrap_or_default(),
-                            ],
+
+                        // Route through the same deterministic gates as every other proposal.
+                        let (outcome, signals) = verify::run_gates(
+                            store, "drift_flag", &content_hash, &proposed_text, &evidence,
                         );
-                        result.drift_based_proposals += 1;
+                        match outcome {
+                            verify::GateOutcome::Pass => {
+                                let _ = store.conn().execute(
+                                    "INSERT OR IGNORE INTO proposals
+                                     (proposal_type, content_hash, target_file, proposed_text, evidence, status, gate_signals)
+                                     VALUES ('drift_flag', ?1, '.graphify-output/graph.json', ?2, ?3, 'pending', ?4)",
+                                    rusqlite::params![
+                                        content_hash, proposed_text,
+                                        evidence.to_string(), signals.to_json(),
+                                    ],
+                                );
+                                result.drift_based_proposals += 1;
+                            }
+                            verify::GateOutcome::Reject(reason) => {
+                                verify::log_rejection(
+                                    &rejected_log, "drift_flag", &content_hash,
+                                    &proposed_text, &reason, &signals,
+                                );
+                            }
+                            verify::GateOutcome::Trial { .. } => { /* drift digests don't trial */ }
+                        }
                     }
                 }
             }

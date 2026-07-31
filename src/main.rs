@@ -14,10 +14,12 @@ mod mcp;
 mod meta;
 mod miner;
 mod model;
+mod output_filter;
 mod planner;
 mod prefs;
 mod protocol;
 mod reasoner;
+mod scoreboard;
 mod search;
 mod session_store;
 mod skills;
@@ -245,11 +247,52 @@ enum Command {
         name: String,
     },
 
+    /// Approve a pending proposal by id (as shown by review-proposals).
+    ///
+    /// `review-proposals` is interactive, which is no use from a script or an
+    /// agent, and it printed instructions for these two subcommands before they
+    /// existed. Now they do.
+    ProposalApprove {
+        /// Proposal id.
+        id: i64,
+    },
+
+    /// Reject a pending proposal by id.
+    ProposalReject {
+        /// Proposal id.
+        id: i64,
+        /// Optional one-line reason, recorded so a later reader knows why.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
     /// Find sessions without a closeout record.
     SessionOrphans,
 
     /// Print a one-line system health report.
     HealthReport,
+
+    /// Self-learning KPI scoreboard: pass rate, gap rate, marker capture,
+    /// pattern reuse, telemetry coverage — each with a trend vs the previous window.
+    Scoreboard {
+        /// Rolling window length in days (compared against the previous window of the same length).
+        #[arg(long, default_value_t = 14)]
+        window_days: u32,
+    },
+
+    /// Install the lossless compact_output hook into Claude Code settings.
+    HooksInit {
+        /// Repo root to write settings to (default: current dir).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Write to the shared, committed .claude/settings.json instead of the
+        /// personal, git-ignored .claude/settings.local.json (default).
+        #[arg(long)]
+        shared: bool,
+        /// Refresh the hook even if an identical one is already present.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -643,8 +686,176 @@ fn main() -> Result<()> {
         Command::SkillStatus                    => run_skill_status(&db_path),
         Command::SkillApprove { name }          => run_skill_approve(&name, &db_path),
         Command::SkillReject { name }           => run_skill_reject(&name, &db_path),
+        Command::ProposalApprove { id }         => run_proposal_decision(id, "approved", None, &db_path),
+        Command::ProposalReject { id, reason }  => {
+            run_proposal_decision(id, "rejected", reason.as_deref(), &db_path)
+        }
         Command::SessionOrphans                 => run_session_orphans(&db_path),
         Command::HealthReport                   => run_health_report(&db_path),
+        Command::Scoreboard { window_days }     => run_scoreboard(&db_path, window_days, format),
+        Command::HooksInit { root, shared, force } => run_hooks_init(root, shared, force),
+    }
+}
+
+fn run_scoreboard(db_path: &Path, window_days: u32, format: OutputFormat) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let sb = scoreboard::compute(&store, window_days)?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&sb)?),
+        OutputFormat::Text => print!("{}", scoreboard::format_text(&sb)),
+    }
+    Ok(())
+}
+
+/// Outcome of an `ensure_compact_hook` call, for honest reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookOutcome {
+    /// The hook was written (file created or the block added/refreshed).
+    Written,
+    /// The hook was already present and identical — nothing changed.
+    AlreadyPresent,
+}
+
+/// Ensure the lossless `compact_output` hook exists in the given Claude Code
+/// settings file (`settings.json` shared, or `settings.local.json` personal).
+///
+/// Passes BOTH `${tool_response.stdout}` and `${tool_response.stderr}` —
+/// cargo/rustc write diagnostics to stderr, so an stdout-only hook would
+/// silently drop every compiler error (the mistake that shipped in
+/// agentmemory#539). Merge-safe (preserves every other key/hook) and idempotent
+/// (replaces an existing cortex compact_output hook rather than duplicating).
+fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutcome> {
+    let claude_dir = root.join(".claude");
+    std::fs::create_dir_all(&claude_dir)
+        .with_context(|| format!("failed to create {}", claude_dir.display()))?;
+    let filename = if local { "settings.local.json" } else { "settings.json" };
+    let settings_path = claude_dir.join(filename);
+
+    let compact_hook = json!({
+        "matcher": "Bash",
+        "hooks": [{
+            "type": "mcp_tool",
+            "server": "cortex",
+            "tool": "compact_output",
+            "input": {
+                "command": "${tool_input.command}",
+                "stdout": "${tool_response.stdout}",
+                "stderr": "${tool_response.stderr}"
+            }
+        }]
+    });
+
+    let mut root_obj: serde_json::Map<String, Value> = if settings_path.exists() {
+        let text = std::fs::read_to_string(&settings_path)
+            .with_context(|| format!("failed to read {}", settings_path.display()))?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON", settings_path.display()))?
+    } else {
+        serde_json::Map::new()
+    };
+
+    let hooks = root_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let hooks_obj = hooks
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("`hooks` in {filename} is not an object"))?;
+    let post = hooks_obj
+        .entry("PostToolUse".to_string())
+        .or_insert_with(|| Value::Array(vec![]));
+    let arr = post
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("`hooks.PostToolUse` in {filename} is not an array"))?;
+
+    let is_compact = |entry: &Value| -> bool {
+        entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("tool").and_then(|t| t.as_str()) == Some("compact_output")
+                    && h.get("server").and_then(|s| s.as_str()) == Some("cortex")
+            })
+        })
+    };
+
+    // Already present and identical → no-op (unless --force refresh requested).
+    let existing = arr.iter().find(|e| is_compact(e));
+    if let Some(existing) = existing {
+        if !force && *existing == compact_hook {
+            return Ok(HookOutcome::AlreadyPresent);
+        }
+    }
+    arr.retain(|e| !is_compact(e));
+    arr.push(compact_hook);
+
+    let rendered = serde_json::to_string_pretty(&Value::Object(root_obj))?;
+    std::fs::write(&settings_path, rendered)
+        .with_context(|| format!("failed to write {}", settings_path.display()))?;
+    Ok(HookOutcome::Written)
+}
+
+fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()> {
+    let root = root.unwrap_or_else(|| PathBuf::from("."));
+    let outcome = ensure_compact_hook(&root, !shared, force)?;
+    let filename = if shared { "settings.json" } else { "settings.local.json" };
+    match outcome {
+        HookOutcome::Written => println!(
+            "Wrote .claude/{filename} — cortex compact_output hook installed on PostToolUse(Bash).\n\
+             It losslessly strips build/test progress noise (stdout + stderr) and tees the full \
+             log to .cortex/tee/. Restart Claude Code (or reload the session) for it to take effect.\n\
+             Note: this is a Claude Code hook. VS Code Copilot cannot auto-rewrite tool output — \
+             it can still call the compact_output MCP tool directly (exposed via .vscode/mcp.json)."
+        ),
+        HookOutcome::AlreadyPresent => {
+            println!("cortex compact_output hook already present in .claude/{filename} — no change.")
+        }
+    }
+    Ok(())
+}
+
+/// True when this process looks like it is running inside Claude Code — either
+/// Claude Code set its entrypoint env var, or the repo already has a `.claude/`
+/// directory (the project has used Claude Code before). Used to decide whether
+/// the serve-time auto-install of the compact_output hook is "applicable".
+fn is_claude_code_context(repo: &Path) -> bool {
+    std::env::var_os("CLAUDECODE").is_some()
+        || std::env::var_os("CLAUDE_CODE_ENTRYPOINT").is_some()
+        || repo.join(".claude").is_dir()
+}
+
+/// Auto-install the compact_output hook the FIRST time cortex serves a Claude
+/// Code project, then never again (a sentinel file records the install). This
+/// makes the token saving automatic for existing projects without a re-bootstrap,
+/// while never re-adding the hook if the user deliberately removes it.
+///
+/// Non-fatal by contract: any failure is logged and serving continues.
+fn auto_install_hook_on_serve(repo: &Path) {
+    // Explicit opt-out for users who don't want cortex touching their config.
+    if std::env::var_os("CORTEX_NO_AUTO_HOOKS").is_some() {
+        return;
+    }
+    if !is_claude_code_context(repo) {
+        return; // Copilot / unknown host — the MCP tool is still available.
+    }
+    let sentinel = repo.join(".cortex").join(".claude-hooks-installed");
+    if sentinel.exists() {
+        return; // Already handled once — respect the user's later edits.
+    }
+    // Personal, git-ignored settings: the hook targets THIS machine's cortex
+    // server, so it must not be committed into a teammate's checkout.
+    match ensure_compact_hook(repo, /* local */ true, /* force */ false) {
+        Ok(outcome) => {
+            let _ = std::fs::create_dir_all(repo.join(".cortex"));
+            let _ = std::fs::write(&sentinel, chrono::Utc::now().to_rfc3339());
+            match outcome {
+                HookOutcome::Written => eprintln!(
+                    "  hooks: installed compact_output into .claude/settings.local.json \
+                     (lossless output compaction; active next Claude Code session)"
+                ),
+                HookOutcome::AlreadyPresent => eprintln!(
+                    "  hooks: compact_output already configured; recorded install sentinel"
+                ),
+            }
+        }
+        Err(e) => eprintln!("  hooks: auto-install skipped ({e})"),
     }
 }
 
@@ -2003,6 +2214,9 @@ fn run_serve(args: ServeArgs, db_path: &Path) -> Result<()> {
     let prefs_summary = prefs::render_for_copilot(&prefs);
 
     eprintln!("  {} units loaded — listening on stdio", units.len());
+    // Automatic, install-once setup of the lossless compaction hook for Claude
+    // Code projects (no-op for Copilot/other hosts and after the first install).
+    auto_install_hook_on_serve(&args.repo);
     mcp::serve(store, units, &args.name, args.repo, prefs_summary)
 }
 
@@ -3683,8 +3897,36 @@ fn run_review_proposals(kind: Option<&str>, db_path: &Path) -> Result<()> {
         return Ok(());
     }
     println!("{}", consolidator2::format_pending_proposals(&proposals));
-    println!("To approve: cortex.exe --db <db> proposal-approve <id>");
-    println!("To reject:  cortex.exe --db <db> proposal-reject <id>");
+    println!("To approve: cortex.exe proposal-approve <id>");
+    println!("To reject:  cortex.exe proposal-reject <id> [--reason \"...\"]");
+    Ok(())
+}
+
+/// Approve or reject one proposal by id, without an interactive prompt.
+///
+/// Reports what the proposal WAS before changing it, so the record of the
+/// decision is legible afterwards, and refuses an id that does not exist rather
+/// than reporting success for a no-op update.
+fn run_proposal_decision(
+    id: i64,
+    status: &str,
+    reason: Option<&str>,
+    db_path: &Path,
+) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let pending = consolidator2::load_pending_proposals(&store)?;
+    let Some(p) = pending.iter().find(|p| p.id == id) else {
+        anyhow::bail!(
+            "no pending proposal with id {id} — run `review-proposals` for the current list"
+        );
+    };
+    let summary: String = p.proposed_text.lines().next().unwrap_or("").chars().take(100).collect();
+    consolidator2::set_proposal_status(&store, id, status)?;
+    println!("[cortex] [{id}] {} → {status}", p.proposal_type);
+    println!("         {summary}");
+    if let Some(r) = reason {
+        println!("         reason: {r}");
+    }
     Ok(())
 }
 
@@ -3720,23 +3962,52 @@ fn run_skill_reject(name: &str, db_path: &Path) -> Result<()> {
 fn run_session_orphans(db_path: &Path) -> Result<()> {
     let store = Store::open(db_path)?;
     let grace = chrono::Utc::now().timestamp() - 7200; // 2h grace period
+
+    // A row is created for the current wall-clock minute on ANY MCP server
+    // start, so every editor reload and every `cortex-reset` mints one. Most
+    // "orphans" are therefore empty rows that never retrieved anything and
+    // never could have produced knowledge — counting them as lost work turns a
+    // real signal into noise, which is how this reached 57 and got ignored.
+    //
+    // Only a session that actually retrieved something had knowledge to lose.
     let mut stmt = store.conn().prepare(
-        "SELECT session_key, started_at FROM protocol_sessions
+        "SELECT session_key, started_at,
+                (delta_retrieved + preferences_loaded + anti_patterns_loaded + context_loaded) AS steps,
+                bootstrap_complete
+         FROM protocol_sessions
          WHERE closeout_run = 0 AND started_at < ?1
          ORDER BY started_at DESC"
     )?;
     let rows = stmt.query_map(rusqlite::params![grace], |r| {
-        Ok((r.get::<_,String>(0)?, r.get::<_,i64>(1)?))
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
     })?;
-    let orphans: Vec<_> = rows.filter_map(|r| r.ok()).collect();
-    if orphans.is_empty() {
-        println!("[cortex] No orphaned sessions (all sessions closed within grace period).");
+    let all: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+    let (worked, empty): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, _, steps, _)| *steps > 0);
+
+    if worked.is_empty() {
+        println!("[cortex] No sessions did work without a closeout.");
     } else {
-        println!("[cortex] {} orphaned session(s) without closeout:", orphans.len());
-        for (key, ts) in &orphans {
+        println!(
+            "[cortex] {} session(s) retrieved knowledge but never closed out:",
+            worked.len()
+        );
+        for (key, ts, steps, boot) in &worked {
             let age = (chrono::Utc::now().timestamp() - ts) / 3600;
-            println!("  {} ({} hours ago)", key, age);
+            let b = if *boot == 1 { ", bootstrap complete" } else { "" };
+            println!("  {key} ({age}h ago, {steps}/4 baseline steps{b})");
         }
+    }
+    if !empty.is_empty() {
+        println!(
+            "
+[cortex] {} empty session row(s) ignored — created by an MCP server start              that never retrieved anything. Not lost work.",
+            empty.len()
+        );
     }
     Ok(())
 }
@@ -3749,8 +4020,14 @@ fn run_health_report(db_path: &Path) -> Result<()> {
     let anti_patterns: i64 = store.conn().query_row("SELECT COUNT(*) FROM anti_patterns", [], |r| r.get(0)).unwrap_or(0);
     let pending_obs: i64 = store.conn().query_row("SELECT COUNT(*) FROM pending_observations", [], |r| r.get(0)).unwrap_or(0);
     let pending_proposals: i64 = store.conn().query_row("SELECT COUNT(*) FROM proposals WHERE status='pending'", [], |r| r.get(0)).unwrap_or(0);
+    // Only sessions that actually retrieved something. A row is minted on every
+    // MCP server start, so counting all of them reported 57 "orphans" on a day
+    // with one real session — a number nobody could act on, which is the same
+    // as no number at all.
     let orphans: i64 = store.conn().query_row(
-        "SELECT COUNT(*) FROM protocol_sessions WHERE closeout_run=0 AND started_at < (unixepoch()-7200)",
+        "SELECT COUNT(*) FROM protocol_sessions
+          WHERE closeout_run=0 AND started_at < (unixepoch()-7200)
+            AND (delta_retrieved + preferences_loaded + anti_patterns_loaded + context_loaded) > 0",
         [], |r| r.get(0)
     ).unwrap_or(0);
     let gaps: i64 = store.conn().query_row(
@@ -3763,11 +4040,11 @@ fn run_health_report(db_path: &Path) -> Result<()> {
     println!("  anti-patterns:     {}", anti_patterns);
     println!("  pending review:    {}", pending_obs);
     println!("  pending proposals: {}", pending_proposals);
-    println!("  orphaned sessions: {}", orphans);
+    println!("  unclosed sessions: {} (that did work)", orphans);
     println!("  hot gaps (7d):     {}", gaps);
 
     if low_survival > 0 { println!("  ! {} low-survival patterns — run: cortex.ps1 quality-check", low_survival); }
-    if orphans > 0       { println!("  ! {} orphaned sessions — run: cortex session-orphans", orphans); }
+    if orphans > 0       { println!("  ! {} unclosed session(s) with work in them — run: cortex session-orphans", orphans); }
     if pending_proposals > 0 { println!("  ! {} proposals pending — run: cortex.ps1 review-proposals", pending_proposals); }
     if gaps > 0          { println!("  ! {} hot query gaps — run: cortex.ps1 propose-gaps", gaps); }
     println!("===========================");

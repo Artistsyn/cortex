@@ -431,17 +431,44 @@ pub fn apply_meta_proposal(
                 )?;
             }
         }
-        "meta_instruction" if target.contains("copilot-instructions") => {
-            if !target_path.exists() {
-                return Ok((false, format!("Target file '{}' does not exist.", target_path.display())));
-            }
-            let existing = std::fs::read_to_string(&target_path)?;
-            let note = format!("\n<!-- META {} -->\n<!-- {} -->\n",
+        "meta_instruction" if target.contains("copilot-instructions") || target.contains("CLAUDE.md") => {
+            // Instruction improvements apply to BOTH agent manuals — the files are
+            // maintained as platform twins, and a note only one agent can see is
+            // drift, not learning. Written as visible markdown (a bullet under a
+            // dedicated section), not an HTML comment nobody reads.
+            let twins = [".github/copilot-instructions.md", "CLAUDE.md"];
+            let section = "## Meta-Learned Notes";
+            let bullet = format!(
+                "- {} — {}",
                 Utc::now().format("%Y-%m-%d"),
-                proposed_text.chars().take(200).collect::<String>());
-            diff = format!("+ <!-- META {} -->", Utc::now().format("%Y-%m-%d"));
+                proposed_text.chars().take(300).collect::<String>().replace('\n', " "),
+            );
+
+            let mut applied_to: Vec<String> = Vec::new();
+            for rel in twins {
+                let path = repo_root.join(rel.trim());
+                if !path.exists() { continue; }
+                if !dry_run {
+                    let existing = std::fs::read_to_string(&path)?;
+                    let new_content = if let Some(pos) = existing.find(section) {
+                        // Insert the bullet right after the section heading line.
+                        let insert_at = existing[pos..].find('\n')
+                            .map(|n| pos + n + 1)
+                            .unwrap_or(existing.len());
+                        format!("{}{}\n{}", &existing[..insert_at], bullet, &existing[insert_at..])
+                    } else {
+                        format!("{existing}\n{section}\n\nSelf-tuning notes staged by the cortex meta-analysis loop and human-approved via `cortex meta apply`.\n\n{bullet}\n")
+                    };
+                    std::fs::write(&path, new_content)?;
+                }
+                applied_to.push(rel.trim().to_string());
+            }
+
+            if applied_to.is_empty() {
+                return Ok((false, "Neither instruction file exists — nothing applied.".to_string()));
+            }
+            diff = format!("+ {bullet}\n  (applied to: {})", applied_to.join(", "));
             if !dry_run {
-                std::fs::write(&target_path, format!("{existing}{note}"))?;
                 store.conn().execute(
                     "UPDATE proposals SET status = 'committed', committed_at = unixepoch() WHERE id = ?1",
                     rusqlite::params![proposal_id],

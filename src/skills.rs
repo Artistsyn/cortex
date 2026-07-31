@@ -189,6 +189,113 @@ Review the procedure below, refine as needed, then approve.
     Ok(path.to_string_lossy().to_string())
 }
 
+// ── Agent-authored skill drafts ───────────────────────────────────────────────
+
+/// Write a SKILL.md draft from content the agent actually authored.
+///
+/// Unlike `draft_skill_file` (a placeholder template derived from tool names),
+/// this preserves the agent's own procedure text — written at closeout time
+/// when the full session experience is still in its context window. This is
+/// the real self-authoring path; the template version is only a fallback for
+/// pipeline-detected candidates no agent has authored yet.
+#[allow(clippy::too_many_arguments)]
+pub fn write_authored_skill_file(
+    name: &str,
+    trigger: &str,
+    procedure: &str,
+    when_not_to_use: &str,
+    tool_sequence: &[String],
+    proposals_dir: &Path,
+    skills_dir_hint: &str,
+) -> Result<String> {
+    std::fs::create_dir_all(proposals_dir)?;
+
+    let safe_name = name.replace(['/', '\\', ' '], "-");
+    let filename  = format!("skill_{safe_name}.md");
+    let path      = proposals_dir.join(&filename);
+
+    let trigger_section = if trigger.is_empty() {
+        "- [Edit: describe when to invoke this skill]".to_string()
+    } else {
+        trigger.lines()
+            .map(|l| if l.trim_start().starts_with('-') { l.to_string() } else { format!("- {l}") })
+            .collect::<Vec<_>>().join("\n")
+    };
+    let avoid_section = if when_not_to_use.is_empty() {
+        "- [Edit: describe when NOT to use this skill]".to_string()
+    } else {
+        when_not_to_use.lines()
+            .map(|l| if l.trim_start().starts_with('-') { l.to_string() } else { format!("- {l}") })
+            .collect::<Vec<_>>().join("\n")
+    };
+    let tools_section = if tool_sequence.is_empty() {
+        String::new()
+    } else {
+        format!("\n## Tool Routing Rules\n\n- Tools used: {}\n", tool_sequence.join(", "))
+    };
+
+    let content = format!(
+r#"# {name}
+<!-- Agent-authored via propose_skill | Drafted: {date} -->
+<!-- Review and approve: cortex skill-approve {safe_name} -->
+<!-- Target: {skills_dir_hint}/{safe_name}/SKILL.md -->
+
+## Use This Skill When
+
+{trigger_section}
+
+## Do Not Use This Skill When
+
+{avoid_section}
+
+## Procedure
+
+{procedure}
+{tools_section}
+## Output Contract
+
+- Report outcome with Trust: verified/inferred
+- Write CORTEX-PATTERN or CORTEX-AP markers for any discoveries
+- Call closeout_session at end
+"#,
+        name = name,
+        date = chrono::Utc::now().format("%Y-%m-%d"),
+        safe_name = safe_name,
+        skills_dir_hint = skills_dir_hint,
+        trigger_section = trigger_section,
+        avoid_section = avoid_section,
+        procedure = procedure,
+        tools_section = tools_section,
+    );
+
+    std::fs::write(&path, content)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Ensure a skill candidate row exists for an agent-proposed skill, so the
+/// pipeline tracks it (status/draft_path/usage) like detected candidates.
+pub fn upsert_agent_candidate(
+    store: &Store,
+    name: &str,
+    trigger: &str,
+    session_key: &str,
+    tool_sequence: &[String],
+) -> Result<()> {
+    let seq_json = serde_json::to_string(tool_sequence).unwrap_or_else(|_| "[]".to_string());
+    store.conn().execute(
+        "INSERT INTO skill_candidates
+             (name, trigger_hint, tool_sequence, session_keys, occurrence_count,
+              confidence, status, first_seen_at, last_seen_at)
+         VALUES (?1, ?2, ?3, json_array(?4), 1, 0.8, 'candidate', unixepoch(), unixepoch())
+         ON CONFLICT(name) DO UPDATE SET
+             trigger_hint = CASE WHEN excluded.trigger_hint != '' THEN excluded.trigger_hint
+                                 ELSE skill_candidates.trigger_hint END,
+             last_seen_at = unixepoch()",
+        params![name, trigger, seq_json, session_key],
+    )?;
+    Ok(())
+}
+
 // ── Skill health metrics ──────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]

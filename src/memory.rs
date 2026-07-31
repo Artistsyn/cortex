@@ -33,6 +33,8 @@ notes = [
     "MANDATORY PRE-CODE CHECK (no PROTOCOL required): before writing any factory/tick/spawn/physics function call get_anti_patterns + get_preferences + list_patterns",
     "MANDATORY MID-TASK CORTEX USAGE: after first approach fails call recall <error_keyword> before retrying. After two failed attempts STOP and call recall or semantic_search before a third.",
     "session-end mandatory: when task verified complete, present Task Complete Summary and ask user to type KNOWLEDGE COMMITTED to trigger closeout_session(inline_approve=true)",
+    "compact_output (MCP) losslessly strips only provably-redundant command output (build/download progress, per-test '... ok' lines == cargo -q, duplicate lines). Every error/warning/panic/failure is kept verbatim with its file:line, and the full original is tee'd to .cortex/tee/. It is post-processing of output you ALREADY ran — it is NOT a replacement for reading files or seeing diagnostics, and it never drops actionable content.",
+    "Claude Code: the compact_output PostToolUse(Bash) hook AUTO-INSTALLS on the first cortex serve of a Claude Code project (into .claude/settings.local.json — personal/git-ignored, install-once via a .cortex/.claude-hooks-installed sentinel; removing the hook is respected and not re-added). Set CORTEX_NO_AUTO_HOOKS=1 to disable, or run 'cortex hooks-init --shared' to commit it for teammates. VS Code Copilot has NO output-rewriting hook mechanism — it cannot auto-compact; call the compact_output MCP tool directly instead (it is exposed via .vscode/mcp.json).",
 ]
 
 [enforcement]
@@ -190,6 +192,11 @@ impl Store {
                 "MCP: list_all",
                 "Params: kind str optional enum/struct/trait/fn/type/const. Lists all indexed units filtered by kind, grouped by kind. Good for discovery when you don't know a type name. kind='enum' shows all enums. kind='struct' shows all structs. Includes scoped units (e.g. synful::) when indexed.",
                 &["cortex", "mcp", "tools", "list_all"],
+            ),
+            (
+                "MCP: compact_output",
+                "Params: command str required, stdout str optional, stderr str optional. LOSSLESS command-output compaction: removes only provably-redundant lines (cargo build/download progress, per-test '... ok' lines == cargo -q, consecutive duplicate lines) and keeps EVERY error/warning/note/panic/failure verbatim with file:line. Full original tee'd to .cortex/tee/ whenever anything is dropped. Pass BOTH stdout and stderr — cargo/rustc write diagnostics to stderr. Does not execute anything (pure post-processing). Below ~800 chars it returns input untouched. Install as an automatic PostToolUse(Bash) hook via 'cortex hooks-init'.",
+                &["cortex", "mcp", "tools", "compression"],
             ),
         ];
 
@@ -647,6 +654,17 @@ impl Store {
                 created_at        INTEGER NOT NULL DEFAULT (unixepoch())
             );
             CREATE INDEX IF NOT EXISTS idx_ss_outcome ON session_snapshots(outcome_type);
+
+            CREATE TABLE IF NOT EXISTS compression_savings (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_key    TEXT NOT NULL,
+                command        TEXT NOT NULL,
+                original_chars INTEGER NOT NULL,
+                filtered_chars INTEGER NOT NULL,
+                ratio          REAL NOT NULL,
+                saved_at       INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_savings_session ON compression_savings(session_key);
         ")?;
 
         // Drift-detection columns on code_units (idempotent).
@@ -1228,6 +1246,30 @@ impl Store {
             params![tool, args, chrono::Utc::now().to_rfc3339()],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Record a lossless-compaction saving for telemetry. Non-fatal by
+    /// contract — callers ignore the Result so a logging failure never breaks
+    /// the compaction itself.
+    pub fn log_compression_saving(
+        &self,
+        session_key: &str,
+        command: &str,
+        original_chars: usize,
+        filtered_chars: usize,
+    ) -> Result<()> {
+        let ratio = if original_chars > 0 {
+            filtered_chars as f64 / original_chars as f64
+        } else {
+            1.0
+        };
+        self.conn.execute(
+            "INSERT INTO compression_savings
+                (session_key, command, original_chars, filtered_chars, ratio)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![session_key, command, original_chars as i64, filtered_chars as i64, ratio],
+        )?;
+        Ok(())
     }
 
     pub fn log_session_retrieval(

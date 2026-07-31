@@ -114,15 +114,66 @@ pub fn compare_graphs(current: &GraphData, previous: &GraphData) -> DriftReport 
     let curr_comm = current.community_nodes();
     let prev_comm = previous.community_nodes();
 
-    let all_communities: HashSet<u32> =
-        curr_comm.keys().copied().chain(prev_comm.keys().copied()).collect();
+    // Match communities across snapshots by MEMBERSHIP, not by id.
+    //
+    // Community detection does not produce stable ids: rebuild the graph and the
+    // same set of nodes comes back as a different number. Comparing
+    // curr_comm[id] against prev_comm[id] therefore reported every community as
+    // ~100% changed after any rebuild — which is exactly what happened: 1303
+    // communities at drift 2.00, each reading "+91/-91 nodes (now 91, was 91)".
+    // Same size, same members, different id. The pipeline dutifully raised a
+    // digest, the meta-analyser then flagged that nobody ever approved one, and
+    // the whole loop spent a fortnight arguing with an artefact.
+    //
+    // Each current community is paired with the previous one it overlaps most,
+    // so a renumbered-but-identical community scores 0.
+    let mut pairing: HashMap<u32, u32> = HashMap::new();
+    let mut taken: HashSet<u32> = HashSet::new();
+    let mut candidates: Vec<(f64, u32, u32)> = Vec::new();
+    for (c_id, c_nodes) in &curr_comm {
+        for (p_id, p_nodes) in &prev_comm {
+            let inter = c_nodes.intersection(p_nodes).count();
+            if inter == 0 {
+                continue;
+            }
+            let union = c_nodes.union(p_nodes).count().max(1);
+            candidates.push((inter as f64 / union as f64, *c_id, *p_id));
+        }
+    }
+    // Greedy best-overlap first, one previous community per current one.
+    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    for (score, c_id, p_id) in candidates {
+        if score <= 0.0 || pairing.contains_key(&c_id) || taken.contains(&p_id) {
+            continue;
+        }
+        pairing.insert(c_id, p_id);
+        taken.insert(p_id);
+    }
+
+    let all_communities: HashSet<u32> = curr_comm
+        .keys()
+        .copied()
+        .chain(prev_comm.keys().copied().filter(|p| !taken.contains(p)))
+        .collect();
 
     let mut community_drifts: Vec<CommunityDrift> = Vec::new();
     let mut communities_affected = 0usize;
 
     for &c_id in &all_communities {
         let curr_nodes = curr_comm.get(&c_id).cloned().unwrap_or_default();
-        let prev_nodes = prev_comm.get(&c_id).cloned().unwrap_or_default();
+        // Its partner from the previous snapshot, whatever it was numbered.
+        let prev_nodes = match pairing.get(&c_id) {
+            Some(p_id) => prev_comm.get(p_id).cloned().unwrap_or_default(),
+            // Unpaired: either a genuinely new community, or a previous one
+            // that has no successor. Both are real signal.
+            None => {
+                if curr_comm.contains_key(&c_id) {
+                    HashSet::new()
+                } else {
+                    prev_comm.get(&c_id).cloned().unwrap_or_default()
+                }
+            }
+        };
 
         let added   = curr_nodes.difference(&prev_nodes).count();
         let removed = prev_nodes.difference(&curr_nodes).count();
@@ -415,5 +466,77 @@ mod tests {
         assert_eq!(prev.file_name().unwrap(), s2.file_name().unwrap());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    fn graph(communities: &[(u32, &[&str])]) -> GraphData {
+        let mut nodes = Vec::new();
+        for (cid, members) in communities {
+            for m in *members {
+                nodes.push(GraphNode {
+                    id: m.to_string(),
+                    label: None,
+                    source_file: None,
+                    node_type: None,
+                    community: Some(*cid),
+                });
+            }
+        }
+        GraphData { nodes, links: Vec::new() }
+    }
+
+    #[test]
+    fn renumbering_a_community_is_not_drift() {
+        // The bug that produced 1303 false flags: identical membership, new ids.
+        let before = graph(&[(1, &["a", "b", "c"]), (2, &["d", "e"])]);
+        let after  = graph(&[(77, &["a", "b", "c"]), (99, &["d", "e"])]);
+        let report = compare_graphs(&after, &before);
+        assert_eq!(
+            report.communities_affected, 0,
+            "same members under different ids must score zero drift, got {:?}",
+            report.community_drifts
+        );
+        assert!(report.high_drift_communities.is_empty());
+    }
+
+    #[test]
+    fn a_real_membership_change_still_registers() {
+        let before = graph(&[(1, &["a", "b", "c", "d"])]);
+        // Half the members replaced — that is genuine drift.
+        let after  = graph(&[(5, &["a", "b", "x", "y"])]);
+        let report = compare_graphs(&after, &before);
+        assert_eq!(report.communities_affected, 1);
+        let d = &report.community_drifts[0];
+        assert_eq!(d.nodes_added, 2);
+        assert_eq!(d.nodes_removed, 2);
+        assert!(d.drift_score > 0.9, "expected high drift, got {}", d.drift_score);
+    }
+
+    #[test]
+    fn a_brand_new_community_is_reported() {
+        let before = graph(&[(1, &["a", "b"])]);
+        let after  = graph(&[(1, &["a", "b"]), (2, &["p", "q", "r"])]);
+        let report = compare_graphs(&after, &before);
+        assert_eq!(report.communities_affected, 1, "only the new one counts");
+        let new = report.community_drifts.iter().find(|d| d.nodes_added == 3).unwrap();
+        assert_eq!(new.node_count_previous, 0);
+    }
+
+    #[test]
+    fn growth_within_a_community_is_proportional() {
+        let before = graph(&[(1, &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"])]);
+        let mut members: Vec<&str> = vec!["a","b","c","d","e","f","g","h","i","j"];
+        members.push("k");
+        let after = graph(&[(3, &members)]);
+        let report = compare_graphs(&after, &before);
+        let d = &report.community_drifts[0];
+        assert_eq!(d.nodes_added, 1);
+        assert_eq!(d.nodes_removed, 0);
+        assert!(d.drift_score < DRIFT_HIGH_THRESHOLD,
+            "one new node in ten must not trip the high-drift threshold, got {}", d.drift_score);
     }
 }

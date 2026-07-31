@@ -28,9 +28,16 @@ pub struct CloseoutResult {
     pub skill_candidates_staged: usize,
     pub markers_staged:          usize,
     pub outcome_logged:          bool,
+    /// Patterns whose use/reverted telemetry was updated from this session's
+    /// targeted retrievals × outcome (survival feedback loop).
+    pub patterns_scored:         usize,
     pub graph_snapshot_written:  bool,
     pub session_snapshot_written: bool,
     pub mirror_written:          bool,
+    /// Things the caller should be told that are not counts — a graph rebuilt
+    /// before snapshotting, or a snapshot skipped because it could not be.
+    /// Surfaced so a skipped step is visible rather than silently absent.
+    pub notes:                   Vec<String>,
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────
@@ -40,6 +47,11 @@ pub struct CloseoutResult {
 /// - `inline_approve`: if true, all extracted markers are immediately committed
 ///   to their target DB tables. Set only when the user has typed "KNOWLEDGE COMMITTED".
 ///   If false, markers are staged in knowledge_markers with promoted=0.
+/// - `markers_text`: when provided (non-empty), CORTEX-* markers are parsed directly
+///   from this text instead of scraping a host-specific chat store. This is the
+///   platform-independent capture path: any agent (Claude Code, Copilot, Continue)
+///   passes the text containing its own markers. Falls back to the VS Code session
+///   store, then the mcp_calls DB, only when this is None/empty.
 pub fn run_closeout(
     store: &Store,
     session_key: &str,
@@ -49,15 +61,21 @@ pub fn run_closeout(
     inline_approve: bool,
     repo_root: &Path,
     prefs_path: Option<&Path>,
+    markers_text: Option<&str>,
 ) -> Result<CloseoutResult> {
     let mut result = CloseoutResult::default();
 
-    // ── Step 1: Flush knowledge markers from session store ───────────────────
-    let markers = extract_session_markers().unwrap_or_else(|e| {
-        eprintln!("[closeout] warn: session store unavailable ({e}) — no markers from store");
-        // Fallback: try to extract markers from recent mcp_calls in DB
-        extract_markers_from_mcp_calls(store).unwrap_or_default()
-    });
+    // ── Step 1: Flush knowledge markers ──────────────────────────────────────
+    // Priority: (1) markers passed in directly by the agent (platform-independent),
+    // (2) VS Code Copilot session store, (3) recent mcp_calls in the DB.
+    let markers = match markers_text.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(text) => markers::parse_markers(text),
+        None => extract_session_markers().unwrap_or_else(|e| {
+            eprintln!("[closeout] warn: session store unavailable ({e}) — no markers from store");
+            // Fallback: try to extract markers from recent mcp_calls in DB
+            extract_markers_from_mcp_calls(store).unwrap_or_default()
+        }),
+    };
     let extracted_markers = markers.clone();
 
     if inline_approve {
@@ -113,6 +131,17 @@ pub fn run_closeout(
         result.outcome_logged = true;
     }
 
+    // ── Step 2b: Retrieval × outcome → pattern survival telemetry ────────────
+    // Every pattern this session retrieved via a TARGETED lookup (recall topic
+    // match / get_context relevance — not bulk list_patterns browsing) gets a
+    // usage tick; failed build/test sessions also tick reverted. This is what
+    // makes survival_rate a real signal instead of a default-100% placeholder.
+    result.patterns_scored = apply_retrieval_outcomes(store, session_key, outcome_type)
+        .unwrap_or_else(|e| {
+            eprintln!("[closeout] warn: retrieval-outcome telemetry failed: {e}");
+            0
+        });
+
     // ── Step 3: Run git-review (pattern relevance scan) ───────────────────────
     if let Ok(deltas) = crate::git::head_deltas_with_options(repo_root, &crate::git::DeltaOptions {
         include: None,
@@ -130,8 +159,36 @@ pub fn run_closeout(
     }
 
     // ── Step 4: Write Graphify graph snapshot ─────────────────────────────────
+    //
+    // Only if the graph still describes the code. Snapshotting a stale
+    // graph.json is worse than snapshotting nothing: every later drift
+    // comparison is then measured against a file that predates the changes, and
+    // the pipeline reports drift everywhere. That is exactly what happened — a
+    // graph 15 days older than the source produced a digest claiming 1303
+    // communities had drifted, which was noise the meta-analyser then correctly
+    // flagged as "zero proposals approved out of 1303".
+    //
+    // So: rebuild it when a rebuild is possible, and when it is not, skip the
+    // snapshot and say why rather than emitting a signal that cannot be trusted.
     let graph_src = repo_root.join(".graphify-output").join("graph.json");
     if graph_src.exists() {
+        if let Some(reason) = graph_is_stale(repo_root, &graph_src) {
+            match rebuild_graph(repo_root) {
+                Ok(()) => result.notes.push(format!(
+                    "graph rebuilt before snapshot ({reason})"
+                )),
+                Err(e) => {
+                    // No rebuild, no snapshot. A drift measurement against this
+                    // file would be fiction.
+                    result.notes.push(format!(
+                        "graph snapshot SKIPPED — {reason}, and rebuild failed: {}.                          Run: graphify-rs build --path . --code-only --update",
+                        crate::closeout::one_line(&e.to_string())
+                    ));
+                }
+            }
+        }
+    }
+    if graph_src.exists() && graph_is_stale(repo_root, &graph_src).is_none() {
         let snapshots_dir = repo_root.join(".graphify-output").join("snapshots");
         if std::fs::create_dir_all(&snapshots_dir).is_ok() {
             let ts = Utc::now().format("%Y%m%d_%H%M%S");
@@ -198,6 +255,52 @@ pub fn run_closeout(
     Ok(result)
 }
 
+// ── Retrieval × outcome telemetry ────────────────────────────────────────────
+
+/// Feed session outcome back into pattern use/reverted counts.
+///
+/// Patterns retrieved via targeted lookups this session (`recall` topic match,
+/// `get_context` relevance hit) are treated as "engaged":
+///   - build_pass            → use_count + 1
+///   - build_fail/test_fail  → use_count + 1 AND reverted_count + 1
+///   - research_only / review_findings → no telemetry (nothing was exercised)
+///
+/// Capped at 12 patterns per session to keep one noisy session from swinging
+/// the whole store. Returns the number of patterns updated.
+fn apply_retrieval_outcomes(store: &Store, session_key: &str, outcome_type: &str) -> Result<usize> {
+    let (use_delta, reverted_delta): (i64, i64) = match outcome_type {
+        "build_pass"              => (1, 0),
+        "build_fail" | "test_fail" => (1, 1),
+        _                          => return Ok(0),
+    };
+
+    let pattern_ids: Vec<i64> = {
+        let mut stmt = store.conn().prepare(
+            "SELECT DISTINCT entry_id FROM session_retrieval_log
+             WHERE session_id = ?1 AND entry_table = 'patterns'
+               AND tool_name IN ('recall', 'get_context')
+             LIMIT 12",
+        )?;
+        let rows = stmt.query_map(params![session_key], |r| r.get::<_, i64>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let mut updated = 0usize;
+    for id in &pattern_ids {
+        let touched = store.conn().execute(
+            "UPDATE patterns
+             SET use_count = use_count + ?1, reverted_count = reverted_count + ?2
+             WHERE id = ?3",
+            params![use_delta, reverted_delta, id],
+        )?;
+        if touched > 0 {
+            let _ = store.recompute_pattern_survival(*id);
+            updated += 1;
+        }
+    }
+    Ok(updated)
+}
+
 // ── Marker extraction from session store ────────────────────────────────────
 
 /// Scan the VS Code session store for CORTEX-* markers in recent turns.
@@ -244,7 +347,7 @@ fn commit_marker(
                 survival_rate: 1.0,
             };
             store.insert_pattern(&p)?;
-            mark_promoted(store, session_key, "pattern", name)?;
+            mark_promoted_nonfatal(store, session_key, "pattern", name);
             Ok(true)
         }
 
@@ -265,13 +368,13 @@ fn commit_marker(
                 added_at: Utc::now(),
             };
             store.insert_anti_pattern(&ap)?;
-            mark_promoted(store, session_key, "anti_pattern", description)?;
+            mark_promoted_nonfatal(store, session_key, "anti_pattern", description);
             Ok(true)
         }
 
         KnowledgeMarker::Correction { attempted, reason, fix, tags } => {
             store.insert_self_correction(attempted, reason, fix, tags)?;
-            mark_promoted(store, session_key, "correction", attempted)?;
+            mark_promoted_nonfatal(store, session_key, "correction", attempted);
             Ok(true)
         }
 
@@ -294,7 +397,7 @@ fn commit_marker(
                 updated_at: Utc::now(),
             };
             store.insert_adr(&adr)?;
-            mark_promoted(store, session_key, "adr", title)?;
+            mark_promoted_nonfatal(store, session_key, "adr", title);
             Ok(true)
         }
 
@@ -306,7 +409,7 @@ fn commit_marker(
                     let dated = format!("{} Trust: annotated {}", body, Utc::now().format("%Y-%m-%d"));
                     prefs.project.notes.push(dated);
                     let _ = crate::prefs::save(&prefs, path);
-                    mark_promoted(store, session_key, "prefs_note", &body.chars().take(60).collect::<String>())?;
+                    mark_promoted_nonfatal(store, session_key, "prefs_note", &body.chars().take(60).collect::<String>());
                     return Ok(true);
                 }
             }
@@ -345,15 +448,33 @@ fn commit_marker(
 }
 
 /// Record that a knowledge marker was promoted to its target table.
+///
+/// NOTE: standard SQLite does not support `UPDATE ... LIMIT` (needs the
+/// SQLITE_ENABLE_UPDATE_DELETE_LIMIT compile flag, which bundled rusqlite
+/// lacks). The old LIMIT form failed to prepare on EVERY commit, and the
+/// error propagated after the real insert had succeeded — so closeout
+/// reported "0 committed" while the data was actually in the DB. Use a
+/// rowid subquery instead (LIMIT inside a subselect is standard).
 fn mark_promoted(store: &Store, session_key: &str, marker_type: &str, name: &str) -> Result<()> {
     store.conn().execute(
         "UPDATE knowledge_markers SET promoted = 1
-         WHERE session_key = ?1 AND marker_type = ?2 AND (name = ?3 OR body LIKE ?4)
-         AND promoted = 0
-         LIMIT 1",
+         WHERE id = (
+             SELECT id FROM knowledge_markers
+             WHERE session_key = ?1 AND marker_type = ?2 AND (name = ?3 OR body LIKE ?4)
+             AND promoted = 0
+             ORDER BY id LIMIT 1
+         )",
         params![session_key, marker_type, name, format!("%{}%", &name.chars().take(30).collect::<String>())],
     )?;
     Ok(())
+}
+
+/// mark_promoted is bookkeeping — a failure there must never mask a commit
+/// that already happened. Log and continue.
+fn mark_promoted_nonfatal(store: &Store, session_key: &str, marker_type: &str, name: &str) {
+    if let Err(e) = mark_promoted(store, session_key, marker_type, name) {
+        eprintln!("[closeout] warn: mark_promoted failed for {marker_type} '{name}': {e}");
+    }
 }
 
 // ── Stage a marker for later review ──────────────────────────────────────────
@@ -402,6 +523,71 @@ fn marker_tags_json(marker: &KnowledgeMarker) -> String {
     serde_json::to_string(&tags).unwrap_or_else(|_| "[]".to_string())
 }
 
+// ── Host trace ingestion (Claude Code hook bridge) ────────────────────────────
+
+/// Parse `.cortex/session-trace.jsonl` (appended by the Claude Code PostToolUse
+/// hook), returning (tool names in first-seen order, domain tags from touched
+/// paths). After ingestion the trace is archived to
+/// `mined-tasks/trace_<session>.jsonl` so the next session starts clean.
+fn ingest_session_trace(
+    trace_path: &Path,
+    mined_dir: &Path,
+    session_key: &str,
+) -> (Vec<String>, Vec<String>) {
+    let Ok(content) = std::fs::read_to_string(trace_path) else {
+        return (vec![], vec![]);
+    };
+
+    let mut tools: Vec<String> = Vec::new();
+    let mut tags:  Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue; };
+
+        if let Some(tool) = v.get("tool_name").and_then(|t| t.as_str()) {
+            if !tool.is_empty() && !tools.iter().any(|t| t == tool) {
+                tools.push(tool.to_string());
+            }
+        }
+
+        // Derive a domain tag from the touched path: the first path component
+        // under the repo root (crate / top-level dir name).
+        let input = v.get("tool_input");
+        let path_str = input
+            .and_then(|i| i.get("file_path").or_else(|| i.get("path")).or_else(|| i.get("notebook_path")))
+            .and_then(|p| p.as_str());
+        if let Some(p) = path_str {
+            let norm = p.replace('\\', "/");
+            // Take the component after the repo root if the path is absolute,
+            // else the first component of a relative path.
+            let tag = norm.rsplit_once("/RProjects/")
+                .map(|(_, rest)| rest)
+                .unwrap_or(&norm)
+                .trim_start_matches('/')
+                .split('/')
+                // For absolute paths the first component after RProjects is the
+                // repo name — the second is the crate; relative paths start at
+                // the crate directly. Take the first non-repo-looking component.
+                .find(|c| !c.is_empty() && *c != "FlowMake")
+                .unwrap_or("")
+                .to_string();
+            if !tag.is_empty() && !tag.contains('.') && !tags.iter().any(|t| t == &tag) && tags.len() < 10 {
+                tags.push(tag);
+            }
+        }
+    }
+    tools.truncate(30);
+
+    // Archive the raw trace next to the session snapshot, then remove the live file.
+    let archived = mined_dir.join(format!("trace_{}.jsonl", session_key.replace('/', "_")));
+    if std::fs::rename(trace_path, &archived).is_err() {
+        // Rename across a lock or missing dir — fall back to truncation.
+        let _ = std::fs::write(trace_path, "");
+    }
+
+    (tools, tags)
+}
+
 // ── Session snapshot ──────────────────────────────────────────────────────────
 
 fn write_session_snapshot(
@@ -424,7 +610,7 @@ fn write_session_snapshot(
     });
 
     // Read recent tool sequences from mcp_calls for this session.
-    let tool_seq: Vec<String> = {
+    let mut tool_seq: Vec<String> = {
         if let Ok(mut stmt) = store.conn().prepare(
             "SELECT DISTINCT tool FROM mcp_calls
              WHERE called_at >= datetime('now', '-3 hours')
@@ -438,12 +624,25 @@ fn write_session_snapshot(
         }
     };
 
+    // Merge in host-side trace events (Claude Code PostToolUse hook writes
+    // .cortex/session-trace.jsonl). This is what makes trajectories on Claude
+    // Code as rich as the VS Code session store makes them for Copilot:
+    // real work tools (Edit/Bash/Read...) + touched crates as domain tags.
+    let trace_path = repo_root.join(".cortex").join("session-trace.jsonl");
+    let (trace_tools, domain_tags) = ingest_session_trace(&trace_path, &dir, session_key);
+    for t in trace_tools {
+        if !tool_seq.contains(&t) {
+            tool_seq.push(t);
+        }
+    }
+    tool_seq.truncate(60);
+
     let snapshot = json!({
         "session_key":   session_key,
         "outcome_type":  outcome_type,
         "marker_counts": marker_counts,
         "tool_sequence": tool_seq,
-        "domain_tags":   [],
+        "domain_tags":   domain_tags,
         "created_at":    Utc::now().to_rfc3339(),
     });
 
@@ -545,4 +744,175 @@ fn prune_old_snapshots(dir: &Path, max_age_days: u64) {
             let _ = std::fs::remove_file(&old);
         }
     }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_store(name: &str) -> Store {
+        let dir = std::env::temp_dir().join("cortex-closeout-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join(format!("{name}.db"));
+        let _ = std::fs::remove_file(&db);
+        Store::open(&db).unwrap()
+    }
+
+    /// Regression: closeout must COUNT what it commits. The old mark_promoted
+    /// used `UPDATE ... LIMIT` (unsupported in bundled SQLite), which errored
+    /// after each successful insert — data landed but every counter read 0,
+    /// so "KNOWLEDGE COMMITTED" reported nothing was saved.
+    #[test]
+    fn closeout_markers_text_commits_and_counts() {
+        let store = test_store("counts");
+        let repo_root = std::env::temp_dir().join("cortex-closeout-test-repo");
+        let _ = std::fs::create_dir_all(&repo_root);
+
+        let markers_text = r#"
+[CORTEX-PATTERN: name="test-pattern-count" intent="verify counting" trust="verified"]body here[/CORTEX-PATTERN]
+[CORTEX-AP: description="test anti-pattern count" tags="test"]wrong: x
+correct: y[/CORTEX-AP]
+[CORTEX-CORRECTION: attempted="counted wrong" reason="LIMIT clause" fix="subquery"][/CORTEX-CORRECTION]
+"#;
+
+        let result = run_closeout(
+            &store, "session-test", "build_pass", None, None,
+            true, &repo_root, None, Some(markers_text),
+        ).unwrap();
+
+        assert_eq!(result.patterns_committed, 1, "pattern commit must be counted");
+        assert_eq!(result.anti_patterns_committed, 1, "anti-pattern commit must be counted");
+        assert_eq!(result.corrections_committed, 1, "correction commit must be counted");
+
+        // The data must actually be in the DB, matching the counts.
+        let n: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM patterns WHERE name = 'test-pattern-count'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 1);
+
+        // Second closeout with the same markers: duplicate pattern/AP are
+        // skipped (counted 0), never double-inserted.
+        let again = run_closeout(
+            &store, "session-test-2", "build_pass", None, None,
+            true, &repo_root, None, Some(markers_text),
+        ).unwrap();
+        assert_eq!(again.patterns_committed, 0, "duplicate pattern must not recount");
+        assert_eq!(again.anti_patterns_committed, 0, "duplicate AP must not recount");
+        let n2: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM patterns WHERE name = 'test-pattern-count'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n2, 1, "no duplicate rows");
+    }
+
+    /// mark_promoted must be valid SQL on stock SQLite (no UPDATE ... LIMIT).
+    #[test]
+    fn mark_promoted_sql_is_valid() {
+        let store = test_store("promote");
+        stage_marker(&store, "s1", &KnowledgeMarker::Pattern {
+            name: "p1".into(), intent: "i".into(), body: "b".into(),
+            trust: "verified".into(), uses: vec![], tags: vec![],
+        }).unwrap();
+        // Must not error — the old LIMIT form failed at prepare time.
+        mark_promoted(&store, "s1", "pattern", "p1").unwrap();
+        let promoted: i64 = store.conn().query_row(
+            "SELECT COUNT(*) FROM knowledge_markers WHERE promoted = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(promoted, 1);
+    }
+}
+
+
+/// Is `graph.json` older than the code it claims to describe?
+///
+/// Returns a human reason when stale, `None` when it is current. Compares
+/// against the newest source file rather than a fixed age: a graph built an hour
+/// ago is stale if the code changed since, and one built a month ago is fine if
+/// nothing has.
+fn graph_is_stale(repo_root: &Path, graph: &Path) -> Option<String> {
+    let graph_time = std::fs::metadata(graph).and_then(|m| m.modified()).ok()?;
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    let mut stack = vec![repo_root.to_path_buf()];
+    let mut looked = 0usize;
+    while let Some(dir) = stack.pop() {
+        // Bounded: this runs on every closeout and must not walk a whole disk.
+        if looked > 20_000 {
+            break;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for e in entries.flatten() {
+            let path = e.path();
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let is_source = path
+                .extension()
+                .map(|x| matches!(x.to_string_lossy().as_ref(), "rs" | "slint" | "toml" | "py" | "ts" | "tsx"))
+                .unwrap_or(false);
+            if !is_source {
+                continue;
+            }
+            looked += 1;
+            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                if newest.as_ref().map(|(nt, _)| t > *nt).unwrap_or(true) {
+                    newest = Some((t, path.display().to_string()));
+                }
+            }
+        }
+    }
+    let (newest_time, newest_path) = newest?;
+    if newest_time > graph_time {
+        let age = newest_time
+            .duration_since(graph_time)
+            .map(|d| d.as_secs() / 3600)
+            .unwrap_or(0);
+        Some(format!(
+            "graph.json is {age}h behind the newest source ({})",
+            Path::new(&newest_path)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or(newest_path)
+        ))
+    } else {
+        None
+    }
+}
+
+/// Rebuild the graph in place. Fails if graphify-rs is not on PATH, which is a
+/// normal state on a machine that does not have it — hence a skipped snapshot
+/// rather than a failed closeout.
+fn rebuild_graph(repo_root: &Path) -> Result<()> {
+    // --output is REQUIRED. Without it graphify-rs writes to its own per-project
+    // cache under ~/.graphify-rs/<project>-<hash>/, not to the repo, so the
+    // rebuild "succeeds" and .graphify-output/graph.json stays exactly as stale
+    // as it was — the staleness check would then fire on every single closeout
+    // and never clear. Verified: a rebuild without it left a 15-day-old file in
+    // place and reported exit 0.
+    let out = std::process::Command::new("graphify-rs")
+        .args([
+            "build",
+            "--path", ".",
+            "--code-only",
+            "--update",
+            "--output", ".graphify-output",
+        ])
+        .current_dir(repo_root)
+        .output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "graphify-rs exited {}: {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).lines().next().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+/// First line only — provider and tool errors carry whole stack traces.
+pub(crate) fn one_line(s: &str) -> String {
+    s.lines().next().unwrap_or("").chars().take(160).collect()
 }

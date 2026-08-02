@@ -519,13 +519,9 @@ fn tool_get_context(
     // Targeted-retrieval telemetry: these patterns were surfaced by relevance
     // to the task hint — closeout joins them with the session outcome to keep
     // survival_rate honest.
-    // Everything in a context packet is already relevance-selected against the
-    // hint, so each one counts as used — same reasoning as the hint-matched
-    // branch in `list_patterns`.
     for p in &packet.patterns {
         if let Some(id) = p.id {
             let _ = store.log_session_retrieval(session_id, "patterns", id, "get_context");
-            let _ = store.pattern_used(id);
         }
     }
 
@@ -793,22 +789,22 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
             p.survival_rate * 100.0,
             p.intent
         ));
+        // Distinguish a TARGETED expansion from bulk browsing.
+        //
+        // A listing touches every row on every call, so crediting all of them
+        // would recreate the vacuous survival signal this telemetry exists to
+        // fix. But the hint-matched ones are genuinely targeted — the agent
+        // described a task and these came back expanded — and excluding them
+        // entirely is why coverage sat at 5%: agents open with
+        // `list_patterns(hint=...)` roughly 100x more often than they call
+        // `recall`/`get_context`, so the dominant retrieval path produced no
+        // signal at all.
+        //
+        // Crediting still happens at CLOSEOUT, gated on session outcome and
+        // capped, never here.
         if let Some(id) = p.id {
-            let _ = store.log_session_retrieval(session_id, "patterns", id, "list_patterns");
-            // Count a *hint-matched* pattern as used. Until now `pattern_used`
-            // fired only from `recall`, while the operating protocol tells
-            // agents to open with `list_patterns(hint=...)` — so the main
-            // retrieval path recorded nothing and 141 of 149 patterns sat at
-            // use_count 0. That made survival_rate a default-100% placeholder
-            // and left "0 patterns below 40% survival" reporting health for a
-            // store with no usage signal at all.
-            //
-            // Deliberately only the relevant ones: crediting every pattern in
-            // the index on every call would break the signal in the other
-            // direction.
-            if relevant {
-                let _ = store.pattern_used(id);
-            }
+            let tool = if relevant { "list_patterns_hint" } else { "list_patterns" };
+            let _ = store.log_session_retrieval(session_id, "patterns", id, tool);
         }
 
         if detail != "summary" {

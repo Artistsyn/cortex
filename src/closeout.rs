@@ -286,7 +286,7 @@ fn apply_retrieval_outcomes(store: &Store, session_key: &str, outcome_type: &str
         let mut stmt = store.conn().prepare(
             "SELECT DISTINCT entry_id FROM session_retrieval_log
              WHERE session_id = ?1 AND entry_table = 'patterns'
-               AND tool_name IN ('recall', 'get_context')
+               AND tool_name IN ('recall', 'get_context', 'list_patterns_hint')
              LIMIT 12",
         )?;
         let rows = stmt.query_map(params![session_key], |r| r.get::<_, i64>(0))?;

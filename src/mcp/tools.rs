@@ -519,9 +519,13 @@ fn tool_get_context(
     // Targeted-retrieval telemetry: these patterns were surfaced by relevance
     // to the task hint — closeout joins them with the session outcome to keep
     // survival_rate honest.
+    // Everything in a context packet is already relevance-selected against the
+    // hint, so each one counts as used — same reasoning as the hint-matched
+    // branch in `list_patterns`.
     for p in &packet.patterns {
         if let Some(id) = p.id {
             let _ = store.log_session_retrieval(session_id, "patterns", id, "get_context");
+            let _ = store.pattern_used(id);
         }
     }
 
@@ -614,6 +618,8 @@ fn tool_get_preferences(args: &Value, prefs_summary: &str) -> Result<String, Str
 
 // ── recall ────────────────────────────────────────────────────────────────────
 
+use crate::recall_match::{recall_score, recall_terms};
+
 fn tool_recall(
     args: &Value,
     store: &Store,
@@ -623,16 +629,20 @@ fn tool_recall(
 ) -> Result<String, String> {
     let topic = args["topic"].as_str().ok_or("missing `topic`")?;
     let topic_lower = topic.to_lowercase();
+    let terms = recall_terms(topic);
 
     let mut out = format!("# Recall: `{topic}`\n\n");
     let mut found = false;
 
     // API units
     let mut unit_items: Vec<(String, String)> = Vec::new();
-    for u in units.iter().filter(|u| {
-        u.name.to_lowercase().contains(&topic_lower)
-            || u.compressed.to_lowercase().contains(&topic_lower)
-    }).take(4) {
+    let mut scored_units: Vec<(usize, &CodeUnit)> = units
+        .iter()
+        .map(|u| (recall_score(&[&u.name, &u.compressed], &topic_lower, &terms), u))
+        .filter(|(s, _)| *s > 0)
+        .collect();
+    scored_units.sort_by(|a, b| b.0.cmp(&a.0));
+    for u in scored_units.into_iter().take(4).map(|(_, u)| u) {
         let hash = sha256_hex(u.compressed.as_bytes());
         unit_items.push((hash, u.compressed.clone()));
         found = true;
@@ -645,12 +655,23 @@ fn tool_recall(
 
     // Patterns
     let patterns = store.all_patterns().map_err(|e| e.to_string())?;
-    let matched_patterns: Vec<_> = patterns.iter().filter(|p| {
-        p.name.to_lowercase().contains(&topic_lower)
-            || p.intent.to_lowercase().contains(&topic_lower)
-            || p.uses.iter().any(|u| u.to_lowercase().contains(&topic_lower))
-            || p.tags.iter().any(|t| t.to_lowercase().contains(&topic_lower))
-    }).collect();
+    let uses_joined: Vec<String> = patterns.iter().map(|p| p.uses.join(" ")).collect();
+    let tags_joined: Vec<String> = patterns.iter().map(|p| p.tags.join(" ")).collect();
+    let mut scored_patterns: Vec<(usize, &_)> = patterns
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let score = recall_score(
+                &[&p.name, &p.intent, &p.body, &uses_joined[i], &tags_joined[i]],
+                &topic_lower,
+                &terms,
+            );
+            (score, p)
+        })
+        .filter(|(s, _)| *s > 0)
+        .collect();
+    scored_patterns.sort_by(|a, b| b.0.cmp(&a.0));
+    let matched_patterns: Vec<_> = scored_patterns.into_iter().map(|(_, p)| p).collect();
 
     if !matched_patterns.is_empty() {
         found = true;
@@ -668,11 +689,22 @@ fn tool_recall(
 
     // Anti-patterns
     let aps = store.all_anti_patterns().map_err(|e| e.to_string())?;
-    let matched_aps: Vec<_> = aps.iter().filter(|ap| {
-        ap.description.to_lowercase().contains(&topic_lower)
-            || ap.wrong.to_lowercase().contains(&topic_lower)
-            || ap.tags.iter().any(|t| t.to_lowercase().contains(&topic_lower))
-    }).collect();
+    let ap_tags: Vec<String> = aps.iter().map(|ap| ap.tags.join(" ")).collect();
+    let mut scored_aps: Vec<(usize, &_)> = aps
+        .iter()
+        .enumerate()
+        .map(|(i, ap)| {
+            let score = recall_score(
+                &[&ap.description, &ap.wrong, &ap.correct, &ap_tags[i]],
+                &topic_lower,
+                &terms,
+            );
+            (score, ap)
+        })
+        .filter(|(s, _)| *s > 0)
+        .collect();
+    scored_aps.sort_by(|a, b| b.0.cmp(&a.0));
+    let matched_aps: Vec<_> = scored_aps.into_iter().map(|(_, ap)| ap).collect();
 
     if !matched_aps.is_empty() {
         found = true;
@@ -688,11 +720,15 @@ fn tool_recall(
 
     // Annotations
     let annotations = store.all_annotations().map_err(|e| e.to_string())?;
-    let matched_annotations: Vec<_> = annotations.iter().filter(|a| {
-        a.topic.to_lowercase().contains(&topic_lower)
-            || a.body.to_lowercase().contains(&topic_lower)
-            || a.tags.iter().any(|t| t.to_lowercase().contains(&topic_lower))
-    }).collect();
+    let ann_tags: Vec<String> = annotations.iter().map(|a| a.tags.join(" ")).collect();
+    let mut scored_ann: Vec<(usize, &_)> = annotations
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (recall_score(&[&a.topic, &a.body, &ann_tags[i]], &topic_lower, &terms), a))
+        .filter(|(s, _)| *s > 0)
+        .collect();
+    scored_ann.sort_by(|a, b| b.0.cmp(&a.0));
+    let matched_annotations: Vec<_> = scored_ann.into_iter().map(|(_, a)| a).collect();
 
     if !matched_annotations.is_empty() {
         found = true;
@@ -759,6 +795,20 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
         ));
         if let Some(id) = p.id {
             let _ = store.log_session_retrieval(session_id, "patterns", id, "list_patterns");
+            // Count a *hint-matched* pattern as used. Until now `pattern_used`
+            // fired only from `recall`, while the operating protocol tells
+            // agents to open with `list_patterns(hint=...)` — so the main
+            // retrieval path recorded nothing and 141 of 149 patterns sat at
+            // use_count 0. That made survival_rate a default-100% placeholder
+            // and left "0 patterns below 40% survival" reporting health for a
+            // store with no usage signal at all.
+            //
+            // Deliberately only the relevant ones: crediting every pattern in
+            // the index on every call would break the signal in the other
+            // direction.
+            if relevant {
+                let _ = store.pattern_used(id);
+            }
         }
 
         if detail != "summary" {

@@ -114,8 +114,9 @@ pub fn parse_markers(text: &str) -> Vec<KnowledgeMarker> {
 
         let mut search_from = 0usize;
         while let Some(open_pos) = find_case_insensitive(text, &open_prefix, search_from) {
-            // Find the closing `]` of the opening tag.
-            let Some(header_end) = text[open_pos..].find(']') else { break; };
+            // Find the closing `]` of the opening tag, ignoring any that sit
+            // inside a quoted attribute value.
+            let Some(header_end) = find_header_end(&text[open_pos..]) else { break; };
             let header_end_abs = open_pos + header_end;
 
             // Extract the attribute string: text between ":" and "]".
@@ -149,6 +150,32 @@ pub fn parse_markers(text: &str) -> Vec<KnowledgeMarker> {
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Byte offset of the `]` that closes a marker's opening tag.
+///
+/// A naive `find(']')` truncates any attribute whose value legitimately contains
+/// a bracket — and since attributes after the truncation point are lost too, the
+/// entry lands with a half-written description and **no tags at all**, silently.
+/// That really happened: an anti-pattern documenting the regex `[a-z_]+` was
+/// stored as "Rust field-name regexes using [a-z_" with its tags dropped.
+///
+/// So track quote state and only accept a bracket outside a quoted value. If the
+/// quotes turn out to be unbalanced, fall back to the first bracket rather than
+/// swallowing the rest of the document.
+fn find_header_end(s: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    for (i, ch) in s.char_indices() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ']' if !in_quotes => return Some(i),
+            // A marker header is a single line; a newline means the quotes never
+            // closed, so stop guessing and use the naive result.
+            '\n' if in_quotes => return s.find(']'),
+            _ => {}
+        }
+    }
+    s.find(']')
+}
 
 fn find_case_insensitive(haystack: &str, needle: &str, from: usize) -> Option<usize> {
     let lower_h = haystack.to_lowercase();
@@ -443,5 +470,71 @@ correct: decode GIF manually into Vec<Arc<RgbaImage>>
         assert_eq!(attrs["name"], "hello world");
         assert_eq!(attrs["trust"], "verified");
         assert_eq!(attrs["tags"], "a,b,c");
+    }
+}
+
+#[cfg(test)]
+mod bracket_in_attribute_tests {
+    use super::*;
+
+    /// Regression: the real marker that was corrupted in production.
+    #[test]
+    fn a_bracket_inside_a_quoted_value_does_not_truncate_the_header() {
+        let text = r#"[CORTEX-AP: description="Rust field-name regexes using [a-z_]+ silently skip fields containing digits" tags="regex,rust,parsing"]wrong: grep -E "pub [a-z_]+:"
+correct: use [a-z_0-9]+[/CORTEX-AP]"#;
+        let markers = parse_markers(text);
+        assert_eq!(markers.len(), 1, "marker should parse");
+        match &markers[0] {
+            KnowledgeMarker::AntiPattern { description, tags, .. } => {
+                assert!(
+                    description.contains("silently skip fields containing digits"),
+                    "description truncated at the bracket: {description}"
+                );
+                assert_eq!(tags, &vec!["regex".to_string(), "rust".to_string(), "parsing".to_string()],
+                           "tags after a bracketed value must survive");
+            }
+            other => panic!("expected an anti-pattern, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn brackets_in_several_attributes_and_in_the_body_all_survive() {
+        let text = r#"[CORTEX-PATTERN: name="glob-[abc]" intent="match [a-z] ranges" trust="verified" uses="regex"]body with [brackets] here[/CORTEX-PATTERN]"#;
+        let markers = parse_markers(text);
+        assert_eq!(markers.len(), 1);
+        match &markers[0] {
+            KnowledgeMarker::Pattern { name, intent, body, .. } => {
+                assert_eq!(name, "glob-[abc]");
+                assert_eq!(intent, "match [a-z] ranges");
+                assert_eq!(body, "body with [brackets] here");
+            }
+            other => panic!("expected a pattern, got {other:?}"),
+        }
+    }
+
+    /// Ordinary markers must be unaffected.
+    #[test]
+    fn markers_without_brackets_parse_exactly_as_before() {
+        let text = r#"[CORTEX-AP: description="plain description" tags="a,b"]wrong: x
+correct: y[/CORTEX-AP]"#;
+        let markers = parse_markers(text);
+        assert_eq!(markers.len(), 1);
+        match &markers[0] {
+            KnowledgeMarker::AntiPattern { description, wrong, correct, tags } => {
+                assert_eq!(description, "plain description");
+                assert!(wrong.contains('x'));
+                assert!(correct.contains('y'));
+                assert_eq!(tags.len(), 2);
+            }
+            other => panic!("expected an anti-pattern, got {other:?}"),
+        }
+    }
+
+    /// An unbalanced quote must not swallow the rest of the transcript.
+    #[test]
+    fn an_unclosed_quote_falls_back_instead_of_consuming_everything() {
+        let text = "[CORTEX-AP: description=\"oops unclosed tags=\"x\"]wrong: a\ncorrect: b[/CORTEX-AP]\nlater text";
+        let markers = parse_markers(text);
+        assert!(markers.len() <= 1, "must not run away past the marker");
     }
 }

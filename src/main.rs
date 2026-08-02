@@ -16,6 +16,7 @@ mod miner;
 mod model;
 mod output_filter;
 mod planner;
+mod recall_match;
 mod prefs;
 mod protocol;
 mod reasoner;
@@ -3370,13 +3371,13 @@ fn format_bytes(b: u64) -> String {
 fn run_recall(topic: &str, db_path: &Path, format: OutputFormat) -> Result<()> {
     let store = Store::open(db_path)?;
     let topic_lower = topic.to_lowercase();
+    let terms = crate::recall_match::recall_terms(topic);
 
     let units = store.all_units()?;
     let matched_units: Vec<_> = units
         .iter()
         .filter(|u| {
-            u.name.to_lowercase().contains(&topic_lower)
-                || u.compressed.to_lowercase().contains(&topic_lower)
+            crate::recall_match::recall_score(&[&u.name, &u.compressed], &topic_lower, &terms) > 0
         })
         .take(6)
         .collect();
@@ -3385,10 +3386,13 @@ fn run_recall(topic: &str, db_path: &Path, format: OutputFormat) -> Result<()> {
     let matched_patterns: Vec<_> = patterns
         .iter()
         .filter(|p| {
-            p.name.to_lowercase().contains(&topic_lower)
-                || p.intent.to_lowercase().contains(&topic_lower)
-                || p.uses.iter().any(|u| u.to_lowercase().contains(&topic_lower))
-                || p.tags.iter().any(|t| t.to_lowercase().contains(&topic_lower))
+            let uses = p.uses.join(" ");
+            let tags = p.tags.join(" ");
+            crate::recall_match::recall_score(
+                &[&p.name, &p.intent, &p.body, &uses, &tags],
+                &topic_lower,
+                &terms,
+            ) > 0
         })
         .collect();
 
@@ -3396,9 +3400,12 @@ fn run_recall(topic: &str, db_path: &Path, format: OutputFormat) -> Result<()> {
     let matched_aps: Vec<_> = aps
         .iter()
         .filter(|ap| {
-            ap.description.to_lowercase().contains(&topic_lower)
-                || ap.wrong.to_lowercase().contains(&topic_lower)
-                || ap.tags.iter().any(|t| t.to_lowercase().contains(&topic_lower))
+            let tags = ap.tags.join(" ");
+            crate::recall_match::recall_score(
+                &[&ap.description, &ap.wrong, &ap.correct, &tags],
+                &topic_lower,
+                &terms,
+            ) > 0
         })
         .collect();
 

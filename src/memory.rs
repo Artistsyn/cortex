@@ -721,7 +721,62 @@ impl Store {
                 [],
             )?;
         }
+        // Provenance: which source root produced this unit. Indexing is
+        // INSERT OR REPLACE with no delete, so units from sources that were
+        // renamed or dropped from index-sources.json lingered forever — the live
+        // index was serving 94 units of cortex's own source and 35 from `air_src`,
+        // neither of them configured. NULL means "indexed before provenance
+        // existed", which after one full reindex is exactly the orphan set.
+        if !cols.contains("source_root") {
+            self.conn.execute(
+                "ALTER TABLE code_units ADD COLUMN source_root TEXT",
+                [],
+            )?;
+        }
         Ok(())
+    }
+
+    /// Units grouped by the source root that produced them.
+    /// `None` covers rows indexed before provenance stamping existed.
+    pub fn units_by_source(&self) -> Result<Vec<(Option<String>, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_root, COUNT(*) FROM code_units GROUP BY source_root ORDER BY 2 DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Delete units that no configured source root claims.
+    ///
+    /// `keep` is the set of source roots from the current index configuration.
+    /// Rows whose `source_root` is NULL or absent from `keep` are removed, along
+    /// with their members and graph nodes. Returns the number of units deleted.
+    pub fn prune_orphan_units(&self, keep: &[String]) -> Result<usize> {
+        let placeholders = if keep.is_empty() {
+            "''".to_string()
+        } else {
+            keep.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+        };
+        let sql = format!(
+            "SELECT id FROM code_units \
+             WHERE source_root IS NULL OR source_root NOT IN ({placeholders})"
+        );
+        let params: Vec<&dyn rusqlite::ToSql> =
+            keep.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        for id in &ids {
+            self.conn.execute("DELETE FROM code_members WHERE parent_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM graph_edges WHERE from_id = ?1 OR to_id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM graph_nodes WHERE id = ?1", params![id])?;
+            self.conn.execute("DELETE FROM code_units WHERE id = ?1", params![id])?;
+        }
+        Ok(ids.len())
     }
 
     /// Phase 0A: add logical_session_key to mcp_calls and credibility to patterns.
@@ -808,6 +863,11 @@ impl Store {
     // ── Code units ────────────────────────────────────────────────────────────
 
     pub fn upsert_unit(&self, unit: &CodeUnit) -> Result<()> {
+        self.upsert_unit_from(unit, None)
+    }
+
+    /// Upsert a unit, recording which source root produced it.
+    pub fn upsert_unit_from(&self, unit: &CodeUnit, source_root: Option<&str>) -> Result<()> {
         let tv_json = serde_json::to_string(&unit.term_vector)?;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -832,13 +892,14 @@ impl Store {
         self.conn.execute(
             "INSERT OR REPLACE INTO code_units
              (id, kind, name, module_path, summary, compressed, term_vector, indexed_at,
-              previous_compressed, signature_changed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              previous_compressed, signature_changed_at, source_root)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 unit.id, unit.kind, unit.name, unit.module_path,
                 unit.summary, unit.compressed, tv_json, now,
                 prev_compressed,
                 signature_changed_at,
+                source_root,
             ],
         )?;
         Ok(())
@@ -1851,4 +1912,74 @@ fn row_to_annotation(row: &rusqlite::Row) -> rusqlite::Result<Annotation> {
         id: Some(row.get(0)?), topic: row.get(1)?,
         body: row.get(2)?, tags, added_at,
     })
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+    use crate::model::CodeUnit;
+
+    fn store(name: &str) -> Store {
+        let dir = std::env::temp_dir().join("cortex-prune-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join(format!("{name}.db"));
+        let _ = std::fs::remove_file(&db);
+        Store::open(&db).unwrap()
+    }
+
+    fn unit(id: &str) -> CodeUnit {
+        CodeUnit {
+            id: id.to_string(),
+            kind: "struct".into(),
+            name: id.rsplit("::").next().unwrap().to_string(),
+            module_path: id.rsplit_once("::").map(|(m, _)| m).unwrap_or("").to_string(),
+            summary: String::new(),
+            term_vector: vec![],
+            compressed: format!("[struct: {id}]\n"),
+            indexed_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn prune_removes_only_units_from_unconfigured_sources() {
+        let s = store("orphans");
+        s.upsert_unit_from(&unit("canvas::core::Canvas"), Some("quartz/src")).unwrap();
+        s.upsert_unit_from(&unit("cortex::memory::Store"), Some("cortex/src")).unwrap();
+
+        let deleted = s.prune_orphan_units(&["quartz/src".to_string()]).unwrap();
+
+        assert_eq!(deleted, 1, "only the unconfigured source should be pruned");
+        let names: Vec<String> = s.conn
+            .prepare("SELECT id FROM code_units ORDER BY id").unwrap()
+            .query_map([], |r| r.get(0)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(names, vec!["canvas::core::Canvas".to_string()]);
+    }
+
+    /// Rows predating provenance stamping have a NULL source_root. After a full
+    /// reindex restamps every configured source, whatever is still NULL is residue.
+    #[test]
+    fn unstamped_units_are_treated_as_orphans() {
+        let s = store("unstamped");
+        s.upsert_unit(&unit("air_src::legacy::Thing")).unwrap();
+        s.upsert_unit_from(&unit("canvas::core::Canvas"), Some("quartz/src")).unwrap();
+
+        assert_eq!(s.prune_orphan_units(&["quartz/src".to_string()]).unwrap(), 1);
+        let left: i64 = s.conn
+            .query_row("SELECT COUNT(*) FROM code_units", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 1);
+    }
+
+    #[test]
+    fn units_by_source_groups_stamped_and_unstamped() {
+        let s = store("bysource");
+        s.upsert_unit_from(&unit("a::A"), Some("quartz/src")).unwrap();
+        s.upsert_unit_from(&unit("b::B"), Some("quartz/src")).unwrap();
+        s.upsert_unit(&unit("c::C")).unwrap();
+
+        let groups = s.units_by_source().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], (Some("quartz/src".to_string()), 2));
+        assert_eq!(groups[1], (None, 1));
+    }
 }

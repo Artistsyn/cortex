@@ -262,11 +262,25 @@ fn tools_list() -> Value {
             {
                 "name": "get_item",
                 "description": "Get full compressed details on a named API item — \
-                                signature, fields, variants, methods.",
+                                signature, fields, variants, methods. The index spans \
+                                several projects and both engine forks, so a bare name \
+                                can be ambiguous; alternatives are listed when it is. \
+                                Pass a full unit id as `name`, or set `scope`, to pin \
+                                one exactly.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Exact item name." }
+                        "name": {
+                            "type": "string",
+                            "description": "Exact item name, or a full unit id such as \
+                                            `canvas::core::Canvas` to resolve unambiguously."
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Optional scope prefix to restrict the search, \
+                                            e.g. `synful`, `path_forge`, `ss_engine`. \
+                                            Omit for the primary unscoped engine."
+                        }
                     },
                     "required": ["name"]
                 }

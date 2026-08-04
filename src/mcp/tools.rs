@@ -31,10 +31,10 @@ pub fn dispatch(
         "get_context"          => tool_get_context(args, store, units, repo_root, prefs_summary, session_id),
         "get_delta"            => tool_get_delta(args, repo_root),
         "query_graph"          => tool_query_graph(args, store, session_id),
-        "explain_dependency_path" => tool_explain_dependency_path(args, store),
+        "explain_dependency_path" => tool_explain_dependency_path(args, store, session_id),
         "get_preferences"      => tool_get_preferences(args, prefs_summary),
         "recurrent_think"      => tool_recurrent_think(args, store),
-        "simulate_change"      => tool_simulate_change(args, store),
+        "simulate_change"      => tool_simulate_change(args, store, session_id),
         "recall"               => tool_recall(args, store, units, sessions, session_id),
         "list_patterns"        => tool_list_patterns(args, store, session_id),
         "get_anti_patterns"    => tool_get_anti_patterns(args, store, session_id),
@@ -194,20 +194,48 @@ fn tool_get_item(
     session_id: &str,
 ) -> Result<String, String> {
     let name = args["name"].as_str().ok_or("missing `name`")?;
+    let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("").trim();
 
-    let unit = units.iter().find(|u| u.name == name)
-        .ok_or_else(|| {
-            let _ = store.log_query_gap(
-                "get_item",
-                name,
-                Some(session_id),
-                Some("no indexed item with exact name"),
-            );
+    let candidates = resolve_candidates(name, scope, units);
+
+    let unit = candidates.first().copied().ok_or_else(|| {
+        let detail = if scope.is_empty() {
+            "no indexed item with exact name".to_string()
+        } else {
+            format!("no indexed item named `{name}` in scope `{scope}`")
+        };
+        let _ = store.log_query_gap("get_item", name, Some(session_id), Some(&detail));
+        if scope.is_empty() {
             format!("no item named `{name}`")
-        })?;
+        } else {
+            format!("no item named `{name}` in scope `{scope}`")
+        }
+    })?;
 
-    let header = format!("# `{}` ({})\n\nmodule: `{}`\n\n",
+    let mut header = format!("# `{}` ({})\n\nmodule: `{}`\n\n",
         unit.name, unit.kind, unit.module_path);
+
+    // The index spans several projects and two engine forks, so one bare name can
+    // match units with wildly different surfaces — `Canvas` resolves to four units
+    // with 115, 164, 4 and 4 methods. Returning one silently made the answer a
+    // coin flip; list the alternatives so the caller can tell which they got.
+    if candidates.len() > 1 {
+        header.push_str(&format!(
+            "> **{} other indexed items share this name.** Showing `{}`. \
+             Disambiguate with `scope`, or pass the full id as `name`.\n>\n",
+            candidates.len() - 1,
+            unit.id,
+        ));
+        for other in &candidates[1..] {
+            header.push_str(&format!(
+                "> - `{}` ({}, {} methods)\n",
+                other.id,
+                other.kind,
+                count_methods(&other.compressed),
+            ));
+        }
+        header.push('\n');
+    }
 
     let hash = sha256_hex(unit.compressed.as_bytes());
     let rendered = render_with_session(
@@ -834,6 +862,25 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
             if expanded > 0 { format!(", {expanded} expanded as relevant") } else { String::new() },
         ));
     }
+
+    // Make the cost of omitting the hint visible at the call site.
+    //
+    // Only hint-matched rows count as targeted retrievals, so a hintless call
+    // contributes nothing to survival telemetry. Measured 2026-08-04: of 119
+    // `list_patterns` calls, 3 passed a hint — so 3,036 pattern touches produced
+    // 32 usable signals, and only 37 of 160 patterns had ever been targeted.
+    // The instruction to pass a hint exists in CLAUDE.md twice and was followed
+    // 3% of the time; stating the consequence where the call happens is more
+    // likely to land than repeating the rule somewhere else.
+    if tokens.is_empty() {
+        out.push_str(
+            "\nNote: no `hint` was passed, so this call recorded no usage signal. \
+             A hint expands the patterns relevant to your task AND marks them as \
+             actually retrieved, which is what feeds survival/credibility scoring. \
+             Without it, pattern health is measured on almost no data.\n",
+        );
+    }
+
     Ok(out)
 }
 
@@ -1020,6 +1067,52 @@ fn pattern_detail_tier(args: &Value) -> &str {
     }
 }
 
+/// Number of methods recorded on a compressed unit.
+fn count_methods(compressed: &str) -> usize {
+    compressed
+        .lines()
+        .filter_map(|l| l.strip_prefix("methods:"))
+        .flat_map(|l| l.split('|'))
+        .filter(|m| !m.trim().is_empty())
+        .count()
+}
+
+/// Resolve a name (or full unit id) to every matching unit, best first.
+///
+/// The index spans multiple projects plus the quartz/synful fork, so hundreds of
+/// names are ambiguous. An exact id match is always definitive.
+///
+/// Otherwise the **primary engine wins**: scoped sources are indexed with their
+/// scope prefixed onto the module path (`synful::canvas::core`), so the shallowest
+/// module path is the unscoped primary. Ranking on richness alone would hand
+/// `Canvas` to the synful fork purely because the fork has 164 methods to quartz's
+/// 115 — the opposite of the documented precedence, and of what quartz-ctx does
+/// with its origin tags. Depth first, then richness to break ties between two
+/// equally shallow projects, then id for determinism.
+///
+/// `scope` restricts to units whose id begins with `<scope>::`.
+fn resolve_candidates<'a>(name: &str, scope: &str, units: &'a [CodeUnit]) -> Vec<&'a CodeUnit> {
+    if let Some(exact) = units.iter().find(|u| u.id == name) {
+        return vec![exact];
+    }
+
+    let mut matches: Vec<&CodeUnit> = units
+        .iter()
+        .filter(|u| u.name == name)
+        .filter(|u| scope.is_empty() || u.id.starts_with(&format!("{scope}::")))
+        .collect();
+
+    matches.sort_by(|a, b| {
+        a.module_path
+            .matches("::")
+            .count()
+            .cmp(&b.module_path.matches("::").count())
+            .then_with(|| count_methods(&b.compressed).cmp(&count_methods(&a.compressed)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    matches
+}
+
 fn find_symbol_unit<'a>(symbol: &str, units: &'a [CodeUnit]) -> Option<&'a CodeUnit> {
     let exact_id = units.iter().find(|u| u.id == symbol);
     let exact_name = units.iter().find(|u| u.name == symbol);
@@ -1145,7 +1238,11 @@ fn tool_recurrent_think(args: &Value, store: &Store) -> Result<String, String> {
 
 // ── simulate_change ────────────────────────────────────────────────────────────
 
-fn tool_explain_dependency_path(args: &Value, store: &Store) -> Result<String, String> {
+fn tool_explain_dependency_path(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+) -> Result<String, String> {
     let from = args["from"].as_str().ok_or("missing `from`")?;
     let to = args["to"].as_str().ok_or("missing `to`")?;
     let max_depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
@@ -1153,10 +1250,25 @@ fn tool_explain_dependency_path(args: &Value, store: &Store) -> Result<String, S
     let from_candidates = resolve_graph_candidates(store.conn(), from, 6).map_err(|e| e.to_string())?;
     let to_candidates = resolve_graph_candidates(store.conn(), to, 6).map_err(|e| e.to_string())?;
 
+    // A miss here names a relationship the graph cannot express yet, which is
+    // precisely what the gap pipeline should learn from — these two tools were
+    // the only code-intelligence tools not feeding it.
     if from_candidates.is_empty() {
+        let _ = store.log_query_gap(
+            "explain_dependency_path",
+            from,
+            Some(session_id),
+            Some("no graph node matched the `from` endpoint"),
+        );
         return Err(format!("no graph node found for `from`: {}", from));
     }
     if to_candidates.is_empty() {
+        let _ = store.log_query_gap(
+            "explain_dependency_path",
+            to,
+            Some(session_id),
+            Some("no graph node matched the `to` endpoint"),
+        );
         return Err(format!("no graph node found for `to`: {}", to));
     }
 
@@ -1217,7 +1329,11 @@ fn tool_explain_dependency_path(args: &Value, store: &Store) -> Result<String, S
     Ok(out)
 }
 
-fn tool_simulate_change(args: &Value, store: &Store) -> Result<String, String> {
+fn tool_simulate_change(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+) -> Result<String, String> {
     let item_name = args["item"].as_str().ok_or("missing `item`")?;
     let change_description = args["change"].as_str().unwrap_or("unspecified change");
     let depth = args["depth"].as_u64().unwrap_or(1) as u8;
@@ -1236,7 +1352,15 @@ fn tool_simulate_change(args: &Value, store: &Store) -> Result<String, String> {
             item_name,
             change_description,
         )
-    }.map_err(|e| format!("Simulation failed: {}", e))?;
+    }.map_err(|e| {
+        let _ = store.log_query_gap(
+            "simulate_change",
+            item_name,
+            Some(session_id),
+            Some("simulation could not resolve the item in the graph"),
+        );
+        format!("Simulation failed: {}", e)
+    })?;
 
     if let Some(filter) = relation_filter {
         result
@@ -1754,10 +1878,97 @@ fn tool_propose_skill(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_risk, parse_relation_filter, tool_get_anti_patterns};
+    use super::{classify_risk, count_methods, parse_relation_filter, resolve_candidates,
+                tool_get_anti_patterns};
+    use crate::model::CodeUnit;
     use crate::reasoner::simulator::RiskLevel;
     use crate::memory::Store;
     use serde_json::json;
+
+    fn unit(id: &str, name: &str, methods: &[&str]) -> CodeUnit {
+        let module_path = id.rsplit_once("::").map(|(m, _)| m).unwrap_or("").to_string();
+        let compressed = if methods.is_empty() {
+            format!("[struct: {name}]\n")
+        } else {
+            format!("[struct: {name}]\nmethods: {}\n", methods.join(" | "))
+        };
+        CodeUnit {
+            id: id.to_string(),
+            kind: "struct".into(),
+            name: name.into(),
+            module_path,
+            summary: String::new(),
+            term_vector: vec![],
+            compressed,
+            indexed_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The live index serves four `Canvas` units with 115/164/4/4 methods. Picking
+    /// one silently made every `get_item("Canvas")` a coin flip.
+    fn canvases() -> Vec<CodeUnit> {
+        vec![
+            // The fork deliberately has MORE methods than the primary, mirroring
+            // the real index (synful 164 vs quartz 115).
+            unit("synful::canvas::core::Canvas", "Canvas",
+                 &["new", "run", "add_plugin", "grapple"]),
+            unit("space_soup::canvas::Canvas", "Canvas", &["new"]),
+            unit("canvas::core::Canvas", "Canvas", &["new", "run", "add_plugin"]),
+        ]
+    }
+
+    /// The primary unscoped engine must outrank a scoped fork even when the fork
+    /// has more methods — synful's Canvas has 164 to quartz's 115 in the real index.
+    #[test]
+    fn ambiguous_name_surfaces_all_candidates_primary_engine_first() {
+        let units = canvases();
+        let got = resolve_candidates("Canvas", "", &units);
+        assert_eq!(got.len(), 3, "all candidates must be surfaced, not one");
+        assert_eq!(
+            got[0].id, "canvas::core::Canvas",
+            "the primary unscoped engine must rank first, not the richest fork"
+        );
+    }
+
+    #[test]
+    fn full_unit_id_resolves_to_exactly_one() {
+        let units = canvases();
+        let got = resolve_candidates("canvas::core::Canvas", "", &units);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "canvas::core::Canvas");
+    }
+
+    #[test]
+    fn scope_filters_to_that_project() {
+        let units = canvases();
+        let got = resolve_candidates("Canvas", "synful", &units);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, "synful::canvas::core::Canvas");
+
+        assert!(
+            resolve_candidates("Canvas", "path_forge", &units).is_empty(),
+            "an unmatched scope must return nothing, not fall back to another project"
+        );
+    }
+
+    #[test]
+    fn ranking_is_deterministic_for_equally_rich_units() {
+        let units = vec![
+            unit("b::T", "T", &["x"]),
+            unit("a::T", "T", &["x"]),
+        ];
+        let first = resolve_candidates("T", "", &units)[0].id.clone();
+        let again = resolve_candidates("T", "", &units)[0].id.clone();
+        assert_eq!(first, again);
+        assert_eq!(first, "a::T", "ties break lexicographically by id");
+    }
+
+    #[test]
+    fn method_counting_ignores_empty_segments() {
+        assert_eq!(count_methods("[struct: T]\nmethods: a | b | c\n"), 3);
+        assert_eq!(count_methods("[struct: T]\n"), 0);
+        assert_eq!(count_methods("[struct: T]\nmethods: a |  | b\n"), 2);
+    }
 
     fn ap_store(name: &str) -> Store {
         let dir = std::env::temp_dir().join("cortex-tools-test");

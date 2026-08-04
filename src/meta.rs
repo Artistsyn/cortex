@@ -182,19 +182,31 @@ fn analyze_gap_evolution(store: &Store) -> Result<usize> {
 
 // ── Phase 5c: Threshold impact analysis ──────────────────────────────────────
 
+/// How far back the approval-rate analysis looks. Gate thresholds are tuned for
+/// how the pipeline behaves *now*, so the signal must come from recent runs.
+const THRESHOLD_WINDOW_DAYS: i64 = 30;
+
 /// Compute per-type approval rates and return alerts for types with consistently
-/// low approval (< 20% with >= 5 samples).
+/// low approval (< 20% with >= 5 samples) within the recent window.
+///
+/// The window matters. Scoring all history lets one bad run poison the metric
+/// permanently: a pre-fix burst produced 1,304 auto-rejected drift proposals in
+/// a single minute, after which this analyzer reported "drift_flag: 0/1304
+/// approved (0%)" on every subsequent run — advice derived entirely from a
+/// defect that had already been fixed, which it then proposed acting on.
 fn analyze_threshold_impact(store: &Store) -> Result<Vec<String>> {
+    let cutoff = chrono::Utc::now().timestamp() - THRESHOLD_WINDOW_DAYS * 86_400;
     let mut stmt = store.conn().prepare(
         "SELECT proposal_type,
                 COUNT(*) as total,
                 SUM(CASE WHEN status='approved' THEN 1 ELSE 0 END) as approved_count
          FROM proposals
+         WHERE created_at >= ?1
          GROUP BY proposal_type
          HAVING total >= 5"
     )?;
 
-    let rows = stmt.query_map([], |r| {
+    let rows = stmt.query_map([cutoff], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, i64>(1)?,
@@ -208,8 +220,8 @@ fn analyze_threshold_impact(store: &Store) -> Result<Vec<String>> {
         let rate = approved as f32 / total as f32;
         if rate < 0.2 {
             alerts.push(format!(
-                "Type '{}': {}/{} approved ({:.0}%) — consider adjusting gate thresholds",
-                ptype, approved, total, rate * 100.0
+                "Type '{}': {}/{} approved ({:.0}%) in the last {} days — consider adjusting gate thresholds",
+                ptype, approved, total, rate * 100.0, THRESHOLD_WINDOW_DAYS
             ));
         }
     }
@@ -582,5 +594,68 @@ mod tests {
         assert!(first > 0);
         assert_eq!(second, 0, "second call should stage 0 (deduplication via INSERT OR IGNORE)");
         let _ = std::fs::remove_file(&log);
+    }
+}
+
+#[cfg(test)]
+mod threshold_window_tests {
+    use super::*;
+    use crate::memory::Store;
+
+    fn store(name: &str) -> Store {
+        let dir = std::env::temp_dir().join("cortex-meta-window");
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join(format!("{name}.db"));
+        let _ = std::fs::remove_file(&db);
+        Store::open(&db).unwrap()
+    }
+
+    fn add(s: &Store, ptype: &str, status: &str, age_days: i64, n: usize) {
+        let ts = Utc::now().timestamp() - age_days * 86_400;
+        for i in 0..n {
+            s.conn()
+                .execute(
+                    "INSERT INTO proposals (proposal_type, content_hash, target_file, section,
+                     proposed_text, evidence, status, gate_signals, created_at)
+                     VALUES (?1, ?2, 't', 's', 'x', '{}', ?3, '{}', ?4)",
+                    rusqlite::params![ptype, format!("{ptype}{status}{age_days}{i}"), status, ts],
+                )
+                .unwrap();
+        }
+    }
+
+    /// A burst of auto-rejections from a defect that has since been fixed must
+    /// stop influencing threshold advice once it ages out — otherwise the
+    /// analyzer keeps recommending changes based on a bug that no longer exists.
+    #[test]
+    fn stale_rejections_age_out_of_the_approval_rate() {
+        let s = store("stale");
+        add(&s, "drift_flag", "rejected", 90, 50); // the old pre-fix burst
+        add(&s, "drift_flag", "approved", 1, 8); // healthy recent behaviour
+
+        let alerts = analyze_threshold_impact(&s).unwrap();
+        assert!(
+            alerts.is_empty(),
+            "stale rejections still dragging the rate down: {alerts:?}"
+        );
+    }
+
+    /// Genuinely poor recent performance must still raise an alert.
+    #[test]
+    fn recent_low_approval_still_alerts() {
+        let s = store("recent");
+        add(&s, "drift_flag", "rejected", 2, 20);
+
+        let alerts = analyze_threshold_impact(&s).unwrap();
+        assert_eq!(alerts.len(), 1, "expected one alert, got {alerts:?}");
+        assert!(alerts[0].contains("drift_flag"), "{}", alerts[0]);
+    }
+
+    /// Below the sample floor, say nothing rather than guess from noise.
+    #[test]
+    fn too_few_recent_samples_produces_no_alert() {
+        let s = store("few");
+        add(&s, "drift_flag", "rejected", 2, 3);
+        assert!(analyze_threshold_impact(&s).unwrap().is_empty());
     }
 }

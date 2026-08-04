@@ -112,6 +112,27 @@ enum Command {
         keep_calls: usize,
     },
 
+    /// Remove indexed units that no configured source root claims.
+    ///
+    /// Indexing is INSERT OR REPLACE with no delete, so units from sources that
+    /// were renamed or dropped out of index-sources.json stay in the index and
+    /// keep being served. Run this after a full reindex, passing every root that
+    /// is still configured.
+    ///
+    /// Reports without deleting unless --apply is given.
+    ///
+    /// Example:
+    ///   cortex prune-index --keep quartz/src --keep path_forge/src --apply
+    PruneIndex {
+        /// A source root that is still configured. Repeatable.
+        #[arg(long = "keep")]
+        keep: Vec<String>,
+
+        /// Actually delete. Without this the command only reports.
+        #[arg(long)]
+        apply: bool,
+    },
+
     /// Show memory store statistics.
     Status {
         #[arg(long)]
@@ -654,6 +675,7 @@ fn main() -> Result<()> {
         Command::AntiPattern(cmd)  => run_anti_pattern(cmd, &db_path, format),
         Command::Annotate(cmd)     => run_annotate(cmd, &db_path, format),
         Command::Prune { keep_calls } => run_prune(keep_calls, &db_path),
+        Command::PruneIndex { keep, apply } => run_prune_index(keep, apply, &db_path),
         Command::Status { full }   => run_status(&db_path, full, format),
         Command::Meta(cmd)        => run_meta(cmd, &db_path, format),
         Command::Doctor(cmd)       => run_doctor(cmd, &db_path, format),
@@ -2158,16 +2180,33 @@ fn run_index(args: IndexArgs, db_path: &Path) -> Result<()> {
         let json = std::fs::read_to_string(graph_path)
             .with_context(|| format!("could not read api-graph: {}", graph_path.display()))?;
         let graph_items: Vec<model::ApiGraphItem> = serde_json::from_str(&json)?;
-        let graph_units = compressor::compress_api_graph(&graph_items);
-        eprintln!("  api-graph: {} items ingested from {}", graph_units.len(), graph_path.display());
-        // Merge: api-graph items take precedence (they have richer doc)
-        let source_ids: std::collections::HashSet<&str> = graph_units.iter().map(|u| u.id.as_str()).collect();
-        units.retain(|u| !source_ids.contains(u.id.as_str()));
+        // Same scope as the source itself: quartz-ctx ids are unprefixed, so
+        // ingesting a scoped source without it would collide with the primary
+        // engine's ids and overwrite them.
+        let graph_units = compressor::compress_api_graph(&graph_items, args.scope.as_deref());
+        // Merge: api-graph items take precedence (they carry full method
+        // signatures with types, per-method docs and field docs).
+        let source_ids: std::collections::HashSet<String> =
+            graph_units.iter().map(|u| u.id.clone()).collect();
+        let ingested = source_ids.len();
+        let replaced = units.iter().filter(|u| source_ids.contains(&u.id)).count();
+        units.retain(|u| !source_ids.contains(&u.id));
         units.extend(graph_units);
+        eprintln!(
+            "  api-graph: {} items from {} ({} replaced own extraction, {} added)",
+            ingested,
+            graph_path.display(),
+            replaced,
+            ingested - replaced,
+        );
     }
 
+    // Stamp provenance so orphaned sources can be pruned later. Normalised to
+    // forward slashes so the same root indexed from PowerShell and bash agrees.
+    let source_root = args.source.to_string_lossy().replace('\\', "/");
+
     for unit in &units {
-        store.upsert_unit(unit)?;
+        store.upsert_unit_from(unit, Some(&source_root))?;
         store.upsert_symbol_catalog_from_unit(unit)?;
         store.add_symbol_example_if_missing(
             &unit.id,
@@ -2205,7 +2244,7 @@ fn run_serve(args: ServeArgs, db_path: &Path) -> Result<()> {
         if let Some(graph_path) = &args.api_graph {
             let json = std::fs::read_to_string(graph_path)?;
             let graph_items: Vec<model::ApiGraphItem> = serde_json::from_str(&json)?;
-            units.extend(compressor::compress_api_graph(&graph_items));
+            units.extend(compressor::compress_api_graph(&graph_items, None));
         }
         units
     };
@@ -3343,6 +3382,48 @@ fn build_status_report(store: &Store, db_path: &Path, full: bool) -> Result<Stri
     }
 
     Ok(out)
+}
+
+fn run_prune_index(keep: Vec<String>, apply: bool, db_path: &Path) -> Result<()> {
+    let store = Store::open(db_path)?;
+    let keep: Vec<String> = keep.iter().map(|k| k.replace('\\', "/")).collect();
+
+    if keep.is_empty() {
+        anyhow::bail!(
+            "refusing to run with no --keep roots: that would delete the entire index.\n\
+             help: pass every configured source, e.g. --keep quartz/src --keep path_forge/src"
+        );
+    }
+
+    println!("cortex prune-index");
+    println!("  keeping {} source root(s): {}", keep.len(), keep.join(", "));
+    println!("\n  units by source:");
+
+    let mut orphans = 0i64;
+    for (source, count) in store.units_by_source()? {
+        let label = source.clone().unwrap_or_else(|| "<unstamped>".to_string());
+        let kept = source.as_ref().map(|s| keep.contains(s)).unwrap_or(false);
+        if !kept {
+            orphans += count;
+        }
+        println!("    {:<48} {:>5}  {}", label, count, if kept { "keep" } else { "PRUNE" });
+    }
+
+    if orphans == 0 {
+        println!("\n  nothing to prune.");
+        return Ok(());
+    }
+
+    if !apply {
+        println!("\n  {orphans} unit(s) would be deleted. Re-run with --apply to delete.");
+        println!("  note: run a full reindex first, or units from configured sources that");
+        println!("        predate provenance stamping will be counted as orphans.");
+        return Ok(());
+    }
+
+    let deleted = store.prune_orphan_units(&keep)?;
+    println!("\n  deleted {deleted} orphaned unit(s) and their members, nodes and edges.");
+    Ok(())
 }
 
 fn run_prune(keep_calls: usize, db_path: &Path) -> Result<()> {

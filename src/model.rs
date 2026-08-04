@@ -228,6 +228,21 @@ pub struct ApiGraphItem {
     pub fields: Vec<ApiGraphField>,
     pub generics: String,
     pub traits_impl: Vec<String>,
+    /// Declared visibility (`pub`, `pub(crate)`, `private`, …). Defaults to
+    /// public so api-graphs written before quartz-ctx recorded visibility still
+    /// deserialise.
+    #[serde(default)]
+    pub visibility: Option<String>,
+    /// Where the item is declared, so answers can cite `file:line`.
+    #[serde(default)]
+    pub span: Option<ApiGraphSpan>,
+}
+
+/// A `file:line` source location from quartz-ctx.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiGraphSpan {
+    pub file: String,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

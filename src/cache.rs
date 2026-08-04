@@ -222,7 +222,37 @@ pub fn compute_index_version(conn: &Connection) -> Result<String> {
         hasher.update(b"\n");
     }
 
+    // Hash the build identity.
+    //
+    // Without this the key describes only the DATA, so changing how a tool
+    // RENDERS that data leaves every cached answer valid and the rebuilt binary
+    // replays the old output. That cost a full false-negative debug cycle on
+    // 2026-08-03: a `get_item` ranking fix was verified by unit test, deployed,
+    // and appeared not to work over MCP until three stale rows were deleted by
+    // hand. A cache keyed on inputs alone cannot see a change in the function.
+    hasher.update(b"build:");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(b"@");
+    hasher.update(build_stamp().as_bytes());
+    hasher.update(b"\n");
+
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// A value that changes whenever this binary is rebuilt.
+///
+/// The executable's own modification time is the most reliable signal available
+/// without a build script: it moves on every relink, including a rebuild from
+/// identical sources, which is the conservative direction for a cache key.
+/// Falls back to the compile timestamp constant if the path cannot be read.
+fn build_stamp() -> String {
+    std::env::current_exe()
+        .and_then(|p| std::fs::metadata(p))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|| "unknown-build".to_string())
 }
 
 // ── Session registry (in-memory) ──────────────────────────────────────────────

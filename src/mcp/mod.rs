@@ -49,6 +49,9 @@ const UNCACHEABLE: &[&str] = &[
     "propose_skill",
     // Output varies per call (live command output) — never cache.
     "compact_output",
+    // Depends on per-session fire history, so a cached answer would repeat a
+    // warning the session has already been given.
+    "edit_guard",
 ];
 
 pub fn serve(
@@ -690,6 +693,23 @@ fn tools_list() -> Value {
                         "stderr":  { "type": "string", "description": "The command's stderr stream (cargo/rustc write diagnostics here)." }
                     },
                     "required": ["command"]
+                }
+            },
+            {
+                "name": "edit_guard",
+                "description": "Check an edit against recorded anti-patterns and return a short \
+                                warning if it touches a known trap, or an EMPTY string if it does \
+                                not — silence is the expected outcome. Installed automatically as a \
+                                PostToolUse(Edit|Write) hook; you do not call this yourself. At most \
+                                one trap per edit, never the same trap twice in a session, at most \
+                                four per session.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": { "type": "string", "description": "File being edited, for the message." },
+                        "added":     { "type": "string", "description": "Text the edit introduces (Edit's new_string)." },
+                        "content":   { "type": "string", "description": "Whole-file content (Write's content), when there is no diff." }
+                    }
                 }
             }
         ]

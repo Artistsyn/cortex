@@ -283,6 +283,16 @@ impl Store {
                 added_at    TEXT NOT NULL
             );
 
+            -- Which traps the edit guard has already raised, per session, so an
+            -- unsolicited warning is never repeated at the same author.
+            CREATE TABLE IF NOT EXISTS edit_guard_fires (
+                session_id      TEXT NOT NULL,
+                anti_pattern_id INTEGER NOT NULL,
+                file            TEXT NOT NULL DEFAULT '',
+                fired_at        TEXT NOT NULL,
+                PRIMARY KEY (session_id, anti_pattern_id)
+            );
+
             CREATE TABLE IF NOT EXISTS annotations (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 topic       TEXT NOT NULL,
@@ -820,7 +830,31 @@ impl Store {
 
         self.ensure_supersession_columns()?;
         self.ensure_compression_family_column()?;
+        self.ensure_edit_guard_file_column()?;
 
+        Ok(())
+    }
+
+    /// `file` on edit_guard_fires (idempotent).
+    ///
+    /// CREATE TABLE IF NOT EXISTS does not alter a table that already exists, so
+    /// a column added to the schema after a database was created is simply
+    /// absent — and because the guard's writes are deliberately non-fatal, the
+    /// failure was invisible: the query errored, `unwrap_or(false)` let the
+    /// warning through, and the insert dropped on the floor.
+    fn ensure_edit_guard_file_column(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(edit_guard_fires)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut cols = std::collections::HashSet::new();
+        for c in rows {
+            cols.insert(c?);
+        }
+        if !cols.contains("file") {
+            self.conn.execute(
+                "ALTER TABLE edit_guard_fires ADD COLUMN file TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -1235,6 +1269,48 @@ impl Store {
             params![new_id, old_id],
         )?;
         Ok(n)
+    }
+
+    /// Which traps the edit guard has already raised this session.
+    ///
+    /// Per-session rather than global: a trap worth naming once while you are
+    /// editing is not worth naming again three edits later, but it IS worth
+    /// naming again next week in a different piece of work.
+    pub fn edit_guard_fired_ids(&self, session_id: &str) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT anti_pattern_id FROM edit_guard_fires WHERE session_id = ?1")?;
+        let rows = stmt.query_map(params![session_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Has this session already been warned about this file?
+    ///
+    /// One warning per file, not per trap. A file is edited many times in a row
+    /// during real work — this session touched some files fifteen times — and
+    /// "never the same trap twice" alone still permits a fresh trap on each of
+    /// those edits, which is the wallpaper outcome by a slower route.
+    pub fn edit_guard_warned_file(&self, session_id: &str, file: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM edit_guard_fires WHERE session_id = ?1 AND file = ?2",
+            params![session_id, file],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn record_edit_guard_fire(
+        &self,
+        session_id: &str,
+        anti_pattern_id: i64,
+        file: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO edit_guard_fires (session_id, anti_pattern_id, file, fired_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, anti_pattern_id, file, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
     }
 
     /// Entries retired by `supersede`, newest replacement first.

@@ -51,10 +51,94 @@ pub fn dispatch(
         // Lossless output compaction: post-processes output the agent already
         // obtained through the normal (permissioned) Bash path. No execution.
         "compact_output"          => tool_compact_output(args, store, session_id, repo_root),
+        "edit_guard"              => tool_edit_guard(args, store, session_id),
         other                  => Err(format!("unknown tool: {other}")),
     }?;
 
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+}
+
+// ── edit_guard ──────────────────────────────────────────────────────────────
+
+/// Never warn about the same trap twice in one session.
+/// Never warn more than this many times in one session, whatever matches.
+const EDIT_GUARD_SESSION_CAP: usize = 4;
+/// An unsolicited warning has to clear a higher bar than an asked-for one.
+const EDIT_GUARD_MIN_SCORE: usize = 3;
+
+/// Surface a known trap AT THE MOMENT OF THE EDIT, not at session boot.
+///
+/// Retrieval is pull: a trap in the store only helps if the agent thinks to ask,
+/// and the moment it is least likely to ask is the moment it is most sure — the
+/// recorded anti-pattern "check cortex when most confident" exists because that
+/// is when the checking stops. This is the same knowledge, pushed.
+///
+/// The whole design problem is not finding matches, it is NOT SPEAKING. A hook
+/// that fires on every edit is wallpaper within a session: this very project has
+/// a hook that printed "No preview server is running" on some fifteen
+/// consecutive edits, useful once and ignored thereafter — and an ignored
+/// warning is worse than none, because it trains the reader to skip the next.
+///
+/// So: at most one trap per edit, never the same trap twice in a session, at
+/// most four in total, and a match threshold higher than ordinary retrieval
+/// uses. Silence is the expected outcome and returns an empty string.
+fn tool_edit_guard(args: &Value, store: &Store, session_id: &str) -> Result<String, String> {
+    // Edit sends new_string; Write sends content. Either may be absent.
+    let added = args
+        .get("added")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| args.get("content").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    // A one-line tweak carries no context to judge; matching it produces noise.
+    if added.len() < 120 {
+        return Ok(String::new());
+    }
+
+    let file_path = args.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+    // One warning per file per session. "Never the same trap twice" is not
+    // enough on its own: a file gets edited fifteen times in a row during real
+    // work, and a fresh trap on each of those edits is the wallpaper outcome by
+    // a slower route. Caught by a test that expected silence and got a warning.
+    if store.edit_guard_warned_file(session_id, file_path).unwrap_or(false) {
+        return Ok(String::new());
+    }
+    let already = store.edit_guard_fired_ids(session_id).unwrap_or_default();
+    if already.len() >= EDIT_GUARD_SESSION_CAP {
+        return Ok(String::new());
+    }
+
+    // Score the ADDED text against each trap. `wrong` carries the shape to
+    // avoid, so it is the part worth matching; the description gives the topic.
+    let tokens = hint_tokens(added);
+    if tokens.is_empty() {
+        return Ok(String::new());
+    }
+    let aps = store.all_anti_patterns().map_err(|e| e.to_string())?;
+    let best = aps
+        .iter()
+        .filter(|ap| ap.id.is_some_and(|id| !already.contains(&id)))
+        .map(|ap| {
+            let hay =
+                format!("{} {} {}", ap.description, ap.wrong, ap.tags.join(" ")).to_lowercase();
+            (text_hint_score(&hay, &tokens), ap)
+        })
+        .filter(|(s, _)| *s >= EDIT_GUARD_MIN_SCORE)
+        .max_by_key(|(s, _)| *s);
+
+    let Some((score, ap)) = best else { return Ok(String::new()) };
+    let Some(id) = ap.id else { return Ok(String::new()) };
+    let _ = store.record_edit_guard_fire(session_id, id, file_path);
+
+    // Short by construction. The point is to interrupt, not to teach; the full
+    // entry is one get_anti_patterns call away and the description names it.
+    let file = if file_path.is_empty() { "this edit" } else { file_path };
+    let file = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    Ok(format!(
+        "[cortex] {file} touches a recorded trap (match {score}):\n  {}\n  → {}\n",
+        ap.description.trim(),
+        ap.correct.trim(),
+    ))
 }
 
 // ── compact_output ──────────────────────────────────────────────────────────
@@ -2722,6 +2806,63 @@ mod delta_mode_tests {
         let t = hint_tokens("cache cache cache");
         assert_eq!(t.len(), 1);
         assert_eq!(text_hint_score("cache cache cache cache", &t), 1);
+    }
+
+    // ── edit guard: the tests are about staying quiet ─────────────────────────
+
+    #[test]
+    fn a_small_edit_says_nothing() {
+        let Some(store) = live_store() else { return };
+        let out = tool_edit_guard(
+            &serde_json::json!({ "file_path": "a.rs", "added": "let x = 1;" }),
+            &store,
+            "test_guard_small",
+        )
+        .unwrap();
+        assert!(out.is_empty(), "a one-liner has no context to judge: {out}");
+    }
+
+    #[test]
+    fn an_edit_that_matches_nothing_says_nothing() {
+        let Some(store) = live_store() else { return };
+        let prose = "the quick brown fox jumps over the lazy dog ".repeat(6);
+        let out = tool_edit_guard(
+            &serde_json::json!({ "file_path": "a.txt", "added": prose }),
+            &store,
+            "test_guard_nomatch",
+        )
+        .unwrap();
+        assert!(out.is_empty(), "unrelated text must be silent: {out}");
+    }
+
+    #[test]
+    fn the_same_trap_is_never_raised_twice_in_one_session() {
+        let Some(store) = live_store() else { return };
+        let session = format!("test_guard_dedupe_{}", std::process::id());
+        // Text drawn from a real recorded trap, so it scores.
+        let added = "engine.setHardwareScalingLevel and createPickingRay with \
+                     devicePixelRatio scaling of the canvas rect for the picking ray "
+            .repeat(3);
+        let args = serde_json::json!({ "file_path": "input.js", "added": added });
+
+        let first = tool_edit_guard(&args, &store, &session).unwrap();
+        let second = tool_edit_guard(&args, &store, &session).unwrap();
+        if !first.is_empty() {
+            assert!(second.is_empty(), "a repeated warning trains the reader to ignore it");
+        }
+        let _ = store.conn().execute(
+            "DELETE FROM edit_guard_fires WHERE session_id = ?1",
+            rusqlite::params![session],
+        );
+    }
+
+    #[test]
+    fn a_session_is_never_warned_more_than_the_cap() {
+        assert!(EDIT_GUARD_SESSION_CAP <= 5, "beyond a handful it is wallpaper");
+        assert!(
+            EDIT_GUARD_MIN_SCORE > hint_expand_threshold(&hint_tokens("a b c")),
+            "an unsolicited warning must clear a higher bar than an asked-for one",
+        );
     }
 
     #[test]

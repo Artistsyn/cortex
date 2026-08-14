@@ -875,24 +875,45 @@ fn ensure_compact_hook(root: &Path, local: bool, force: bool) -> Result<HookOutc
         .as_array_mut()
         .ok_or_else(|| anyhow::anyhow!("`hooks.PostToolUse` in {filename} is not an array"))?;
 
-    let is_compact = |entry: &Value| -> bool {
+    // The edit guard rides the same mechanism: an mcp_tool hook needs no shell,
+    // no binary path and no per-machine wiring, so it installs itself with the
+    // compaction hook and there is nothing for anyone to remember. It returns an
+    // empty string unless an edit touches a recorded trap, which is why it can
+    // be attached to every edit without becoming noise.
+    let guard_hook = json!({
+        "matcher": "Edit|Write",
+        "hooks": [{
+            "type": "mcp_tool",
+            "server": "cortex",
+            "tool": "edit_guard",
+            "input": {
+                "file_path": "${tool_input.file_path}",
+                "added": "${tool_input.new_string}",
+                "content": "${tool_input.content}"
+            }
+        }]
+    });
+
+    let names_tool = |entry: &Value, tool: &str| -> bool {
         entry.get("hooks").and_then(|h| h.as_array()).is_some_and(|hooks| {
             hooks.iter().any(|h| {
-                h.get("tool").and_then(|t| t.as_str()) == Some("compact_output")
+                h.get("tool").and_then(|t| t.as_str()) == Some(tool)
                     && h.get("server").and_then(|s| s.as_str()) == Some("cortex")
             })
         })
     };
+    let is_compact = |e: &Value| names_tool(e, "compact_output");
+    let is_guard = |e: &Value| names_tool(e, "edit_guard");
 
     // Already present and identical → no-op (unless --force refresh requested).
-    let existing = arr.iter().find(|e| is_compact(e));
-    if let Some(existing) = existing {
-        if !force && *existing == compact_hook {
-            return Ok(HookOutcome::AlreadyPresent);
-        }
+    let compact_current = arr.iter().find(|e| is_compact(e)).is_some_and(|e| *e == compact_hook);
+    let guard_current = arr.iter().find(|e| is_guard(e)).is_some_and(|e| *e == guard_hook);
+    if !force && compact_current && guard_current {
+        return Ok(HookOutcome::AlreadyPresent);
     }
-    arr.retain(|e| !is_compact(e));
+    arr.retain(|e| !is_compact(e) && !is_guard(e));
     arr.push(compact_hook);
+    arr.push(guard_hook);
 
     let rendered = serde_json::to_string_pretty(&Value::Object(root_obj))?;
     std::fs::write(&settings_path, rendered)
@@ -906,11 +927,15 @@ fn run_hooks_init(root: Option<PathBuf>, shared: bool, force: bool) -> Result<()
     let filename = if shared { "settings.json" } else { "settings.local.json" };
     match outcome {
         HookOutcome::Written => println!(
-            "Wrote .claude/{filename} — cortex compact_output hook installed on PostToolUse(Bash).\n\
-             It losslessly strips build/test progress noise (stdout + stderr) and tees the full \
-             log to .cortex/tee/. Restart Claude Code (or reload the session) for it to take effect.\n\
-             Note: this is a Claude Code hook. VS Code Copilot cannot auto-rewrite tool output — \
-             it can still call the compact_output MCP tool directly (exposed via .vscode/mcp.json)."
+            "Wrote .claude/{filename} — two cortex hooks installed:\n\
+             \x20 compact_output on PostToolUse(Bash) — losslessly strips build/test progress \
+             noise (stdout + stderr) and tees the full log to .cortex/tee/.\n\
+             \x20 edit_guard on PostToolUse(Edit|Write) — names a recorded trap when an edit \
+             touches one. Silent otherwise, and capped at one warning per file and four per \
+             session, so it cannot become wallpaper.\n\
+             Restart Claude Code (or reload the session) for them to take effect.\n\
+             Note: these are Claude Code hooks. VS Code Copilot cannot auto-rewrite tool output \
+             or observe edits — it can still call the MCP tools directly (via .vscode/mcp.json)."
         ),
         HookOutcome::AlreadyPresent => {
             println!("cortex compact_output hook already present in .claude/{filename} — no change.")

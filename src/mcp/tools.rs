@@ -2669,12 +2669,14 @@ mod delta_mode_tests {
             "SELECT COUNT(*) FROM session_retrieval_log WHERE session_id = ?1",
             rusqlite::params![session], |r| r.get(0),
         ).expect("session_retrieval_log query");
+        // LIVE rows only. A superseded entry is not served, so crediting it as
+        // retrieved would feed survival scoring for knowledge nobody can act on.
         let recorded: i64 = store.conn().query_row(
-            "SELECT COUNT(*) FROM anti_patterns", [], |r| r.get(0),
+            "SELECT COUNT(*) FROM anti_patterns WHERE superseded_by IS NULL", [], |r| r.get(0),
         ).expect("anti_patterns count");
         assert_eq!(
             total, recorded,
-            "every anti-pattern must be logged as retrieved even when omitted from the text",
+            "every live anti-pattern must be logged as retrieved even when omitted from the text",
         );
         let _ = store.conn().execute(
             "DELETE FROM session_retrieval_log WHERE session_id = ?1", rusqlite::params![session]);

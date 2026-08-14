@@ -819,7 +819,59 @@ impl Store {
         }
 
         self.ensure_supersession_columns()?;
+        self.ensure_compression_family_column()?;
 
+        Ok(())
+    }
+
+    /// `command_family` on compression_savings (idempotent), plus a one-time
+    /// backfill so the history already collected becomes analysable.
+    fn ensure_compression_family_column(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(compression_savings)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut cols = std::collections::HashSet::new();
+        for c in rows {
+            cols.insert(c?);
+        }
+        if !cols.contains("command_family") {
+            self.conn
+                .execute("ALTER TABLE compression_savings ADD COLUMN command_family TEXT", [])?;
+        }
+
+        // Guard the backfill on a rule version, not on the column's existence.
+        // The parsing rule is the thing that changes; bumping this re-derives
+        // history so old rows and new ones are always grouped the same way. The
+        // first rule missed newline separators and filed 78 rows under path
+        // fragments, which is exactly the kind of correction this has to allow.
+        const FAMILY_RULE_VERSION: &str = "2";
+        let applied: Option<String> = self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = 'compression_family_rule'", [], |r| {
+                r.get(0)
+            })
+            .ok();
+        if applied.as_deref() == Some(FAMILY_RULE_VERSION) {
+            return Ok(());
+        }
+
+        // Backfill in Rust rather than SQL: the parsing rule is the same one new
+        // rows use, so history and future agree by construction.
+        let existing: Vec<(i64, String)> = {
+            let mut s = self.conn.prepare("SELECT id, command FROM compression_savings")?;
+            let r = s.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            r.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (id, cmd) in existing {
+            self.conn.execute(
+                "UPDATE compression_savings SET command_family = ?1 WHERE id = ?2",
+                params![Self::command_family(&cmd), id],
+            )?;
+        }
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('compression_family_rule', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![FAMILY_RULE_VERSION],
+        )?;
         Ok(())
     }
 
@@ -1392,6 +1444,48 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+/// The tool a command belongs to, for grouping compaction telemetry.
+///
+/// The full command string is kept for forensics, but it is useless for
+/// analysis: measured on the live store, 3,468 of 3,487 rows had a distinct
+/// `command`, because every one embeds a working directory, a path or a flag.
+/// "Which tools does compaction actually help?" — the question the 14%
+/// applicability rate exists to answer — could not be asked at all.
+///
+/// Environment assignments and `cd ... &&` prefixes are stepped over, since the
+/// interesting token is the program that produced the output.
+pub fn command_family(command: &str) -> String {
+    let mut rest = command.trim();
+    loop {
+        let head = rest.split_whitespace().next().unwrap_or("");
+        let is_env_assignment = head.contains('=') && !head.starts_with('-');
+        let is_prefix = matches!(head, "cd" | "sudo" | "time" | "env" | "nohup");
+        if !(is_env_assignment || is_prefix) {
+            break;
+        }
+        // Step past this token, and past a `&&`/`;` separator if one follows.
+        rest = rest[head.len()..].trim_start();
+        if is_prefix && head != "env" {
+            // The separator may be `&&`, `;` or a newline — a multi-line script
+            // is common. Take whichever comes first, or give up if the command
+            // is only the prefix. Missing the newline case attributed 78 rows to
+            // "src" and "vr_workspace", which are path fragments, not programs.
+            let cut = ["&&", ";", "\n"]
+                .iter()
+                .filter_map(|sep| rest.find(sep).map(|i| i + sep.len()))
+                .min();
+            match cut {
+                Some(i) => rest = rest[i..].trim_start(),
+                None => break, // `cd somewhere` with nothing after it
+            }
+        }
+    }
+    let head = rest.split_whitespace().next().unwrap_or("").trim_matches(['"', '\'', '(']);
+    // Keep the program, drop any path leading to it.
+    let base = head.rsplit(['/', '\\']).next().unwrap_or(head);
+    if base.is_empty() { "(unknown)".to_string() } else { base.to_lowercase() }
+}
+
     /// Record a lossless-compaction saving for telemetry. Non-fatal by
     /// contract — callers ignore the Result so a logging failure never breaks
     /// the compaction itself.
@@ -1409,9 +1503,16 @@ impl Store {
         };
         self.conn.execute(
             "INSERT INTO compression_savings
-                (session_key, command, original_chars, filtered_chars, ratio)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![session_key, command, original_chars as i64, filtered_chars as i64, ratio],
+                (session_key, command, command_family, original_chars, filtered_chars, ratio)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_key,
+                command,
+                Self::command_family(command),
+                original_chars as i64,
+                filtered_chars as i64,
+                ratio
+            ],
         )?;
         Ok(())
     }

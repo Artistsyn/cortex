@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::cache::{
-    cache_stats, compute_index_version, current_index_version, get_cached_response, cache_response,
+    cache_stats, compute_index_version, current_index_version,
     staleness_notice,
     invalidate_stale, SessionRegistry,
 };
@@ -51,6 +51,10 @@ const UNCACHEABLE: &[&str] = &[
     // Depends on per-session fire history, so a cached answer would repeat a
     // warning the session has already been given.
     "edit_guard",
+    // Both mutate the challenge log; a replayed answer would claim a challenge
+    // was recorded or settled when it was not.
+    "note_challenge",
+    "resolve_challenge",
 ];
 
 pub fn serve(
@@ -186,24 +190,25 @@ pub fn serve(
                     }
                 }
 
-                // Sampled per request: an edit or a reindex mid-session must move
-                // the key, or the cache serves a world that no longer exists.
-                let index_version = current_index_version(store.conn(), Some(repo_root.as_path()));
+                // Still sampled per request, but now only to decide whether the
+                // INDEX is stale enough to warn about — nothing is keyed on it.
+                let _index_version =
+                    current_index_version(store.conn(), Some(repo_root.as_path()));
 
-                // Check response cache (skip for volatile tools).
-                let cached = if UNCACHEABLE.contains(&tool) {
-                    None
-                } else {
-                    get_cached_response(store.conn(), tool, &args_str, &index_version)
-                        .unwrap_or(None)
-                };
-
-                if let Some(cached_text) = cached {
-                    eprintln!("  [cache hit] {}", tool);
-                    Ok(json!({
-                        "content": [{ "type": "text", "text": cached_text }]
-                    }))
-                } else {
+                // The response cache is gone.
+                //
+                // It was correct, it invalidated properly, and it was pointless:
+                // a cache hit returns byte-identical text, so the agent pays the
+                // same tokens either way. It saved server CPU on a workload that
+                // was never CPU-bound, and after every fix it still held zero
+                // entries and zero hits, because required hints made repeat
+                // calls with identical arguments vanishingly rare.
+                //
+                // Kept for months as a token-saving measure that could not save a
+                // token by construction. Removing it deletes a cache-key
+                // correctness problem — one already survived a release serving
+                // stale answers after a rebuild — for no loss.
+                {
                     let mut result = tools::dispatch(
                         tool,
                         &args,
@@ -214,22 +219,6 @@ pub fn serve(
                         &repo_root,
                         &prefs_summary,
                     );
-
-                    // Cache the ORIGINAL answer, before any notice is added.
-                    // A cached notice would be replayed long after the reindex
-                    // that cleared it -- a warning outliving its own condition
-                    // is worse than no warning, because it teaches you to ignore
-                    // the next one.
-                    if let Ok(ref res) = result {
-                        if !UNCACHEABLE.contains(&tool) {
-                            if let Some(text) = res["content"][0]["text"].as_str() {
-                                let _ = cache_response(
-                                    store.conn(), tool, &args_str,
-                                    &index_version, text, CACHE_MAX_ENTRIES,
-                                );
-                            }
-                        }
-                    }
 
                     // Then attach the notice to the answer it qualifies, so it
                     // rides on the response the staleness actually affects.
@@ -688,6 +677,46 @@ fn tools_list() -> Value {
                         "added":     { "type": "string", "description": "Text the edit introduces (Edit's new_string)." },
                         "content":   { "type": "string", "description": "Whole-file content (Write's content), when there is no diff." }
                     }
+                }
+            },
+            {
+                "name": "note_challenge",
+                "description": "Note that a user message disputed something you claimed. Installed \
+                                automatically as a UserPromptSubmit hook; you do not call this \
+                                yourself. Returns an EMPTY string for the overwhelming majority of \
+                                messages — silence is the expected outcome. When it does fire it \
+                                records an OPEN question, never a finding: nothing reaches memory \
+                                until you check who was right and call resolve_challenge.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": { "type": "string", "description": "The user's message." }
+                    }
+                }
+            },
+            {
+                "name": "resolve_challenge",
+                "description": "Settle a disagreement AFTER checking, and propose what it taught. \
+                                Call this once you have actually verified who was right — not from \
+                                memory of the argument. verdict=user_right proposes an anti-pattern \
+                                describing how you went wrong; verdict=agent_right proposes a note \
+                                strengthening the claim that survived the challenge; \
+                                verdict=unresolved stores NOTHING and is the correct answer when the \
+                                question was never settled. Everything raised here is a proposal \
+                                pending human review; nothing is written to memory.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "id":      { "type": "integer", "description": "Challenge id, from note_challenge or get_session_health." },
+                        "verdict": {
+                            "type": "string",
+                            "enum": ["user_right", "agent_right", "mixed", "unresolved"],
+                            "description": "How it came out once checked."
+                        },
+                        "subject":  { "type": "string", "description": "The claim itself, in one sentence — what is true, stated so it is usable next time." },
+                        "evidence": { "type": "string", "description": "What you actually checked: a command you ran and its result, a file:line you read, an observed behaviour. Required for user_right and agent_right; a verdict without it is refused." }
+                    },
+                    "required": ["id", "verdict", "subject", "evidence"]
                 }
             }
         ]

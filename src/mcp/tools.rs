@@ -51,10 +51,79 @@ pub fn dispatch(
         // obtained through the normal (permissioned) Bash path. No execution.
         "compact_output"          => tool_compact_output(args, store, session_id, repo_root),
         "edit_guard"              => tool_edit_guard(args, store, session_id),
+        "note_challenge"          => tool_note_challenge(args, store, session_id),
+        "resolve_challenge"       => tool_resolve_challenge(args, store),
         other                  => Err(format!("unknown tool: {other}")),
     }?;
 
     Ok(json!({ "content": [{ "type": "text", "text": text }] }))
+}
+
+// ── user corrections ────────────────────────────────────────────────────────
+
+/// Note a challenge, and — only when one fires — say the one thing the agent
+/// needs to hear.
+///
+/// The returned text is injected into the conversation by the UserPromptSubmit
+/// hook, so it has to earn its place. It is empty for almost every message. When
+/// it is not, it is deliberately a reminder to *check*, not a reminder to record:
+/// the failure this guards against is settling an argument from memory of the
+/// argument.
+fn tool_note_challenge(
+    args: &Value,
+    store: &Store,
+    session_id: &str,
+) -> Result<String, String> {
+    let prompt = args["prompt"].as_str().unwrap_or("");
+    if prompt.is_empty() {
+        return Ok(String::new());
+    }
+    // An uninterpolated template arrives as the literal `${prompt}`. Silence
+    // here would look exactly like "no challenges were ever raised" — the
+    // failure mode this project keeps shipping. Say it out loud instead.
+    if prompt.trim_start().starts_with("${") {
+        return Ok(format!(
+            "[cortex] note_challenge received an uninterpolated template ({}). \
+             The UserPromptSubmit hook is installed but its input variable is wrong, \
+             so no correction will ever be recorded. Fix the `input` mapping in \
+             .claude/settings.local.json.",
+            prompt.trim()
+        ));
+    }
+    let outcome = crate::corrections::note(store, session_id, prompt);
+    // Beat before branching: the heartbeat is about the HOOK running, and it
+    // must be recorded on the silent path too — that is the only path there is,
+    // almost always.
+    let _ = crate::corrections::beat(store, matches!(outcome, Ok(Some(_))));
+
+    match outcome {
+        Ok(Some(id)) => Ok(format!(
+            "[cortex] That reads as a challenge to something you said. Settle it by \
+             CHECKING — run the command, read the file — not from memory of the \
+             exchange, then call resolve_challenge(id={id}, ...). If it never gets \
+             settled, `unresolved` is the honest answer and stores nothing."
+        )),
+        // Already noted, or not a challenge. Both are silent.
+        Ok(None) => Ok(String::new()),
+        // A logging failure must never block the user's message.
+        Err(_) => Ok(String::new()),
+    }
+}
+
+fn tool_resolve_challenge(args: &Value, store: &Store) -> Result<String, String> {
+    let id = args["id"].as_i64().ok_or("missing `id`")?;
+    let raw = args["verdict"].as_str().ok_or("missing `verdict`")?;
+    let verdict = crate::corrections::Verdict::parse(raw).ok_or_else(|| {
+        format!("unknown verdict `{raw}` — use user_right, agent_right, mixed, or unresolved")
+    })?;
+    let subject = args["subject"].as_str().unwrap_or("").trim();
+    let evidence = args["evidence"].as_str().unwrap_or("");
+
+    if subject.is_empty() {
+        return Err("missing `subject` — state in one sentence what is actually true".into());
+    }
+    crate::corrections::resolve(store, id, verdict, subject, evidence)
+        .map_err(|e| e.to_string())
 }
 
 // ── edit_guard ──────────────────────────────────────────────────────────────
@@ -1857,11 +1926,23 @@ fn review_queue_line(store: &Store) -> String {
     // anything that clears it has survived being fixed twice already.
     let repeats = crate::test_signal::recurring(store, 3).unwrap_or_default();
 
-    if drafted.is_empty() && proposals == 0 && repeats.is_empty() {
+    // Disagreements nobody settled. Listed for the AGENT more than the human:
+    // an open challenge is a correction that was received and dropped, and the
+    // agent that dropped it is the one least likely to remember.
+    let open = crate::corrections::open_count(store).unwrap_or(0);
+
+    if drafted.is_empty() && proposals == 0 && repeats.is_empty() && open == 0 {
         return String::new();
     }
 
     let mut out = String::from("\n\nAWAITING YOUR REVIEW\n");
+    if open > 0 {
+        out.push_str(&format!(
+            "  {open} unsettled challenge(s) — someone disputed a claim and it was \
+             never checked\n    settle each by checking, then resolve_challenge(id, verdict, \
+             subject, evidence)\n"
+        ));
+    }
     for (sig, count, sample) in &repeats {
         let first = sample.lines().next().unwrap_or("").trim();
         out.push_str(&format!(

@@ -320,6 +320,40 @@ impl Store {
                 last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch())
             );
 
+            -- Moments the user disputed something the agent claimed. A row here
+            -- is a QUESTION, not a finding: `verdict` stays NULL until somebody
+            -- actually checked, and only then does anything reach the proposal
+            -- queue. Storing the user's side on sight would teach the store
+            -- things that are false — both directions genuinely occur.
+            CREATE TABLE IF NOT EXISTS challenges (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT NOT NULL,
+                cue         TEXT NOT NULL,
+                excerpt     TEXT NOT NULL,
+                verdict     TEXT,
+                subject     TEXT,
+                evidence    TEXT,
+                raised_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+                resolved_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_challenges_session
+                ON challenges(session_id);
+
+            -- Proof a hook RAN, separate from whether it found anything.
+            --
+            -- Without this the audit cannot tell a correctly-silent mechanism
+            -- from a dead one: note_challenge fires on every message and records
+            -- a row only when a claim is disputed, so an empty challenges table
+            -- means either nobody argued or the hook was never installed - and
+            -- those need opposite responses. Every silent-by-design mechanism
+            -- needs a heartbeat that is not its own output.
+            CREATE TABLE IF NOT EXISTS hook_heartbeat (
+                hook       TEXT PRIMARY KEY,
+                fired      INTEGER NOT NULL DEFAULT 0,
+                matched    INTEGER NOT NULL DEFAULT 0,
+                last_fired INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
             CREATE TABLE IF NOT EXISTS edit_guard_fires (
                 session_id      TEXT NOT NULL,
                 anti_pattern_id INTEGER NOT NULL,

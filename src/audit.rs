@@ -53,6 +53,26 @@ pub const MECHANISMS: &[Mechanism] = &[
         expect_days: 30.0,
         when_idle: "no edit has matched a trap; check the hook is installed",
     },
+    // The HOOK, not its output. `challenges` stays empty whenever nobody
+    // disagrees, which is most of the time and is correct — so watching that
+    // table cannot distinguish a working mechanism from an uninstalled one.
+    Mechanism {
+        label: "note_challenge hook (is it running)",
+        table: "hook_heartbeat",
+        ts_col: "last_fired",
+        expect_days: 2.0,
+        when_idle: "the UserPromptSubmit hook is not installed or not reaching the server",
+    },
+    Mechanism {
+        label: "user corrections captured",
+        table: "challenges",
+        ts_col: "raised_at",
+        // Disagreements are genuinely rare. This going quiet is a fact about the
+        // conversations, not a fault — which is exactly why the hook above is
+        // watched separately.
+        expect_days: 60.0,
+        when_idle: "no claim has been disputed; not a fault if the hook above is live",
+    },
     Mechanism {
         label: "retrieval telemetry",
         table: "session_retrieval_log",
@@ -94,13 +114,6 @@ pub const MECHANISMS: &[Mechanism] = &[
         ts_col: "last_seen_at",
         expect_days: 21.0,
         when_idle: "either coverage is perfect or gap logging is broken",
-    },
-    Mechanism {
-        label: "response cache",
-        table: "response_cache",
-        ts_col: "created_at",
-        expect_days: 7.0,
-        when_idle: "inert by design once delta mode exists; safe to remove",
     },
 ];
 

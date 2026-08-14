@@ -81,6 +81,46 @@ fn looks_passed(out: &str) -> bool {
     NEEDLES.iter().any(|n| out.contains(n))
 }
 
+/// A stable identity for a failure, so the same one can be recognised again.
+///
+/// Deliberately coarse. The point is not to describe a failure precisely, it is
+/// to tell whether THIS failure is one we keep having — so anything that varies
+/// between occurrences (paths, line numbers, counts, durations) is stripped.
+///
+/// Returns `None` for output that failed without a recognisable signature; a
+/// failure we cannot name is one we cannot count, and guessing would merge
+/// unrelated failures into one bogus "recurring" trap.
+pub fn error_signature(output: &str) -> Option<String> {
+    // A Rust error code is the best identity available: stable, specific, and
+    // already a shared vocabulary.
+    if let Some(i) = output.find("error[E") {
+        let code: String =
+            output[i + 6..].chars().take_while(|c| c.is_alphanumeric()).collect();
+        if !code.is_empty() {
+            return Some(format!("rust:{code}"));
+        }
+    }
+    // A failing assertion: keep the message, drop the location and the numbers.
+    if let Some(i) = output.find("panicked at ") {
+        let tail = &output[i + 12..];
+        let msg = tail.lines().nth(1).unwrap_or("").trim();
+        if !msg.is_empty() {
+            let norm: String = msg
+                .chars()
+                .filter(|c| !c.is_ascii_digit())
+                .take(80)
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if norm.len() > 12 {
+                return Some(format!("assert:{norm}"));
+            }
+        }
+    }
+    None
+}
+
 /// Record an outcome and bring the session's score into line with it.
 ///
 /// Returns the number of patterns whose counters moved, for logging.
@@ -90,6 +130,50 @@ pub fn observe(store: &Store, session_id: &str, command: &str, passed: bool) -> 
         params![session_id, command, passed as i64],
     )?;
     apply_verdict(store, session_id, passed)
+}
+
+/// Count a failure so a RECURRING one can be told from a one-off.
+///
+/// This is the filter that makes automatic capture worth having. Most failures
+/// are a typo, a missing import, a name I got wrong — real, fixed in seconds,
+/// and worthless as knowledge. Recording them all would bury the store.
+///
+/// A failure that keeps coming back is a different animal. It does not need
+/// judging, only counting: noise does not repeat, traps do. So nothing is
+/// proposed on a first sighting, and the threshold is crossed only by failures
+/// that survived being fixed at least twice.
+pub fn note_failure(store: &Store, session_id: &str, command: &str, output: &str) -> Result<()> {
+    let Some(sig) = error_signature(output) else { return Ok(()) };
+    // One count per session per signature: hitting the same compile error four
+    // times while iterating on one fix is one occurrence, not four.
+    store.conn().execute(
+        "INSERT INTO recurring_errors (signature, sample, command, sessions, seen_count,
+                                       first_seen_at, last_seen_at)
+         VALUES (?1, ?2, ?3, json_array(?4), 1, unixepoch(), unixepoch())
+         ON CONFLICT(signature) DO UPDATE SET
+             seen_count   = seen_count + (CASE WHEN instr(sessions, ?4) = 0 THEN 1 ELSE 0 END),
+             sessions     = CASE WHEN instr(sessions, ?4) = 0
+                                 THEN json_insert(sessions, '$[#]', ?4) ELSE sessions END,
+             last_seen_at = unixepoch()",
+        params![sig, first_lines(output, 4), command, session_id],
+    )?;
+    Ok(())
+}
+
+fn first_lines(s: &str, n: usize) -> String {
+    s.lines().filter(|l| !l.trim().is_empty()).take(n).collect::<Vec<_>>().join("\n")
+}
+
+/// Failures seen in at least `min` distinct sessions — worth a human deciding
+/// whether they are a trap.
+pub fn recurring(store: &Store, min: i64) -> Result<Vec<(String, i64, String)>> {
+    let mut stmt = store.conn().prepare(
+        "SELECT signature, seen_count, sample FROM recurring_errors
+         WHERE seen_count >= ?1 AND proposed = 0
+         ORDER BY seen_count DESC",
+    )?;
+    let rows = stmt.query_map(params![min], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Make the stored counters reflect this session's CURRENT verdict.
@@ -339,6 +423,62 @@ mod tests {
         let fixed = counters(&store, id);
         assert_eq!(fixed.1, before.1, "a fixed session should not stay blamed");
         cleanup(&store, &session, id, before);
+    }
+
+    // ── recurring-failure detection ──────────────────────────────────────────
+
+    #[test]
+    fn the_same_error_code_gets_the_same_signature() {
+        let a = "error[E0432]: unresolved import `foo::Bar`\n --> src/a.rs:12:5";
+        let b = "error[E0432]: unresolved import `baz::Qux`\n --> src/zzz.rs:99:1";
+        assert_eq!(error_signature(a), error_signature(b), "paths must not split the identity");
+        assert_eq!(error_signature(a), Some("rust:E0432".into()));
+    }
+
+    #[test]
+    fn different_failures_do_not_collide() {
+        assert_ne!(
+            error_signature("error[E0432]: unresolved import"),
+            error_signature("error[E0308]: mismatched types"),
+        );
+    }
+
+    #[test]
+    fn an_assertion_keeps_its_message_and_drops_its_numbers() {
+        let a = "panicked at src/x.rs:12:9:\nexpected 0.278 to be less than 0.001\n";
+        let b = "panicked at src/y.rs:88:1:\nexpected 0.384 to be less than 0.005\n";
+        assert_eq!(error_signature(a), error_signature(b), "the numbers vary, the trap does not");
+        assert!(error_signature(a).unwrap().starts_with("assert:"));
+    }
+
+    #[test]
+    fn a_failure_we_cannot_name_is_not_counted() {
+        // Guessing here would merge unrelated failures into one bogus "recurring"
+        // trap, which is worse than missing it.
+        assert_eq!(error_signature("something went wrong"), None);
+        assert_eq!(error_signature(""), None);
+    }
+
+    #[test]
+    fn hitting_one_error_repeatedly_in_a_session_counts_once() {
+        let Some(store) = live_store() else { return };
+        let session = format!("test_recur_{}", std::process::id());
+        let sig_src = "error[E0999]: a signature used only by this test";
+        for _ in 0..5 {
+            note_failure(&store, &session, "cargo test", sig_src).unwrap();
+        }
+        let n: i64 = store
+            .conn()
+            .query_row(
+                "SELECT seen_count FROM recurring_errors WHERE signature = 'rust:E0999'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "iterating on one fix is one occurrence, not five");
+        let _ = store
+            .conn()
+            .execute("DELETE FROM recurring_errors WHERE signature = 'rust:E0999'", []);
     }
 
     #[test]

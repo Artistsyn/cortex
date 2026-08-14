@@ -306,6 +306,20 @@ impl Store {
                 updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
             );
 
+            -- Failures counted by identity, so a recurring one can be told from
+            -- a one-off. Nothing is proposed on a first sighting: noise does not
+            -- repeat, traps do.
+            CREATE TABLE IF NOT EXISTS recurring_errors (
+                signature     TEXT PRIMARY KEY,
+                sample        TEXT NOT NULL,
+                command       TEXT NOT NULL,
+                sessions      TEXT NOT NULL DEFAULT '[]',
+                seen_count    INTEGER NOT NULL DEFAULT 1,
+                proposed      INTEGER NOT NULL DEFAULT 0,
+                first_seen_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                last_seen_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
             CREATE TABLE IF NOT EXISTS edit_guard_fires (
                 session_id      TEXT NOT NULL,
                 anti_pattern_id INTEGER NOT NULL,

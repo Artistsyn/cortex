@@ -183,6 +183,11 @@ fn tool_compact_output(
     // costs one substring scan and removes the dependency on anyone remembering
     // to close the session out.
     if let Some(passed) = crate::test_signal::classify(command, &raw) {
+        if !passed {
+            // Count it by identity. A single failure is not knowledge; the same
+            // failure across sessions is.
+            let _ = crate::test_signal::note_failure(store, session_id, command, &raw);
+        }
         match crate::test_signal::observe(store, session_id, command, passed) {
             Ok(n) if n > 0 => eprintln!(
                 "[cortex] test signal: {} → {} pattern(s) rescored",
@@ -1847,11 +1852,23 @@ fn review_queue_line(store: &Store) -> String {
         )
         .unwrap_or(0);
 
-    if drafted.is_empty() && proposals == 0 {
+    // Failures that keep coming back. Three distinct sessions is the bar: it
+    // cannot be reached by one bad afternoon of iterating on a single fix, and
+    // anything that clears it has survived being fixed twice already.
+    let repeats = crate::test_signal::recurring(store, 3).unwrap_or_default();
+
+    if drafted.is_empty() && proposals == 0 && repeats.is_empty() {
         return String::new();
     }
 
     let mut out = String::from("\n\nAWAITING YOUR REVIEW\n");
+    for (sig, count, sample) in &repeats {
+        let first = sample.lines().next().unwrap_or("").trim();
+        out.push_str(&format!(
+            "  recurring failure `{sig}` — hit in {count} sessions\n    {first}\n    \
+             worth recording as a trap? cortex anti-pattern add ...\n"
+        ));
+    }
     if !drafted.is_empty() {
         out.push_str(&format!(
             "  {} skill draft(s): {}\n    approve: cortex skill-approve <name>   reject: cortex skill-reject <name>\n",

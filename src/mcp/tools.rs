@@ -176,6 +176,25 @@ fn tool_compact_output(
         return Ok(String::new());
     }
 
+    // Score the session's knowledge from this run, if it was a build or test.
+    //
+    // This is the point where the evidence already arrives: the hook hands over
+    // stdout and stderr for every command, and until now the only thing taken
+    // from a test run was how many characters it saved. Reading the verdict here
+    // costs one substring scan and removes the dependency on anyone remembering
+    // to close the session out.
+    if let Some(passed) = crate::test_signal::classify(command, &raw) {
+        match crate::test_signal::observe(store, session_id, command, passed) {
+            Ok(n) if n > 0 => eprintln!(
+                "[cortex] test signal: {} → {} pattern(s) rescored",
+                if passed { "pass" } else { "fail" },
+                n
+            ),
+            Err(e) => eprintln!("[cortex] test signal: could not record: {e}"),
+            _ => {}
+        }
+    }
+
     let kind = crate::output_filter::detect_command(command);
     let tee_dir = repo_root.join(".cortex").join("tee");
     let filtered = crate::output_filter::filter_output(kind, &raw, Some(&tee_dir));

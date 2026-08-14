@@ -15,6 +15,7 @@ mod meta;
 mod miner;
 mod model;
 mod output_filter;
+mod test_signal;
 mod planner;
 mod recall_match;
 mod prefs;

@@ -285,6 +285,27 @@ impl Store {
 
             -- Which traps the edit guard has already raised, per session, so an
             -- unsolicited warning is never repeated at the same author.
+            -- Every build/test result the compaction hook sees, and what the
+            -- session's verdict was scored as. The verdict is stored because it
+            -- can CHANGE: a session that passes at 14:09 and fails at 14:40 has
+            -- to have its earlier credit taken back, not doubled.
+            CREATE TABLE IF NOT EXISTS test_outcomes (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id   TEXT    NOT NULL,
+                command      TEXT    NOT NULL,
+                passed       INTEGER NOT NULL,
+                observed_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_test_outcomes_session
+                ON test_outcomes(session_id);
+
+            CREATE TABLE IF NOT EXISTS session_verdict (
+                session_id  TEXT PRIMARY KEY,
+                passed      INTEGER NOT NULL,
+                scored_ids  TEXT    NOT NULL,  -- JSON array of pattern ids credited
+                updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
+            );
+
             CREATE TABLE IF NOT EXISTS edit_guard_fires (
                 session_id      TEXT NOT NULL,
                 anti_pattern_id INTEGER NOT NULL,

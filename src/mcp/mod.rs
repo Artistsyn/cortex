@@ -39,7 +39,6 @@ const UNCACHEABLE: &[&str] = &[
     "list_patterns",
     "get_anti_patterns",
     "get_delta",
-    "recurrent_think",
     "simulate_change",
     "explain_dependency_path",
     "begin_protocol_session",
@@ -438,27 +437,6 @@ fn tools_list() -> Value {
                         }
                     },
                     "required": ["hint"]
-                }
-            },
-            {
-                "name": "recurrent_think",
-                "description": "Iterative hypothesis refinement loop for complex tasks. \
-                                Propose → Critique → Refine → Assess → Halt or Continue. \
-                                Max 6 loops by default. Use for deep design decisions or multi-step problems.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "task": { "type": "string", "description": "Problem or feature description." },
-                        "hypothesis": { "type": "string", "description": "Optional: current hypothesis to critique." },
-                        "loop": { "type": "integer", "description": "Current loop index (default: 0)." },
-                        "max_loops": { "type": "integer", "description": "Max iterations (default: 6, capped at 16)." },
-                        "depth_mode": {
-                            "type": "string",
-                            "description": "Iteration preset: auto (default), shallow (2), deep (up to 16).",
-                            "enum": ["auto", "shallow", "deep"]
-                        }
-                    },
-                    "required": ["task"]
                 }
             },
             {

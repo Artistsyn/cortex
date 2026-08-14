@@ -96,13 +96,6 @@ pub const MECHANISMS: &[Mechanism] = &[
         when_idle: "either coverage is perfect or gap logging is broken",
     },
     Mechanism {
-        label: "recurrent_think scratchpads",
-        table: "scratchpads",
-        ts_col: "updated_at",
-        expect_days: 30.0,
-        when_idle: "the reasoning loop is unused — consider retiring it",
-    },
-    Mechanism {
         label: "response cache",
         table: "response_cache",
         ts_col: "created_at",

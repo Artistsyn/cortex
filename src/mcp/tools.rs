@@ -33,7 +33,6 @@ pub fn dispatch(
         "query_graph"          => tool_query_graph(args, store, session_id),
         "explain_dependency_path" => tool_explain_dependency_path(args, store, session_id),
         "get_preferences"      => tool_get_preferences(args, prefs_summary),
-        "recurrent_think"      => tool_recurrent_think(args, store),
         "simulate_change"      => tool_simulate_change(args, store, session_id),
         "recall"               => tool_recall(args, store, units, sessions, session_id),
         "list_patterns"        => tool_list_patterns(args, store, session_id),
@@ -1456,94 +1455,6 @@ fn augment_hint(hint: &str, units: &[CodeUnit]) -> String {
     }
 }
 
-// ── recurrent_think ───────────────────────────────────────────────────────────
-
-fn tool_recurrent_think(args: &Value, store: &Store) -> Result<String, String> {
-    let task = args["task"].as_str().ok_or("missing `task`")?;
-    let hypothesis = args["hypothesis"].as_str();
-    let loop_index = args["loop"].as_u64().unwrap_or(0) as u8;
-    let depth_mode = args["depth_mode"].as_str().unwrap_or("auto");
-    let session_key = args["session_key"].as_str();
-    let max_loops = match depth_mode {
-        "shallow" => 2u8,
-        "deep" => args["max_loops"].as_u64().unwrap_or(12).min(16) as u8,
-        _ => args["max_loops"].as_u64().unwrap_or(6).min(16) as u8,
-    };
-
-    // Load persisted scratchpad from SQLite or initialize a new one.
-    // session_key scopes the scratchpad — different sessions with the same task
-    // get distinct scratchpads (Phase 4).
-    let mut scratchpad =
-        crate::reasoner::scratchpad::load_from_db(store.conn(), task, session_key)
-            .map_err(|e| format!("Failed to load scratchpad: {}", e))?
-            .unwrap_or_else(|| crate::reasoner::scratchpad::Scratchpad::new(task, session_key));
-
-    // Add hypothesis if provided. If this is the first invocation and no hypothesis
-    // was provided, seed one from task text so the loop can critique/refine.
-    if let Some(h) = hypothesis {
-        let next_loop = if loop_index == 0 {
-            scratchpad.loop_index.saturating_add(1).max(1)
-        } else {
-            loop_index
-        };
-        scratchpad
-            .add_hypothesis(next_loop, h)
-            .map_err(|e| format!("Failed to add hypothesis: {}", e))?;
-    } else if scratchpad.hypotheses.is_empty() {
-        scratchpad
-            .add_hypothesis(1, &format!("Initial hypothesis for task: {task}"))
-            .map_err(|e| format!("Failed to seed hypothesis: {}", e))?;
-    }
-
-    if scratchpad.hypotheses.is_empty() {
-        return Ok(
-            "No hypothesis available yet. Call recurrent_think again with a `hypothesis` argument to begin critique/refine loops."
-                .to_string(),
-        );
-    }
-
-    let active_loop = scratchpad.loop_index.max(1);
-
-    // Run critique + refine cycle
-    let context = crate::reasoner::recurrent::run_recurrent_loop(
-        &mut scratchpad,
-        store.conn(),
-        active_loop,
-        max_loops,
-    ).map_err(|e| format!("Recurrent loop failed: {}", e))?;
-
-    // Persist scratchpad
-    crate::reasoner::scratchpad::save_to_db(store.conn(), &scratchpad)
-        .map_err(|e| format!("Failed to save scratchpad: {}", e))?;
-
-    // Return context
-    let mut output = format!(
-        "=== RECURRENT THINKING (Loop {}) ===\n\n\
-         Confidence: {:.0}%\n\
-         Depth Mode: {}\n\
-         Continue: {}\n\n",
-        context.loop_index,
-        context.confidence * 100.0,
-        depth_mode,
-        context.should_continue
-    );
-
-    if !context.critiques.is_empty() {
-        output.push_str("Critiques:\n");
-        for c in &context.critiques {
-            output.push_str(&format!("  • {}\n", c));
-        }
-        output.push('\n');
-    }
-
-    if let Some(reason) = &context.halt_reason {
-        output.push_str(&format!("HALTED: {}\n\n", reason));
-    }
-
-    output.push_str(&format!("Next Prompt:\n{}", context.next_prompt));
-
-    Ok(output)
-}
 
 // ── simulate_change ────────────────────────────────────────────────────────────
 

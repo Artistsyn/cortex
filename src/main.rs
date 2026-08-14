@@ -1,4 +1,5 @@
 mod adr;
+mod audit;
 mod cache;
 mod closeout;
 mod compressor;
@@ -159,6 +160,9 @@ enum Command {
     /// Run production-style workflow health checks.
     #[command(subcommand)]
     Doctor(DoctorCmd),
+
+    /// Show which mechanisms have actually fired, and which are silently idle.
+    Fired,
 
     /// Search patterns, anti-patterns, annotations, and indexed units for a topic.
     Recall {
@@ -720,6 +724,7 @@ fn main() -> Result<()> {
         Command::Status { full }   => run_status(&db_path, full, format),
         Command::Meta(cmd)        => run_meta(cmd, &db_path, format),
         Command::Doctor(cmd)       => run_doctor(cmd, &db_path, format),
+        Command::Fired             => audit::run_cli(&Store::open(&db_path)?),
         Command::Recall { topic }  => run_recall(&topic, &db_path, format),
         Command::GitReview { base, repo } => run_git_review(&base, repo.as_deref(), &db_path),
         Command::Adr(cmd)          => run_adr(cmd, &db_path),

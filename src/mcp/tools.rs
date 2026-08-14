@@ -1989,6 +1989,12 @@ fn tool_get_session_health(
 
     // Anything that needs a human decision, on the surface a human actually sees.
     report.push_str(&review_queue_line(store));
+
+    // Whatever has quietly stopped working. Silent when everything is live, so
+    // this can sit here every session without becoming noise — and when it is
+    // not silent, it is naming a mechanism that is doing nothing while looking
+    // fine, which is this project's most repeated failure.
+    report.push_str(&crate::audit::render_problems(&crate::audit::read_all(store)));
     Ok(report)
 }
 

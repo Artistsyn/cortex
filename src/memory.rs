@@ -818,6 +818,32 @@ impl Store {
             )?;
         }
 
+        self.ensure_supersession_columns()?;
+
+        Ok(())
+    }
+
+    /// `superseded_by` on both knowledge tables (idempotent).
+    ///
+    /// Nullable and unconstrained by a foreign key on purpose: the replacement
+    /// lives in the same table, and a REFERENCES clause added by ALTER TABLE
+    /// cannot be enforced retroactively by SQLite anyway. `supersede()` does the
+    /// checking.
+    fn ensure_supersession_columns(&self) -> Result<()> {
+        for table in ["patterns", "anti_patterns"] {
+            let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut cols = std::collections::HashSet::new();
+            for c in rows {
+                cols.insert(c?);
+            }
+            if !cols.contains("superseded_by") {
+                self.conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN superseded_by INTEGER"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -990,7 +1016,8 @@ impl Store {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, intent, body, uses, tags, approved_at, use_count,
                     reverted_count, survival_rate
-             FROM patterns ORDER BY survival_rate DESC, use_count DESC, approved_at DESC"
+             FROM patterns WHERE superseded_by IS NULL
+             ORDER BY survival_rate DESC, use_count DESC, approved_at DESC"
         )?;
         let rows = stmt.query_map([], row_to_pattern)?;
         let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1114,11 +1141,62 @@ impl Store {
 
     pub fn all_anti_patterns(&self) -> Result<Vec<AntiPattern>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, description, wrong, correct, tags, added_at FROM anti_patterns"
+            "SELECT id, description, wrong, correct, tags, added_at
+             FROM anti_patterns WHERE superseded_by IS NULL"
         )?;
         let rows = stmt.query_map([], row_to_anti_pattern)?;
         let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(items)
+    }
+
+    /// Retire an entry in favour of a newer one, without deleting it.
+    ///
+    /// A correction used to be ADDED beside the thing it corrected, and both were
+    /// then served on every call. Two anti-patterns about the same API said
+    /// opposite things and came back in one response, so the store actively
+    /// taught the bug that had just been fixed. Nothing else in the design could
+    /// catch that: every entry is true of the moment it was written, and only the
+    /// author of the correction knows which older entry it replaces.
+    ///
+    /// Superseded rows stay in the table -- they are the record of what was once
+    /// believed, and closeout evidence still points at their ids -- but retrieval
+    /// never shows them again.
+    pub fn supersede(&self, table: &str, old_id: i64, new_id: i64) -> Result<usize> {
+        if !matches!(table, "patterns" | "anti_patterns") {
+            anyhow::bail!("supersede: unknown table '{table}'");
+        }
+        if old_id == new_id {
+            anyhow::bail!("supersede: an entry cannot supersede itself (id {old_id})");
+        }
+        // The replacement must exist and must itself be live, or a typo would
+        // retire a good entry in favour of nothing.
+        let live: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE id = ?1 AND superseded_by IS NULL"),
+            params![new_id],
+            |r| r.get(0),
+        )?;
+        if live == 0 {
+            anyhow::bail!("supersede: no live {table} row with id {new_id} to supersede in favour of");
+        }
+        let n = self.conn.execute(
+            &format!("UPDATE {table} SET superseded_by = ?1 WHERE id = ?2 AND superseded_by IS NULL"),
+            params![new_id, old_id],
+        )?;
+        Ok(n)
+    }
+
+    /// Entries retired by `supersede`, newest replacement first.
+    pub fn superseded_rows(&self, table: &str) -> Result<Vec<(i64, i64, String)>> {
+        if !matches!(table, "patterns" | "anti_patterns") {
+            anyhow::bail!("superseded_rows: unknown table '{table}'");
+        }
+        let label = if table == "patterns" { "name" } else { "description" };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, superseded_by, {label} FROM {table}
+             WHERE superseded_by IS NOT NULL ORDER BY superseded_by DESC"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn delete_anti_pattern(&self, id: i64) -> Result<()> {

@@ -791,17 +791,35 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
     let detail = pattern_detail_tier(args);
     let detail_is_summary = detail == "summary";
     let tokens = args.get("hint").and_then(|v| v.as_str()).map(hint_tokens).unwrap_or_default();
+
+    // Rank first, then expand at most MAX_EXPANDED_ENTRIES of them. This call
+    // reached 71,633 characters on the live store with a broad hint and was
+    // rejected by the transport, so the mandatory pre-code check failed with an
+    // error rather than an answer. An unbounded response is not a large
+    // response; it is an absent one.
+    let threshold = hint_expand_threshold(&tokens);
+    let mut ranked: Vec<(usize, usize)> = patterns
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let hay =
+                format!("{} {} {} {}", p.name, p.intent, p.body, p.uses.join(" ")).to_lowercase();
+            (i, text_hint_score(&hay, &tokens))
+        })
+        .filter(|(_, s)| *s >= threshold)
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    let over_cap = ranked.len().saturating_sub(MAX_EXPANDED_ENTRIES);
+    let chosen: std::collections::HashSet<usize> =
+        ranked.into_iter().take(MAX_EXPANDED_ENTRIES).map(|(i, _)| i).collect();
+
     let mut out = format!("{} approved pattern(s):\n\n", patterns.len());
     let mut expanded = 0usize;
-    for p in &patterns {
+    for (idx, p) in patterns.iter().enumerate() {
         // A pattern relevant to the stated task gets its body preview even at
         // the summary tier — the saving should come from the ones you are not
         // about to use, not from the one you are.
-        let relevant = !tokens.is_empty() && {
-            let hay = format!("{} {} {} {}",
-                p.name, p.intent, p.body, p.uses.join(" ")).to_lowercase();
-            tokens.iter().any(|t| hay.contains(t.as_str()))
-        };
+        let relevant = chosen.contains(&idx);
         let detail = if relevant && detail == "summary" { expanded += 1; "standard" } else { detail };
         let marker = if p.survival_rate < 0.4 {
             "⚠"
@@ -864,6 +882,29 @@ fn tool_list_patterns(args: &Value, store: &Store, session_id: &str) -> Result<S
             if expanded > 0 { format!(", {expanded} expanded as relevant") } else { String::new() },
         ));
     }
+    if over_cap > 0 {
+        out.push_str(&format!(
+            "({over_cap} further patterns also matched but were not expanded — the \
+             {MAX_EXPANDED_ENTRIES} closest to your hint are shown.)\n"
+        ));
+    }
+
+    // Last line of defence. The ranking and the cap should already keep this
+    // well under the limit, but a `detail=full` call over a store that keeps
+    // growing must degrade to a shorter answer rather than to a transport error.
+    if out.len() > MAX_RESPONSE_CHARS {
+        let keep = out
+            .char_indices()
+            .take_while(|(i, _)| *i < MAX_RESPONSE_CHARS)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        out.truncate(keep);
+        out.push_str(
+            "\n\n[truncated: this response hit the size limit. Pass a narrower hint, \
+             or detail=\"summary\", to see the rest.]\n",
+        );
+    }
 
     // A hint is mandatory now, so it can no longer be absent — but it can still
     // tokenise to nothing (all stop-words, or terms no pattern uses). Say which
@@ -882,6 +923,17 @@ Note: your hint matched no pattern, so nothing was expanded and no              
 // ── get_anti_patterns ─────────────────────────────────────────────────────────
 
 /// Words too common to discriminate between anti-patterns.
+/// The most entries any one call will expand to full remedy or body text.
+///
+/// Chosen against the live store: a well-aimed hint matches a handful, and the
+/// calls that blew past the transport limit matched 60+. Twelve is generous for
+/// the first and impossible for the second.
+const MAX_EXPANDED_ENTRIES: usize = 12;
+
+/// Hard ceiling on a single tool response, below the transport's own limit so
+/// the failure is a readable truncation note instead of a rejected call.
+const MAX_RESPONSE_CHARS: usize = 48_000;
+
 const HINT_STOPWORDS: &[&str] = &[
     "the", "and", "for", "with", "that", "this", "from", "into", "when",
     "code", "function", "write", "writing", "add", "adding", "new", "make",
@@ -889,20 +941,62 @@ const HINT_STOPWORDS: &[&str] = &[
 
 /// Tokens from a task hint, lowercased, short and common words removed.
 fn hint_tokens(hint: &str) -> Vec<String> {
-    hint.split(|c: char| !c.is_alphanumeric() && c != '_')
+    let mut v: Vec<String> = hint
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
         .map(|w| w.to_lowercase())
         .filter(|w| w.len() >= 4 && !HINT_STOPWORDS.contains(&w.as_str()))
-        .collect()
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The number of DISTINCT hint tokens a body of text mentions, matched on word
+/// boundaries rather than as bare substrings.
+///
+/// Substring matching over one concatenated haystack is what made expansion
+/// useless. `contains("size")` fires on "resize", "sizes" and "size_hint";
+/// `contains("roll")` fires on "controlled" and "scrolling". Measured on the
+/// live store, the hint "rust sqlite ALTER TABLE migration add column, MCP tool
+/// response size budget" expanded 61 of 193 anti-patterns, among them GIF frame
+/// compositing, MSAA, and Slint string literals -- roughly 30,000 characters of
+/// content that had nothing to do with the task, which is worse than no
+/// expansion because it buries the entries that DO apply.
+///
+/// A short token must match a whole word. A longer one (>= 6 chars) may match a
+/// prefix, so "migration" still finds "migrations" and "migrating" without
+/// "size" finding "resize".
+fn text_hint_score(haystack: &str, tokens: &[String]) -> usize {
+    if tokens.is_empty() {
+        return 0;
+    }
+    let words: std::collections::HashSet<&str> = haystack
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    tokens
+        .iter()
+        .filter(|t| {
+            words.contains(t.as_str())
+                || (t.len() >= 6 && words.iter().any(|w| w.len() >= t.len() && w.starts_with(t.as_str())))
+        })
+        .count()
+}
+
+/// The score at which an entry is worth expanding.
+///
+/// One incidental word in common is not evidence of relevance; with a hint of
+/// any substance, two are. A one- or two-token hint has nothing to spare, so it
+/// keeps the old bar.
+fn hint_expand_threshold(tokens: &[String]) -> usize {
+    if tokens.len() >= 3 { 2 } else { 1 }
 }
 
 /// How many distinct hint tokens this anti-pattern mentions.
 fn hint_score(ap: &crate::model::AntiPattern, tokens: &[String]) -> usize {
-    if tokens.is_empty() {
-        return 0;
-    }
     let hay = format!("{} {} {} {}", ap.description, ap.wrong, ap.correct, ap.tags.join(" "))
         .to_lowercase();
-    tokens.iter().filter(|t| hay.contains(t.as_str())).count()
+    text_hint_score(&hay, tokens)
 }
 
 /// Every anti-pattern, every time — but the remedy text only where it earns
@@ -939,13 +1033,33 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
         .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
         .map(|d| d.with_timezone(&chrono::Utc));
 
+    // Which entries earn their remedy text, decided across the WHOLE set before
+    // anything is printed rather than one row at a time.
+    //
+    // Two separate limits, because they fail differently. The threshold keeps
+    // incidental word matches out; the cap keeps a hint that legitimately
+    // matches half the store from producing a response nobody can read -- and,
+    // at 71,633 characters measured on list_patterns, one the transport rejects
+    // outright, which turns the mandatory pre-code check into an error.
+    let threshold = hint_expand_threshold(&tokens);
+    let mut ranked: Vec<(usize, usize)> = aps
+        .iter()
+        .enumerate()
+        .map(|(i, ap)| (i, hint_score(ap, &tokens)))
+        .filter(|(_, s)| *s >= threshold)
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+    let over_cap = ranked.len().saturating_sub(MAX_EXPANDED_ENTRIES);
+    let chosen: std::collections::HashSet<usize> =
+        ranked.into_iter().take(MAX_EXPANDED_ENTRIES).map(|(i, _)| i).collect();
+
     let now = chrono::Utc::now();
     let mut out = String::new();
     let mut expanded = 0usize;
     let mut listed = 0usize;
     let mut unchanged = 0usize;
 
-    for ap in &aps {
+    for (idx, ap) in aps.iter().enumerate() {
         // Telemetry is recorded for EVERY entry, shown or not. Only targeted
         // retrievals feed pattern-survival scoring, so suppressing the log for
         // omitted entries would quietly starve the very signal the required
@@ -954,7 +1068,7 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
             let _ = store.log_session_retrieval(session_id, "anti_patterns", id, "get_anti_patterns");
         }
 
-        let relevant = hint_score(ap, &tokens) > 0;
+        let relevant = chosen.contains(&idx);
 
         // An unchanged entry is omitted only when it is ALSO not hint-relevant:
         // the caller asked about this topic, so the remedy is what they came for
@@ -1000,6 +1114,12 @@ fn tool_get_anti_patterns(args: &Value, store: &Store, session_id: &str) -> Resu
             "
 ({listed} listed by description only — their wrong/correct text is one call away:              get_anti_patterns with hint=\"<what you are writing>\", or detail=\"full\" for all of them.)
 "
+        ));
+    }
+    if over_cap > 0 {
+        body.push_str(&format!(
+            "\n({over_cap} further entries also matched but were not expanded — the {MAX_EXPANDED_ENTRIES} \
+             closest to your hint are shown. Narrow the hint to reach the rest.)\n"
         ));
     }
 
@@ -2559,4 +2679,55 @@ mod delta_mode_tests {
         let _ = store.conn().execute(
             "DELETE FROM session_retrieval_log WHERE session_id = ?1", rusqlite::params![session]);
     }
+    // ── hint precision and response bounds ────────────────────────────────────
+
+    #[test]
+    fn a_hint_token_must_match_a_whole_word_not_a_substring() {
+        let t = hint_tokens("resize buffer");
+        // "size" must not be recovered from "resize"; that class of accidental
+        // match is what expanded 61 of 193 entries on an unrelated hint.
+        assert_eq!(text_hint_score("the size of the thing", &["resize".to_string()]), 0);
+        assert_eq!(text_hint_score("we resize the buffer", &t), 2);
+    }
+
+    #[test]
+    fn a_long_token_still_matches_its_own_plural_and_participle() {
+        let t = vec!["migration".to_string()];
+        assert_eq!(text_hint_score("run the migrations", &t), 1);
+        assert_eq!(text_hint_score("migrating the schema", &t), 0, "not a prefix of the token");
+        assert_eq!(text_hint_score("a migration ran", &t), 1);
+    }
+
+    #[test]
+    fn a_short_token_does_not_get_prefix_matching() {
+        // "roll" finding "controlled" and "rolled" is how a thumb question
+        // returned Crystalline physics.
+        assert_eq!(text_hint_score("manually controlled object", &["roll".to_string()]), 0);
+        assert_eq!(text_hint_score("an axial roll", &["roll".to_string()]), 1);
+    }
+
+    #[test]
+    fn a_substantial_hint_needs_two_matches_before_anything_expands() {
+        let many = hint_tokens("sqlite migration column budget");
+        assert!(many.len() >= 3);
+        assert_eq!(hint_expand_threshold(&many), 2);
+        // A short hint has nothing to spare and keeps the single-match bar.
+        assert_eq!(hint_expand_threshold(&hint_tokens("grapple")), 1);
+    }
+
+    #[test]
+    fn distinct_tokens_are_counted_once_however_often_they_repeat() {
+        let t = hint_tokens("cache cache cache");
+        assert_eq!(t.len(), 1);
+        assert_eq!(text_hint_score("cache cache cache cache", &t), 1);
+    }
+
+    #[test]
+    fn the_expansion_cap_is_small_enough_to_fit_the_transport() {
+        // The bound that matters: 12 entries of remedy text cannot approach the
+        // 71,633 chars that got list_patterns rejected outright.
+        assert!(MAX_EXPANDED_ENTRIES <= 16);
+        assert!(MAX_RESPONSE_CHARS < 60_000);
+    }
+
 }

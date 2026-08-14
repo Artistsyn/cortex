@@ -639,6 +639,16 @@ enum PatternCmd {
     Remove { id: i64 },
     /// Mark a pattern as reverted once and update survival rate.
     Revert { id: i64 },
+    /// Retire a pattern in favour of a newer one. It stays in the DB as history
+    /// but is never served again.
+    Supersede {
+        /// The pattern being retired.
+        id: i64,
+        /// The pattern that replaces it.
+        #[arg(long)] by: i64,
+    },
+    /// List patterns retired by `supersede`.
+    Retired,
     /// Show pattern survival health.
     Health,
 }
@@ -653,6 +663,17 @@ enum AntiPatternCmd {
         #[arg(long, value_delimiter = ',')] tags: Vec<String>,
     },
     Remove { id: i64 },
+    /// Retire an anti-pattern in favour of a newer one. Use this when a later
+    /// entry CORRECTS an earlier one — otherwise both are served, and a reader
+    /// gets told to do the thing the correction exists to prevent.
+    Supersede {
+        /// The anti-pattern being retired.
+        id: i64,
+        /// The anti-pattern that replaces it.
+        #[arg(long)] by: i64,
+    },
+    /// List anti-patterns retired by `supersede`.
+    Retired,
 }
 
 #[derive(Subcommand, Debug)]
@@ -2580,6 +2601,8 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
                 crystallizer::add_pattern(&store, &name, &intent, &body, uses, tags),
             PatternCmd::Remove { id } => crystallizer::remove_pattern(&store, id),
             PatternCmd::Revert { id } => crystallizer::report_revert(&store, id),
+            PatternCmd::Supersede { id, by } => run_supersede(&store, "patterns", id, by),
+            PatternCmd::Retired => run_retired(&store, "patterns"),
             PatternCmd::Health => crystallizer::list_pattern_health(&store),
         };
     }
@@ -2612,6 +2635,11 @@ fn run_pattern(cmd: PatternCmd, db_path: &Path, format: OutputFormat) -> Result<
             store.pattern_reverted(id)?;
             print_json(&json!({"ok": true, "action": "revert", "id": id}))
         }
+        PatternCmd::Supersede { id, by } => {
+            let n = store.supersede("patterns", id, by)?;
+            print_json(&json!({"ok": n > 0, "action": "supersede", "id": id, "by": by}))
+        }
+        PatternCmd::Retired => print_json(&store.superseded_rows("patterns")?),
         PatternCmd::Health => {
             let rows = store.pattern_health_rows()?;
             let health: Vec<_> = rows
@@ -2639,6 +2667,8 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
             AntiPatternCmd::Add { description, wrong, correct, tags } =>
                 crystallizer::add_anti_pattern(&store, &description, &wrong, &correct, tags),
             AntiPatternCmd::Remove { id } => crystallizer::remove_anti_pattern(&store, id),
+            AntiPatternCmd::Supersede { id, by } => run_supersede(&store, "anti_patterns", id, by),
+            AntiPatternCmd::Retired => run_retired(&store, "anti_patterns"),
         };
     }
 
@@ -2662,7 +2692,42 @@ fn run_anti_pattern(cmd: AntiPatternCmd, db_path: &Path, format: OutputFormat) -
             store.delete_anti_pattern(id)?;
             print_json(&json!({"ok": true, "action": "remove", "id": id}))
         }
+        AntiPatternCmd::Supersede { id, by } => {
+            let n = store.supersede("anti_patterns", id, by)?;
+            print_json(&json!({"ok": n > 0, "action": "supersede", "id": id, "by": by}))
+        }
+        AntiPatternCmd::Retired => print_json(&store.superseded_rows("anti_patterns")?),
     }
+}
+
+/// Retire one entry in favour of another, and say what happened.
+///
+/// The message names both sides because the destructive-looking half is the one
+/// that disappears from every future call, and a bare "ok" would not let anyone
+/// check that the right row went.
+fn run_supersede(store: &Store, table: &str, id: i64, by: i64) -> Result<()> {
+    let n = store.supersede(table, id, by)?;
+    if n == 0 {
+        println!("[cortex] {table} #{id} was already retired, or does not exist.");
+    } else {
+        println!("[cortex] {table} #{id} retired — superseded by #{by}.");
+        println!("         It stays in the database as history and will not be served again.");
+    }
+    Ok(())
+}
+
+fn run_retired(store: &Store, table: &str) -> Result<()> {
+    let rows = store.superseded_rows(table)?;
+    if rows.is_empty() {
+        println!("[cortex] no retired {table}.");
+        return Ok(());
+    }
+    println!("[cortex] {} retired {table}:", rows.len());
+    for (id, by, label) in rows {
+        let one_line: String = label.chars().take(88).collect();
+        println!("  #{id:<5} superseded by #{by:<5} {one_line}");
+    }
+    Ok(())
 }
 
 fn run_annotate(cmd: AnnotateCmd, db_path: &Path, format: OutputFormat) -> Result<()> {
